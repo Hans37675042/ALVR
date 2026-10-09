@@ -23,6 +23,7 @@ use alvr_common::{
     warn,
 };
 use alvr_graphics::GraphicsContext;
+use alvr_packets::SceneSnapshot;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
 use alvr_system_info::Platform;
 use extra_extensions::{
@@ -36,7 +37,14 @@ use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
 use scene::SceneLoader;
-use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
+use std::{
+    ffi::CStr,
+    path::Path,
+    rc::Rc,
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 use stream::StreamContext;
 
 fn from_xr_vec3(v: xr::Vector3f) -> Vec3 {
@@ -421,6 +429,23 @@ pub fn entry_point() {
         #[cfg(target_os = "android")]
         alvr_system_info::try_get_permission("com.oculus.permission.USE_SCENE");
         let mut scene_loader = SceneLoader::new(xr_session.clone());
+        // One sender thread per session keeps snapshots ordered and off the render thread; it
+        // exits when `scene_sender` is dropped at the end of the session.
+        let (scene_sender, scene_receiver) = mpsc::channel::<SceneSnapshot>();
+        thread::spawn({
+            let core_context = Arc::clone(&core_context);
+            move || {
+                let mut id = 0u32;
+                while let Ok(mut snapshot) = scene_receiver.recv() {
+                    // Only the newest snapshot matters
+                    while let Ok(newer) = scene_receiver.try_recv() {
+                        snapshot = newer;
+                    }
+                    id = id.wrapping_add(1);
+                    core_context.send_scene_snapshot(id, &snapshot);
+                }
+            }
+        });
         if scene_loader.is_none() {
             info!("[SCENE] scene extensions unavailable, scene import disabled");
         }
@@ -701,9 +726,7 @@ pub fn entry_point() {
                 && let Some(snapshot) = loader.update(frame_state.predicted_display_time)
             {
                 if scene_enabled {
-                    // Can be several MB with the global mesh: keep it off the render thread
-                    let core_context = Arc::clone(&core_context);
-                    thread::spawn(move || core_context.send_scene_snapshot(snapshot));
+                    scene_sender.send(snapshot).ok();
                 } else {
                     info!("[SCENE] snapshot dropped, not streaming");
                 }

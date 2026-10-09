@@ -212,7 +212,7 @@ pub enum ClientControlPacket {
     ProximityState(bool),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
-    SceneSnapshot(SceneSnapshot),
+    SceneSnapshotChunk(SceneSnapshotChunk),
 }
 
 /// Raw 16-byte XrUuidEXT of a Quest scene anchor.
@@ -272,6 +272,84 @@ pub struct SceneSnapshot {
     pub rooms: Vec<SceneRoom>,
     pub anchors: Vec<SceneAnchor>,
     pub meshes: Vec<SceneMesh>,
+}
+
+/// Max payload bytes per scene chunk. A snapshot with the global mesh can be several MB; small
+/// control packets keep the control socket free for other packets and keepalives.
+pub const SCENE_CHUNK_SIZE: usize = 60 * 1024;
+
+/// Part `index` of `count` of an LZ4 compressed (size prepended) bincode `SceneSnapshot`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SceneSnapshotChunk {
+    pub id: u32,
+    pub index: u32,
+    pub count: u32,
+    pub data: Vec<u8>,
+}
+
+pub fn split_scene_snapshot(id: u32, snapshot: &SceneSnapshot) -> Vec<SceneSnapshotChunk> {
+    let encoded = bincode::serde::encode_to_vec(snapshot, bincode::config::standard()).unwrap();
+    let compressed = lz4_flex::compress_prepend_size(&encoded);
+    let count = compressed.len().div_ceil(SCENE_CHUNK_SIZE).max(1) as u32;
+
+    (0..count)
+        .map(|index| {
+            let start = index as usize * SCENE_CHUNK_SIZE;
+            let end = (start + SCENE_CHUNK_SIZE).min(compressed.len());
+            SceneSnapshotChunk {
+                id,
+                index,
+                count,
+                data: compressed[start..end].to_vec(),
+            }
+        })
+        .collect()
+}
+
+/// Reassembles chunks sent in order over the control socket. A chunk with index 0 starts a
+/// new snapshot and discards any unfinished one.
+#[derive(Default)]
+pub struct SceneChunkAssembler {
+    id: Option<u32>,
+    count: u32,
+    next_index: u32,
+    data: Vec<u8>,
+}
+
+impl SceneChunkAssembler {
+    pub fn push(&mut self, chunk: SceneSnapshotChunk) -> Result<Option<SceneSnapshot>> {
+        if chunk.index == 0 {
+            self.id = Some(chunk.id);
+            self.count = chunk.count;
+            self.next_index = 0;
+            self.data.clear();
+        } else if self.id != Some(chunk.id)
+            || chunk.index != self.next_index
+            || chunk.count != self.count
+        {
+            self.id = None;
+            self.data.clear();
+            alvr_common::anyhow::bail!(
+                "unexpected scene chunk {}/{} of snapshot {}",
+                chunk.index,
+                chunk.count,
+                chunk.id
+            );
+        }
+
+        self.data.extend_from_slice(&chunk.data);
+        self.next_index += 1;
+        if self.next_index < self.count {
+            return Ok(None);
+        }
+
+        self.id = None;
+        let encoded = lz4_flex::decompress_size_prepended(&std::mem::take(&mut self.data))?;
+        let (snapshot, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())?;
+
+        Ok(Some(snapshot))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

@@ -378,6 +378,8 @@ version = "21.0.0-dev12-realkk.2"
 dependencies = [
  "alvr_common",
  "alvr_session",
+ "bincode",
+ "lz4_flex",
  "serde",
  "serde_json",
 ]

@@ -24,6 +24,7 @@ use alvr_packets::{
     AUDIO, CAMERA, CameraFrameHeader, ClientConnectionResult, ClientConnectionsAction,
     ClientControlPacket, ClientStatistics, DEPTH, DepthFrameHeader, HAPTICS,
     NegotiatedStreamingConfig, NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS,
+    SceneChunkAssembler,
     ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
@@ -1292,6 +1293,7 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+            let mut scene_assembler = SceneChunkAssembler::default();
             while is_streaming(&client_hostname) {
                 let packet = match control_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(packet) => packet,
@@ -1434,14 +1436,22 @@ fn connection_pipeline(
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
                     }
-                    ClientControlPacket::SceneSnapshot(snapshot) => {
-                        let mesh_triangles: usize =
-                            snapshot.meshes.iter().map(|m| m.indices.len() / 3).sum();
-                        let (rooms, anchors) = (snapshot.rooms.len(), snapshot.anchors.len());
-                        let id = ctx.xr_data_relay.set_scene_snapshot(snapshot);
-                        info!(
-                            "XR Data: scene snapshot #{id}: {rooms} rooms, {anchors} anchors,                              {mesh_triangles} mesh triangles"
-                        );
+                    ClientControlPacket::SceneSnapshotChunk(chunk) => {
+                        match scene_assembler.push(chunk) {
+                            Ok(Some(snapshot)) => {
+                                let mesh_triangles: usize =
+                                    snapshot.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                                let (rooms, anchors) =
+                                    (snapshot.rooms.len(), snapshot.anchors.len());
+                                let id = ctx.xr_data_relay.set_scene_snapshot(snapshot);
+                                info!(
+                                    "XR Data: scene snapshot #{id}: {rooms} rooms, \
+                                     {anchors} anchors, {mesh_triangles} mesh triangles"
+                                );
+                            }
+                            Ok(None) => (),
+                            Err(e) => warn!("XR Data: dropped scene snapshot: {e}"),
+                        }
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
                 }
