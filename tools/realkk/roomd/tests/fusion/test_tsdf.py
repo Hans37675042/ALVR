@@ -218,23 +218,25 @@ def test_measurements_beyond_the_floor_do_not_carve_it():
 
 def test_new_object_appears_within_n_frames():
     # real room tap: a chair moved into well-carved free space took ~6 s of viewing to show up,
-    # while the old position cleared in < 1 s (R14 target: moved chair published p95 <= 2 s)
-    fusion = TsdfFusion(FusionConfig())
+    # while the old position cleared in < 1 s (R14 target: moved chair published p95 <= 2 s).
+    # Compare against a volume that never saw the empty room, fed the same frames: carved
+    # free space may delay the box by only a few frames.
     poses = scan_poses()
+    carved = TsdfFusion(FusionConfig())
     empty = box_scene(with_box=False)
-    first_frame(fusion, empty)
-    scan(fusion, empty, poses)
-    scan(fusion, empty, poses)  # free space at full weight
-    assert fusion.occupied_fraction(BOX_BODY) == 0.0
-    reference = TsdfFusion(FusionConfig())
-    first_frame(reference, box_scene())
-    scan(reference, box_scene(), poses)
-    target = 0.8 * reference.occupied_fraction(BOX_BODY)
-    appeared_at = None
-    for n, (eye, target_pt) in enumerate(poses, start=1):
-        fusion.integrate(box_scene().frame_payload(eye, target_pt))
-        if fusion.occupied_fraction(BOX_BODY) >= target:
-            appeared_at = n
+    first_frame(carved, empty)
+    scan(carved, empty, poses)
+    scan(carved, empty, poses)  # free space at full weight
+    assert carved.occupied_fraction(BOX_BODY) == 0.0
+    fresh = TsdfFusion(FusionConfig())
+    first_frame(fresh, empty)
+    caught_up = None
+    for n, (eye, target) in enumerate(poses, start=1):
+        payload = box_scene().frame_payload(eye, target)
+        carved.integrate(payload)
+        fresh.integrate(payload)
+        if n >= 3 and carved.occupied_fraction(BOX_BODY) >= 0.8 * fresh.occupied_fraction(BOX_BODY) > 0:
+            caught_up = n
             break
-    print("box appeared after %s frames" % appeared_at)
-    assert appeared_at is not None and appeared_at <= 8
+    print("box caught up after %s frames" % caught_up)
+    assert caught_up is not None and caught_up <= 5
