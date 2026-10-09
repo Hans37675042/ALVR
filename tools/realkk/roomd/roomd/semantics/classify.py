@@ -119,7 +119,9 @@ def _split_by_patches(pieces, n, patches, big, patch_mean, p: SemanticsParams):
     return out, next_label
 
 
-def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
+def _segment(raster, floor_y, p: SemanticsParams, is_overhang=None) -> List[_Geom]:
+    """``is_overhang(cells_xz, median_rel)``: True drops a tall piece that has free space
+    under it (loft bed, shelf above a desk) before anything attaches to it."""
     top = raster.top
     if top.size == 0:
         return []
@@ -172,6 +174,13 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
         _, _, _, eu, ev = min_area_rect(raster.centres(iz, ix))
         short[k] = min(eu, ev) + raster.cell
 
+    dropped = set()
+    if is_overhang is not None:
+        for k in range(n):
+            if len(cells[k][0]) and med[k] >= p.overhang_min_h and is_overhang(
+                    raster.centres(*cells[k]), med[k]):
+                dropped.add(k)
+
     # thin, higher pieces (backrests, arms, headboards) attach to their lower neighbour
     adj = adjacency_counts(pieces, p.attach_reach)
     nbrs = {}
@@ -180,10 +189,12 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
         nbrs.setdefault(b, []).append((a, cnt))
     parent = np.arange(n)
     for k in np.argsort(area):
-        if short[k] > p.thin_max:
+        if short[k] > p.thin_max or k in dropped:
             continue
         best = None
         for q, cnt in nbrs.get(k, []):
+            if q in dropped:
+                continue
             if area[q] > area[k] and med[k] > med[q] + p.attach_min_rise:
                 if best is None or cnt > best[1]:
                     best = (q, cnt)
@@ -201,7 +212,7 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
 
     out = []
     for r, members in groups.items():
-        if area[r] < p.min_piece_area:
+        if area[r] < p.min_piece_area or r in dropped:
             continue
         biz, bix = cells[r]
         uiz = np.concatenate([cells[k][0] for k in members if k != r] or [np.empty(0, int)])
@@ -415,6 +426,43 @@ def heightmap_raster(hm, floor_y) -> Raster:
     return Raster(hm.cell, hm.origin_x, hm.origin_z, top)
 
 
+def _refill_overhangs(raster, pts, nrm, floor_y, p: SemanticsParams) -> Raster:
+    """Heightmap cells topped by an overhang (loft bed, shelf: top >= overhang_min_h)
+    take the highest upward surface below it, so a desk under a loft is not hidden."""
+    with np.errstate(invalid="ignore"):
+        over = np.isfinite(raster.top) & (raster.top - floor_y >= p.overhang_min_h)
+    if not over.any() or len(pts) == 0:
+        return raster
+    rel = pts[:, 1] - floor_y
+    q = pts[(nrm[:, 1] >= p.up_normal_min) & (rel >= p.blob_min_h) & (rel < p.overhang_min_h)]
+    h, w = raster.top.shape
+    ix = np.floor((q[:, 0] - raster.ox) / raster.cell).astype(int)
+    iz = np.floor((q[:, 2] - raster.oz) / raster.cell).astype(int)
+    ok = (ix >= 0) & (ix < w) & (iz >= 0) & (iz < h)
+    under = np.full(h * w, -np.inf)
+    np.maximum.at(under, iz[ok] * w + ix[ok], q[ok, 1])
+    under = under.reshape(h, w)
+    sel = over & np.isfinite(under)
+    if not sel.any():
+        return raster
+    top = raster.top.copy()
+    top[sel] = under[sel]
+    return Raster(raster.cell, raster.ox, raster.oz, top)
+
+
+def _overhang_probe(view: MapView, floor_y, cell, p: SemanticsParams):
+    def is_overhang(xz, med):
+        centre, u, _, eu, ev = min_area_rect(xz)
+        y0 = floor_y + p.blob_min_h + 0.05
+        y1 = floor_y + med - 0.15
+        if y1 <= y0:
+            return False
+        probe = Obb(float(centre[0]), float(centre[1]), yaw_from_right(u[0], u[1]),
+                    eu + cell, ev + cell, y0, y1)
+        return view.free_fraction(probe) >= p.overhang_free_min
+    return is_overhang
+
+
 def detect(view: MapView, params: Optional[SemanticsParams] = None,
            scene_labels: Sequence[SceneLabel] = ()) -> Detection:
     p = params or SemanticsParams()
@@ -422,8 +470,10 @@ def detect(view: MapView, params: Optional[SemanticsParams] = None,
     pts, nrm = view.surface_points(floor_y + 0.03, floor_y + p.blob_max_h + 1.0)
     walls = detect_walls(pts, nrm, floor_y, p)
     hm = as_heightmap(view.heightmap()) if p.raster_source == "heightmap" else None
+    is_overhang = None
     if hm is not None:
-        raster = heightmap_raster(hm, floor_y)
+        raster = _refill_overhangs(heightmap_raster(hm, floor_y), pts, nrm, floor_y, p)
+        is_overhang = _overhang_probe(view, floor_y, raster.cell, p)
     elif len(pts):
         rel = pts[:, 1] - floor_y
         up = (nrm[:, 1] >= p.up_normal_min) & (rel >= p.blob_min_h) & (rel <= p.blob_max_h)
@@ -431,7 +481,7 @@ def detect(view: MapView, params: Optional[SemanticsParams] = None,
     else:
         raster = rasterize_max(pts, p.raster_cell)
     cands = []
-    for g in _segment(raster, floor_y, p):
+    for g in _segment(raster, floor_y, p, is_overhang):
         c = _classify(g, raster.cell, p)
         if c is not None:
             cands.append(c)

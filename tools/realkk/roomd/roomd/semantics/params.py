@@ -10,11 +10,13 @@ class SemanticsParams:
     # --- 2.5D raster / segmentation
     raster_source: str = "heightmap"   # "heightmap" (fusion 5 cm map) or "points" (upward points)
     raster_cell: float = 0.02          # m, raster cell when raster_source = "points"
-    up_normal_min: float = 0.8         # normal.y for "horizontal surface" points
+    up_normal_min: float = 0.65        # normal.y for "horizontal surface" points (TSDF normals are noisy)
     blob_min_h: float = 0.05           # m above floor; lower = floor
     blob_max_h: float = 2.0            # m above floor; higher = structure, ignored
     structure_min_h: Optional[float] = None  # m; capped heightmap: cells this high = walls/unknown, ignored
     split_dh: float = 0.10             # m, neighbour step that cuts a blob in two
+    overhang_min_h: float = 1.4        # m; heightmap tops this high may be an overhang (loft bed)
+    overhang_free_min: float = 0.5     # free share under a tall piece that makes it an overhang
     split_patch_dh: float = 0.03       # m, two large flat patches this far apart split a blob
     split_patch_fill: float = 0.6      # ... if each fills this much of its min-area rectangle
     patch_tol: float = 0.02            # m, neighbour step inside one horizontal patch
