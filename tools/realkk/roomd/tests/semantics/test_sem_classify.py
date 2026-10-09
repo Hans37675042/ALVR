@@ -200,3 +200,22 @@ def test_desk_under_loft_bed_is_found(cut):
     assert len(tables) == 1, [(c.kind, round(c.surface_h, 2)) for c in cands]
     assert abs(tables[0].surface_h - 0.72) < 0.03
     assert abs(tables[0].sx - 1.6) < 0.1 and abs(tables[0].sz - 0.7) < 0.1
+
+
+def test_low_box_against_taller_furniture_is_not_a_chair():
+    # real tap: suitcase / basket drawers next to taller furniture read as seat + backrest
+    from roomd.semantics import Obb
+    suitcase = Obb(0.0, 0.0, 0.0, 0.5, 0.35, 0.0, 0.5)
+    shelf = Obb(0.0, -0.32, 0.0, 0.6, 0.28, 0.0, 1.2)
+    cands = _detect([suitcase, shelf])
+    assert cands and not any(c.sittable for c in cands), [(c.kind, c.sx, c.sz) for c in cands]
+
+
+def test_things_under_a_loft_do_not_make_a_backrest():
+    from roomd.semantics import Obb
+    room = make_room()
+    room.place("cab", storage(0.0, -1.6, 0.0, w=0.5, d=0.4, h=0.45))
+    room.place("shelf", storage(0.0, -1.95, 0.0, w=0.5, d=0.2, h=1.1))
+    room.place("loft", [Obb(0.0, -1.7, 0.0, 2.0, 0.9, 1.55, 1.65)])
+    cands = detect(room).candidates
+    assert not any(c.sittable for c in cands), [(c.kind, round(c.surface_h, 2)) for c in cands]
