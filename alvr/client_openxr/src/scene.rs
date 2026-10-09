@@ -13,6 +13,7 @@ use alvr_common::{error, info, warn};
 use alvr_packets::{SceneAnchor, SceneMesh, SceneRoom, SceneSnapshot, SceneUuid};
 use openxr::{self as xr, raw, sys};
 use std::{
+    cell::Cell,
     ffi::{CString, c_char},
     ptr,
     time::{Duration, Instant},
@@ -85,6 +86,7 @@ pub struct SceneLoader {
     requery: bool,
     // Spaces loaded by the queries; destroyed once the snapshot is built
     loaded_spaces: Vec<sys::Space>,
+    labels_fallback_warned: Cell<bool>,
 }
 
 impl SceneLoader {
@@ -113,6 +115,7 @@ impl SceneLoader {
             state: State::Idle,
             requery: false,
             loaded_spaces: Vec::new(),
+            labels_fallback_warned: Cell::new(false),
         })
     }
 
@@ -592,7 +595,16 @@ impl SceneLoader {
         };
 
         // Retry without the support info for runtimes that reject it
-        for next in [&support as *const _ as *const _, ptr::null()] {
+        for (attempt, next) in [&support as *const _ as *const _, ptr::null()]
+            .into_iter()
+            .enumerate()
+        {
+            if attempt == 1 && !self.labels_fallback_warned.replace(true) {
+                warn!(
+                    "[SCENE] runtime rejected XrSemanticLabelsSupportInfoFB, labels use the \
+                     legacy set (GLOBAL_MESH/INVISIBLE_WALL_FACE may read as OTHER)"
+                );
+            }
             let mut labels = sys::SemanticLabelsFB {
                 ty: sys::SemanticLabelsFB::TYPE,
                 next,
