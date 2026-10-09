@@ -128,6 +128,7 @@ pub struct StreamContext {
     system: xr::SystemId,
     last_depth_capture: Instant,
     depth_readback: Option<DepthReadback>,
+    depth_skipped_frames: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -337,6 +338,7 @@ impl StreamContext {
             system,
             last_depth_capture: Instant::now(),
             depth_readback,
+            depth_skipped_frames: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -794,7 +796,7 @@ impl StreamContext {
         {
             let texture_id = depth_provider.swapchain_images[swapchain_idx];
             if texture_id == 0 {
-                vec![0x80u8; pixel_count * 2 * 2]
+                None
             } else {
                 self.gfx_ctx.make_current();
                 let gl = &self.gfx_ctx.gl_context;
@@ -910,12 +912,26 @@ impl StreamContext {
                         }
                     }
 
-                    depth_bytes
+                    Some(depth_bytes)
                 }
             }
         } else {
-            // Fallback: dummy data
-            vec![0x80u8; pixel_count * 2 * 2]
+            // No readback pipeline
+            None
+        };
+
+        // Without a readback there is no depth: skip the frame instead of sending a constant
+        // 0x8080 image that viewers would take for real depth.
+        let Some(depth_bytes) = depth_bytes else {
+            self.depth_skipped_frames += 1;
+            if self.depth_skipped_frames <= 3 || self.depth_skipped_frames % 100 == 0 {
+                alvr_common::warn!(
+                    "[XR_DATA] depth readback unavailable, frame skipped ({} so far)",
+                    self.depth_skipped_frames
+                );
+            }
+            self.last_depth_capture = Instant::now();
+            return;
         };
 
         // Each depth view has its own pose (stage space) and FOV; the depth cameras are not
