@@ -411,7 +411,10 @@ fn encode_camera_frame(header: &CameraFrameHeader, data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use alvr_common::{Pose, glam::{Quat, Vec3}};
-    use alvr_packets::DepthFrameFormat;
+    use alvr_packets::{
+        DepthFrameFormat, SceneAnchor, SceneMesh, SceneRoom, SceneSnapshot, SceneUuid,
+        scene_uuid_string,
+    };
 
     fn f32_at(buf: &[u8], offset: usize) -> f32 {
         f32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
@@ -516,6 +519,267 @@ mod tests {
         est.report(t0, 5, 0); // stale sample with a very low offset
         let offset = est.report(t0 + Duration::from_secs(11), 1_000, 0);
         assert_eq!(offset, 1_000);
+    }
+
+    fn uuid(n: u8) -> SceneUuid {
+        let mut u = [0u8; 16];
+        u[0] = n;
+        u[15] = 0xab;
+        u
+    }
+
+    fn sample_scene() -> SceneSnapshot {
+        SceneSnapshot {
+            rooms: vec![SceneRoom {
+                uuid: uuid(1),
+                floor: Some(uuid(2)),
+                ceiling: None,
+                walls: vec![uuid(3), uuid(4)],
+            }],
+            anchors: vec![
+                SceneAnchor {
+                    uuid: uuid(5),
+                    labels: "TABLE".into(),
+                    pose: Some(Pose {
+                        orientation: Quat::from_rotation_y(0.5),
+                        position: Vec3::new(1.0, 0.7, -2.0),
+                    }),
+                    bbox2d: Some([-0.5, -0.25, 1.0, 0.5]),
+                    boundary2d: Some(vec![[-0.5, -0.25], [0.5, -0.25], [0.5, 0.25]]),
+                    bbox3d: Some([-0.5, -0.25, -0.7, 1.0, 0.5, 0.7]),
+                },
+                SceneAnchor {
+                    uuid: uuid(6),
+                    labels: "GLOBAL_MESH".into(),
+                    pose: None,
+                    bbox2d: None,
+                    boundary2d: None,
+                    bbox3d: None,
+                },
+            ],
+            meshes: vec![SceneMesh {
+                anchor_uuid: uuid(6),
+                pose: Pose {
+                    orientation: Quat::IDENTITY,
+                    position: Vec3::new(0.0, 0.0, 0.5),
+                },
+                vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                indices: vec![0, 1, 2],
+            }],
+        }
+    }
+
+    fn sample_recenter() -> Pose {
+        Pose {
+            orientation: Quat::from_rotation_y(1.0),
+            position: Vec3::new(0.3, 0.0, -0.4),
+        }
+    }
+
+    fn pose_at(buf: &[u8], offset: usize) -> [f32; 7] {
+        std::array::from_fn(|i| f32_at(buf, offset + 4 * i))
+    }
+
+    fn pose_array(pose: Pose) -> [f32; 7] {
+        [
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ]
+    }
+
+    fn assert_pose_close(a: [f32; 7], b: [f32; 7]) {
+        for i in 0..7 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    #[test]
+    fn recentered_scene_moves_anchor_and_mesh_poses_only() {
+        let scene = sample_scene();
+        let recenter = sample_recenter();
+        let out = recenter_scene(&scene, recenter);
+
+        let expected = recenter * scene.anchors[0].pose.unwrap();
+        assert_pose_close(pose_array(out.anchors[0].pose.unwrap()), pose_array(expected));
+        assert!(out.anchors[1].pose.is_none());
+        assert_pose_close(
+            pose_array(out.meshes[0].pose),
+            pose_array(recenter * scene.meshes[0].pose),
+        );
+
+        // Bounds and mesh vertices are anchor-local and must not change
+        assert_eq!(out.anchors[0].bbox3d, scene.anchors[0].bbox3d);
+        assert_eq!(out.anchors[0].boundary2d, scene.anchors[0].boundary2d);
+        assert_eq!(out.meshes[0].vertices, scene.meshes[0].vertices);
+        assert_eq!(out.rooms[0].walls, scene.rooms[0].walls);
+    }
+
+    #[test]
+    fn scene_json_matches_contract() {
+        let scene = sample_scene();
+        let json: serde_json::Value =
+            serde_json::from_str(&scene_snapshot_json(&scene)).unwrap();
+
+        let room = &json["rooms"][0];
+        assert_eq!(room["uuid"], scene_uuid_string(&uuid(1)));
+        assert_eq!(room["floor"], scene_uuid_string(&uuid(2)));
+        assert!(room["ceiling"].is_null());
+        assert_eq!(room["walls"].as_array().unwrap().len(), 2);
+        assert_eq!(room["walls"][1], scene_uuid_string(&uuid(4)));
+
+        let table = &json["anchors"][0];
+        assert_eq!(table["uuid"], "05000000-0000-0000-0000-0000000000ab");
+        assert_eq!(table["labels"], "TABLE");
+        let pose = table["pose"].as_array().unwrap();
+        assert_eq!(pose.len(), 7);
+        // [px, py, pz, qx, qy, qz, qw]
+        assert!((pose[0].as_f64().unwrap() - 1.0).abs() < 1e-6);
+        assert!((pose[2].as_f64().unwrap() + 2.0).abs() < 1e-6);
+        assert!((pose[6].as_f64().unwrap() - 0.25f64.cos()).abs() < 1e-6);
+        assert_eq!(table["bbox2d"].as_array().unwrap().len(), 4);
+        assert_eq!(table["boundary2d"].as_array().unwrap().len(), 3);
+        assert_eq!(table["boundary2d"][1].as_array().unwrap().len(), 2);
+        assert_eq!(table["bbox3d"].as_array().unwrap().len(), 6);
+
+        let mesh_anchor = &json["anchors"][1];
+        assert_eq!(mesh_anchor["labels"], "GLOBAL_MESH");
+        for key in ["pose", "bbox2d", "boundary2d", "bbox3d"] {
+            assert!(mesh_anchor[key].is_null(), "{key}");
+        }
+    }
+
+    #[test]
+    fn room_snapshot_layout_matches_contract() {
+        let scene = sample_scene();
+        let recenter = sample_recenter();
+        let buf = encode_room_snapshot(7, recenter, &scene);
+
+        assert_eq!(u32_at(&buf, 0), ROOM_SNAPSHOT_HEADER_SIZE);
+        assert_eq!(ROOM_SNAPSHOT_HEADER_SIZE, 40);
+        assert_eq!(u32_at(&buf, 4), 1); // version
+        assert_eq!(u32_at(&buf, 8), 7); // snapshot_id
+        assert_pose_close(pose_at(&buf, 12), pose_array(recenter));
+
+        let json_len = u32_at(&buf, 40) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&buf[44..44 + json_len]).unwrap();
+        // Poses in the JSON are already recentered
+        let table_pose: Vec<f32> = json["anchors"][0]["pose"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        assert_pose_close(
+            table_pose.try_into().unwrap(),
+            pose_array(recenter * scene.anchors[0].pose.unwrap()),
+        );
+
+        let mut off = 44 + json_len;
+        assert_eq!(u32_at(&buf, off), 1); // mesh_count
+        off += 4;
+        assert_eq!(&buf[off..off + 16], &uuid(6));
+        off += 16;
+        assert_pose_close(pose_at(&buf, off), pose_array(recenter * scene.meshes[0].pose));
+        off += 28;
+        assert_eq!(u32_at(&buf, off), 3); // vcount
+        assert_eq!(u32_at(&buf, off + 4), 3); // icount
+        off += 8;
+        assert_eq!(f32_at(&buf, off + 12), 1.0); // vertex 1 x
+        assert_eq!(f32_at(&buf, off + 28), 1.0); // vertex 2 y
+        off += 36;
+        assert_eq!(u32_at(&buf, off + 8), 2); // index 2
+        off += 12;
+        assert_eq!(buf.len(), off);
+    }
+
+    #[test]
+    fn empty_room_snapshot_has_empty_lists_and_no_meshes() {
+        let buf = encode_room_snapshot(1, Pose::IDENTITY, &SceneSnapshot::default());
+        let json_len = u32_at(&buf, 40) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&buf[44..44 + json_len]).unwrap();
+        assert_eq!(json["rooms"].as_array().unwrap().len(), 0);
+        assert_eq!(json["anchors"].as_array().unwrap().len(), 0);
+        assert_eq!(u32_at(&buf, 44 + json_len), 0);
+        assert_eq!(buf.len(), 48 + json_len);
+    }
+
+    #[test]
+    fn playspace_changed_layout_matches_contract() {
+        let recenter = sample_recenter();
+        let buf = encode_playspace_changed(recenter);
+        assert_eq!(buf.len(), 32);
+        assert_eq!(u32_at(&buf, 0), 1); // version
+        assert_pose_close(pose_at(&buf, 4), pose_array(recenter));
+    }
+
+    #[test]
+    fn room_request_payload_parses_recapture_flag() {
+        assert_eq!(parse_room_request(&[0]), Some(false));
+        assert_eq!(parse_room_request(&[1]), Some(true));
+        assert_eq!(parse_room_request(&[]), None);
+    }
+
+    fn read_msg(stream: &mut TcpStream) -> (u32, Vec<u8>) {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).unwrap();
+        let len = u32_at(&header, 4) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).unwrap();
+        (u32_at(&header, 0), payload)
+    }
+
+    #[test]
+    fn relay_resends_scene_on_connect_and_recenter_and_forwards_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let relay = XrDataRelay::new(port);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        relay.set_scene_request_callback(Box::new({
+            let requests = Arc::clone(&requests);
+            move |recapture| requests.lock().unwrap().push(recapture)
+        }));
+        // The snapshot may arrive before or while the viewer connects; it must be delivered
+        relay.set_scene_snapshot(sample_scene());
+
+        let (mut viewer, _) = listener.accept().unwrap();
+        viewer
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (ty, payload) = read_msg(&mut viewer);
+        assert_eq!(ty, MSG_ROOM_SNAPSHOT);
+        let first_id = u32_at(&payload, 8);
+        assert_pose_close(pose_at(&payload, 12), pose_array(Pose::IDENTITY));
+
+        relay.set_recenter_pose(sample_recenter());
+        // Skip a possible duplicate of the first snapshot (sent by both connect and set)
+        let mut msg = read_msg(&mut viewer);
+        while msg.0 == MSG_ROOM_SNAPSHOT && pose_at(&msg.1, 12) == pose_array(Pose::IDENTITY) {
+            msg = read_msg(&mut viewer);
+        }
+        assert_eq!(msg.0, MSG_PLAYSPACE_CHANGED);
+        assert_pose_close(pose_at(&msg.1, 4), pose_array(sample_recenter()));
+        let (ty, payload) = read_msg(&mut viewer);
+        assert_eq!(ty, MSG_ROOM_SNAPSHOT);
+        assert_eq!(u32_at(&payload, 8), first_id);
+        assert_pose_close(pose_at(&payload, 12), pose_array(sample_recenter()));
+
+        // Viewer asks for a Space Setup recapture
+        let mut request = Vec::new();
+        request.extend_from_slice(&MSG_ROOM_REQUEST.to_le_bytes());
+        request.extend_from_slice(&1u32.to_le_bytes());
+        request.push(1);
+        viewer.write_all(&request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*requests.lock().unwrap(), vec![true]);
     }
 
     #[test]
