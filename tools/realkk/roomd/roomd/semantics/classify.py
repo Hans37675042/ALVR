@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from .geometry import (
     adjacency_counts, detect_walls, footprint_iou, label_components, min_area_rect, rasterize_max)
@@ -74,6 +73,18 @@ class _Geom:
     flat_ratio: float
 
 
+def _nearest(seeds, queries):
+    """Index of the nearest seed for every query point (brute force, chunked)."""
+    seeds = seeds.astype(float)
+    out = np.empty(len(queries), dtype=int)
+    chunk = max(1, 2_000_000 // max(1, len(seeds)))
+    for s in range(0, len(queries), chunk):
+        q = queries[s:s + chunk].astype(float)
+        d = ((q[:, None, :] - seeds[None, :, :]) ** 2).sum(axis=2)
+        out[s:s + chunk] = d.argmin(axis=1)
+    return out
+
+
 def _split_by_patches(pieces, n, patches, big, patch_mean, p: SemanticsParams):
     """Split a piece holding two or more large flat patches at different heights
     (bed + nightstand pushed together, both under ``split_dh`` apart): every cell
@@ -88,9 +99,7 @@ def _split_by_patches(pieces, n, patches, big, patch_mean, p: SemanticsParams):
         if len(ids) < 2 or np.ptp(patch_mean[ids]) < p.split_patch_dh:
             continue
         seed = np.isin(pid, ids)
-        tree = cKDTree(np.column_stack([iz[seed], ix[seed]]))
-        _, nn = tree.query(np.column_stack([iz, ix]))
-        owner = pid[seed][nn]
+        owner = pid[seed][_nearest(np.column_stack([iz[seed], ix[seed]]), np.column_stack([iz, ix]))]
         for b in ids[1:]:
             sel = owner == b
             out[iz[sel], ix[sel]] = next_label
@@ -310,6 +319,8 @@ def _away_from_wall_yaw(obb: Obb, walls):
 
 
 def _is_stale(view: MapView, hm, obb: Obb, p: SemanticsParams) -> bool:
+    if hm is None:
+        return False
     rel, known = heightmap_cells(hm, obb)
     if rel.size == 0:
         return False

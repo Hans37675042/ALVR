@@ -6,9 +6,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-
 from .params import SemanticsParams
 from .basics import Obb
 
@@ -91,12 +88,83 @@ def label_components(mask, top, max_step):
             ok &= np.abs(top[a] - top[b]) <= max_step
         rows.append(idx[a][ok])
         cols.append(idx[b][ok])
-    r = np.concatenate(rows)
-    c = np.concatenate(cols)
-    graph = coo_matrix((np.ones(len(r)), (r, c)), shape=(n, n))
-    count, comp = connected_components(graph, directed=False)
+    comp, count = connected_labels(n, np.concatenate(rows), np.concatenate(cols))
     labels[mask] = comp
-    return labels, int(count)
+    return labels, count
+
+
+def connected_labels(n, rows, cols):
+    """Connected components of an undirected graph on n nodes given as edge lists.
+    Returns (labels 0..count-1, count). Root hooking + pointer jumping, numpy only."""
+    labels = np.arange(n)
+    rows = np.asarray(rows, dtype=int)
+    cols = np.asarray(cols, dtype=int)
+    if n == 0:
+        return labels, 0
+    while len(rows):
+        lr, lc = labels[rows], labels[cols]
+        low = np.minimum(lr, lc)
+        new = labels.copy()
+        np.minimum.at(new, lr, low)
+        np.minimum.at(new, lc, low)
+        while True:
+            nxt = new[new]
+            if np.array_equal(nxt, new):
+                break
+            new = nxt
+        if np.array_equal(new, labels):
+            break
+        labels = new
+    _, inv = np.unique(labels, return_inverse=True)
+    return inv, int(inv.max()) + 1
+
+
+def linear_assignment(cost):
+    """Minimum-cost assignment (Hungarian, shortest augmenting path), like
+    scipy.optimize.linear_sum_assignment: returns (rows, cols) sorted by row."""
+    cost = np.asarray(cost, dtype=float)
+    if cost.size == 0:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+    transposed = cost.shape[0] > cost.shape[1]
+    a = cost.T if transposed else cost
+    n, m = a.shape
+    u = np.zeros(n + 1)
+    v = np.zeros(m + 1)
+    p = np.zeros(m + 1, dtype=int)    # p[j]: row (1-based) assigned to column j
+    way = np.zeros(m + 1, dtype=int)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(m + 1, np.inf)
+        used = np.zeros(m + 1, dtype=bool)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            free = ~used[1:]
+            cur = a[i0 - 1] - u[i0] - v[1:]
+            upd = free & (cur < minv[1:])
+            minv[1:][upd] = cur[upd]
+            way[1:][upd] = j0
+            cand = np.where(free, minv[1:], np.inf)
+            j1 = int(np.argmin(cand)) + 1
+            delta = cand[j1 - 1]
+            on = np.nonzero(used)[0]
+            u[p[on]] += delta
+            v[on] -= delta
+            minv[~used] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+    cols = np.nonzero(p[1:])[0]
+    rows = p[1:][cols] - 1
+    if transposed:
+        rows, cols = cols, rows
+    order = np.argsort(rows)
+    return rows[order], cols[order]
 
 
 def adjacency_counts(labels):

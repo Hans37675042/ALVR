@@ -7,10 +7,9 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 from .classify import Candidate, detect
-from .geometry import footprint_iou
+from .geometry import footprint_iou, linear_assignment
 from .mapview import MapView, as_heightmap
 from .params import SemanticsParams
 from .seats import generate_seats, pose_json, seat_areas, seat_occupancy
@@ -163,7 +162,7 @@ class RoomSemantics:
             for i, c in enumerate(rest):
                 for j, tr in enumerate(live):
                     cost[i, j] = self._cost(c, tr)
-            rows, cols = linear_sum_assignment(cost)
+            rows, cols = linear_assignment(cost)
             taken = set()
             for i, j in zip(rows, cols):
                 if cost[i, j] >= _BIG:
