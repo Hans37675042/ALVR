@@ -296,6 +296,11 @@ class TsdfFusion:
             n = min(int(count.numpy()[0]), cap)
             p = pts.numpy()[:n]
             q = nrm.numpy()[:n]
+        # the kernel appends through an atomic counter: fix the order so results (and the
+        # floor fit summed over them) repeat exactly
+        order = np.lexsort((p[:, 1], p[:, 2], p[:, 0]))
+        p = p[order]
+        q = q[order]
         keep = (p[:, 1] >= min_y) & (p[:, 1] < max_y)
         if region is not None:
             local = (p - np.asarray(region.center)) @ region.rotation()
