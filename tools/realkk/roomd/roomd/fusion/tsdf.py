@@ -72,6 +72,7 @@ class TsdfFusion:
         self._hm_last = -math.inf
         self._floor_cache = None
         self._head = None
+        self._pending_removals: List[Tuple[int, int, int]] = []
 
     # ------------------------------------------------------------------ volume
 
@@ -106,8 +107,22 @@ class TsdfFusion:
         return 0 if self._dims is None else int(np.prod(self._dims))
 
     def reset(self):
+        """Drop the volume (e.g. after a recenter). The next frame allocates a new one.
+
+        Chunk revisions survive and every chunk that was sent with geometry is reported as
+        removed (vcount = 0) by the next snapshot_outputs(), so receivers never see a
+        revision go backwards.
+        """
         with self._lock:
-            self.__init__(self.config)
+            for key, st in self._chunks.items():
+                if st.sent_nonempty:
+                    self._pending_removals.append(key)
+                    st.sent_nonempty = False
+            self._origin = self._dims = None
+            self._tsdf = self._weight = self._last_seen = self._odo = None
+            self._floor_cache = None
+            self._hm_dirty = False
+            self._head = None
 
     # ------------------------------------------------------------- integration
 
@@ -425,6 +440,17 @@ class TsdfFusion:
         cfg = self.config
         with self._lock:
             out = FusionOutputs(mesh_chunks=[], heightmap=None, floor=None, stats={})
+            for key in self._pending_removals:
+                st = self._chunks[key]
+                st.revision += 1
+                st.last_sent = now
+                out.mesh_chunks.append(MeshChunk(ix=key[0], iy=key[1], iz=key[2], revision=st.revision,
+                                                 chunk_size=cfg.chunk_size,
+                                                 vertices=np.zeros((0, 3), np.float32),
+                                                 indices=np.zeros(0, np.uint32)))
+            if self._pending_removals:
+                self._pending_removals = []
+                self._map_revision += 1
             if self._origin is None:
                 out.stats = self.stats()
                 return out

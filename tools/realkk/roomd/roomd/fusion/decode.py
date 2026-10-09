@@ -103,8 +103,31 @@ class DepthFrame:
         return np.mean([v.position_unity for v in self.views], axis=0)
 
 
-def _unpack_raw(payload, header_size, fmt, width, height):
-    data = payload[header_size:]
+def parse_header(payload) -> dict:
+    """MSG_DEPTH_FRAME_V2 header as a dict with depth_listener.parse_depth_v2's keys."""
+    if len(payload) < MIN_HEADER_SIZE:
+        raise ValueError("depth payload too short (%d bytes)" % len(payload))
+    header_size = struct.unpack_from("<I", payload, 0)[0]
+    if header_size < MIN_HEADER_SIZE or header_size > len(payload):
+        raise ValueError("bad depth header_size %d" % header_size)
+    h = {"header_size": header_size}
+    h["client_timestamp_ns"] = struct.unpack_from("<Q", payload, 4)[0]
+    h["view_poses"] = [struct.unpack_from("<7f", payload, off) for off in (12, 40)]
+    h["width"], h["height"] = struct.unpack_from("<II", payload, 68)
+    h["near_z"], h["far_z"] = struct.unpack_from("<ff", payload, 76)
+    h["format"] = struct.unpack_from("<I", payload, 84)[0]
+    h["fov_angles"] = [struct.unpack_from("<4f", payload, off) for off in (88, 104)]
+    h["intrinsics"] = [struct.unpack_from("<4f", payload, off) for off in (120, 136)]
+    if header_size >= 160:
+        h["server_timestamp_unix_ns"] = struct.unpack_from("<Q", payload, 152)[0]
+    return h
+
+
+def unpack_d16(header, data):
+    """Pixel data after the header -> stacked (height, width) uint16 D16 image."""
+    width, height, fmt = header["width"], header["height"], header["format"]
+    if width == 0 or height == 0 or height % 2:
+        raise ValueError("bad stacked depth size %dx%d" % (width, height))
     if fmt == FORMAT_LZ4_D16:
         import lz4.block
 
@@ -114,7 +137,7 @@ def _unpack_raw(payload, header_size, fmt, width, height):
         if size != width * height * 2:
             raise ValueError("LZ4 size %d does not match %dx%d" % (size, width, height))
         try:
-            raw = lz4.block.decompress(data[4:], uncompressed_size=size)
+            raw = lz4.block.decompress(bytes(data[4:]), uncompressed_size=size)
         except Exception as e:  # lz4 raises LZ4BlockError
             raise ValueError("bad LZ4 depth data: %s" % e) from e
     elif fmt == FORMAT_RAW_D16:
@@ -126,48 +149,41 @@ def _unpack_raw(payload, header_size, fmt, width, height):
     return np.frombuffer(raw, dtype="<u2").reshape(height, width)
 
 
-def decode_depth_frame(payload, flip_rows=False) -> Optional[DepthFrame]:
-    """Decode a MSG_DEPTH_FRAME_V2 payload. Returns None for a fake (all-0x80) frame.
+def frame_from_header(header, raw, flip_rows=False) -> Optional[DepthFrame]:
+    """Header dict (parse_header / depth_listener.parse_depth_v2) + stacked D16 image.
 
-    flip_rows: the image rows are bottom-up; each view image is flipped vertically before
-    the pinhole model (u right, v down) is applied.
+    Returns None for a fake (all-0x80) frame. flip_rows: the image rows are bottom-up;
+    each view image is flipped vertically before the pinhole model (u right, v down).
     """
-    if len(payload) < MIN_HEADER_SIZE:
-        raise ValueError("depth payload too short (%d bytes)" % len(payload))
-    header_size = struct.unpack_from("<I", payload, 0)[0]
-    if header_size < MIN_HEADER_SIZE or header_size > len(payload):
-        raise ValueError("bad depth header_size %d" % header_size)
-    client_ts = struct.unpack_from("<Q", payload, 4)[0]
-    poses = [struct.unpack_from("<7f", payload, off) for off in (12, 40)]
-    width, height = struct.unpack_from("<II", payload, 68)
-    near, far = struct.unpack_from("<ff", payload, 76)
-    fmt = struct.unpack_from("<I", payload, 84)[0]
-    intrinsics = [struct.unpack_from("<4f", payload, off) for off in (120, 136)]
-    server_ts = struct.unpack_from("<Q", payload, 152)[0] if header_size >= 160 else None
-    if width == 0 or height == 0 or height % 2:
-        raise ValueError("bad stacked depth size %dx%d" % (width, height))
-
-    raw = _unpack_raw(payload, header_size, fmt, width, height)
+    raw = np.asarray(raw)
     if np.all(raw == FAKE_SAMPLE):
         return None
+    near, far = header["near_z"], header["far_z"]
     if not (near > 0) or math.isnan(far) or far <= near:
         raise ValueError("bad near/far %r/%r" % (near, far))
-
-    half = height // 2
+    half = raw.shape[0] // 2
     views = []
     for i in range(2):
         img = raw[i * half:(i + 1) * half]
         if flip_rows:
             img = img[::-1]
-        q = poses[i][:4]
-        p = poses[i][4:]
-        fx, fy, cx, cy = intrinsics[i]
+        pose = header["view_poses"][i]
+        q = pose[:4]
+        p = pose[4:]
+        fx, fy, cx, cy = header["intrinsics"][i]
         views.append(DepthView(
             depth=np.ascontiguousarray(d16_to_metric(img, near, far)),
             fx=fx, fy=fy, cx=cx, cy=cy,
             position_xr=np.array(p, dtype=np.float64), rotation_xr=np.array(q, dtype=np.float64),
             position_unity=xr_to_unity_position(p), rotation_unity=xr_to_unity_quat(q)))
-    return DepthFrame(views=views, client_ts_ns=client_ts, server_ts_ns=server_ts, near=near, far=far)
+    return DepthFrame(views=views, client_ts_ns=header["client_timestamp_ns"],
+                      server_ts_ns=header.get("server_timestamp_unix_ns"), near=near, far=far)
+
+
+def decode_depth_frame(payload, flip_rows=False) -> Optional[DepthFrame]:
+    """Decode a MSG_DEPTH_FRAME_V2 payload. Returns None for a fake (all-0x80) frame."""
+    header = parse_header(payload)
+    return frame_from_header(header, unpack_d16(header, payload[header["header_size"]:]), flip_rows)
 
 
 def view_rays(view):

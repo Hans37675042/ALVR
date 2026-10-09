@@ -6,7 +6,17 @@ from .outputs import (FloorPlane, FusionOutputs, Heightmap, MeshChunk, encode_me
                       encode_nav_heightmap)
 from .tsdf import Obb, TsdfFusion
 
+
+
+def create_sink():
+    """roomd --fusion roomd.fusion:create_sink (imports roomd.sink lazily)."""
+    from .sink import create_sink as factory
+
+    return factory()
+
+
 __all__ = [
+    "create_sink",
     "DepthFrame", "DepthView", "FloorPlane", "FusionConfig", "FusionOutputs", "Heightmap",
     "MeshChunk", "Obb", "TsdfFusion", "decode_depth_frame", "encode_mesh_chunk", "encode_nav_heightmap",
 ]
