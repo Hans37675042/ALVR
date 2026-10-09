@@ -139,17 +139,20 @@ D16 換成線性距離（標準 GL 投影，d ∈ [0,1]）：
 - 每個 slot 帶著 acquire 當下的 display time、兩個 view 的 pose／FOV、near／far、寬高，所以晚 1–3 幀才送出的深度 header 仍是擷取那一刻的值。線格式沒有變。
 - render thread 交給 worker 的佇列只有 1 格，滿了就丟這一幀（計數）。buffer 由 worker 還回來重複使用，穩定狀態不配置記憶體。
 - 擷取時機改成固定排程（`next_due += 1/depth_fps`），不再是「距上次擷取滿一個間隔」：72 Hz 下舊作法會變成每 8 幀一次（9 fps），量到的 7.6 fps 也有這個因素。還沒有新深度影像（acquire 回 None）時下一幀重試；停頓超過一個間隔後從當下重新起算，不會連續補發。
-- viewer 關掉 depth feed 時呼叫 `xrStopEnvironmentDepthProviderMETA`，重新開啟時走原本的 start 路徑（會重新列舉 swapchain image）。
+- acquire 新影像會把上一張還給 runtime，runtime 之後可能覆寫它，而 app 的 GL fence 擋不住 runtime 端的寫入。所以 blit 讀完 runtime image 之後另插一個 guard fence（`ReleaseGuard`），要等它 signal 才 acquire 下一張；沒 signal 就下一幀再試，不等待，計數在 `runtime-busy frames`。不這樣做的話，送出的深度可能比 header 的 pose 新，或是讀到寫到一半的影像。
+- viewer 關掉 depth feed 時，render thread 先丟掉還在 PBO 裡的幀（不再送出），等 guard fence signal 後才呼叫 `xrStopEnvironmentDepthProviderMETA`。重新開啟時走原本的 start 路徑（會重新列舉 swapchain image）。
+- 深度幀和 tracking、statistics 共用同一條 stream socket 的 mutex。原本一幀幾百 KB 要整包寫完才放鎖，render thread 上的 `report_submit`（在 xrEndFrame 前）會被卡住，而且它卡住時還握著 statistics lock，連帶擋住 video receive thread。現在深度幀改用 `send_interleaved`，UDP 每個 shard 鎖一次，其他封包可以插在 shard 之間，線格式不變；TCP 仍整包寫。`report_submit` 先取 summary、放掉 statistics lock，再用 `try_send` 送，socket 正忙就跳過這一幀的 statistics。
 
 **`[XR_PERF]` log**（`adb logcat | Select-String "XR_PERF"`）：
 
-- render thread，每讀回 50 幀一行：`[XR_PERF] depth N frames read back, S skipped, R ring-full frames, D dropped at the worker, B buffers: ...`，後面接各段的 p50／p95／max：
+- render thread，每讀回 50 幀一行：`[XR_PERF] depth N frames read back, S skipped, R ring-full frames, G runtime-busy frames, D dropped at the worker, B buffers: ...`，後面接各段的 p50／p95／max：
   - `enqueue_ms`：排入 GPU 指令的時間，應遠低於 1 ms。
   - `map_ms`：map＋翻轉複製＋unmap。
   - `fence_frames`／`fence_ms`：從排入到讀出隔了幾幀／幾 ms，預期 1–3 幀。
   - `acquire_ms`：`xrAcquireEnvironmentDepthImageMETA`。
   - `render_thread_ms`：有做深度工作的那幾幀，深度路徑佔 render thread 的總時間。
 - worker，每送 50 幀一行：`[XR_PERF] depth worker N frames: lz4_ms ..., send_ms ...`。
+- render thread，每 720 個送出的幀（72 Hz 約 10 秒）一行：`[XR_PERF] render N frames: report_submit_ms ...`。開關 depth 對照，p95 應維持在 1 ms 以下；偏高代表 render thread 又在等 socket（例如走 TCP 時）。
 
 **Adreno PBO 的坑（未實機驗證，看 log 判斷）**：
 
