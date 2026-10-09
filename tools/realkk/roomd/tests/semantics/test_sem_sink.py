@@ -233,3 +233,23 @@ def test_fused_other_objects_are_not_published_but_scene_other_is():
     assert any(k == M.Kind.Chair for _, k, _ in published)
     assert any(o["Kind"] == "Other" and o["Source"] == "Fused"
                for o in sink.semantics._output(0.0, 0.0)["Objects"])  # still tracked internally
+
+
+def test_map_view_lowers_fusion_normal_filter_only_during_its_query():
+    room = _room()
+    fusion = FakeFusion(room)
+    fusion.config = SimpleNamespace(upward_min_normal_y=0.85)
+    seen = []
+    orig = fusion.surface_points
+
+    def spy(min_y, max_y, region=None):
+        seen.append(fusion.config.upward_min_normal_y)
+        return orig(min_y, max_y, region)
+
+    fusion.surface_points = spy
+    view = FusionMapView(fusion, obb_cls=FakeFusionObb, up_normal_min=0.65)
+    view.surface_points(0.03, 2.0)
+    assert seen == [0.65]
+    assert fusion.config.upward_min_normal_y == 0.85
+    sink = SemanticsSink(FakeInner(room), obb_cls=FakeFusionObb)
+    assert sink.view.up_normal_min == sink.semantics.p.up_normal_min
