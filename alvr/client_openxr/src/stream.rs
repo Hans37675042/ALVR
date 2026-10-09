@@ -41,6 +41,8 @@ const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
 
 // Depth stage timings are summarized in the log every this many captures
 const DEPTH_PERF_REPORT_INTERVAL: u64 = 50;
+// Render thread timings are summarized every this many submitted frames (~10 s at 72 Hz)
+const SUBMIT_PERF_REPORT_INTERVAL: u64 = 720;
 
 fn elapsed_ms(since: Instant) -> f32 {
     since.elapsed().as_secs_f32() * 1000.0
@@ -485,6 +487,8 @@ pub struct StreamContext {
     depth_ring_full: u64,
     // Due captures that waited for the GPU to finish reading the previous runtime image
     depth_runtime_busy: u64,
+    submit_perf: StageSet,
+    submit_perf_frames: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -702,6 +706,8 @@ impl StreamContext {
             depth_frame_index: 0,
             depth_ring_full: 0,
             depth_runtime_busy: 0,
+            submit_perf: StageSet::default(),
+            submit_perf_frames: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -1004,10 +1010,21 @@ impl StreamContext {
         if !buffer_ptr.is_null()
             && let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance())
         {
+            let submit_start = Instant::now();
             self.core_context.report_submit(
                 timestamp,
                 vsync_time.saturating_sub(Duration::from_nanos(xr_now.as_nanos() as u64)),
             );
+            // Shares the socket with the uplink streams; a stall here delays xrEndFrame
+            self.submit_perf.record("report_submit_ms", elapsed_ms(submit_start));
+            self.submit_perf_frames += 1;
+            if self.submit_perf_frames % SUBMIT_PERF_REPORT_INTERVAL == 0 {
+                alvr_common::info!(
+                    "[XR_PERF] render {} frames: {}",
+                    self.submit_perf_frames,
+                    self.submit_perf.format_and_reset()
+                );
+            }
         }
 
         let rect = xr::Rect2Di {
