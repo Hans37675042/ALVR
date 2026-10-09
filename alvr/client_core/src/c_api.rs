@@ -303,7 +303,7 @@ pub extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent) -> bool {
                 }
             }
             ClientCoreEvent::RealTimeConfig(_) => AlvrEvent::RealTimeConfig {},
-            ClientCoreEvent::XrStreamControl { .. } => {
+            ClientCoreEvent::XrStreamControl { .. } | ClientCoreEvent::SceneRequest { .. } => {
                 // Handled internally by the client_openxr layer, not exposed via C API
                 return false;
             }

@@ -514,10 +514,14 @@ fn connection_pipeline(
                         );
                     }
                     Ok(ServerControlPacket::KeepAlive) => (),
+                    Ok(ServerControlPacket::SceneRequest { recapture }) => {
+                        info!("Scene request: recapture={recapture}");
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::SceneRequest { recapture });
+                    }
                     Ok(
-                        ServerControlPacket::Reserved(_)
-                        | ServerControlPacket::ReservedBuffer(_)
-                        | ServerControlPacket::SceneRequest { .. },
+                        ServerControlPacket::Reserved(_) | ServerControlPacket::ReservedBuffer(_),
                     ) => {}
                     Err(ConnectionError::TryAgain(_)) => {
                         if Instant::now() > disconnection_deadline {

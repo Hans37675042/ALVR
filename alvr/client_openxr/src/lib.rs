@@ -10,6 +10,7 @@ mod hw_encoder;
 mod interaction;
 mod lobby;
 mod passthrough;
+mod scene;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
@@ -19,6 +20,7 @@ use alvr_common::{
     glam::{Quat, UVec2, Vec3},
     info,
     parking_lot::RwLock,
+    warn,
 };
 use alvr_graphics::GraphicsContext;
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, PerformanceLevel};
@@ -33,6 +35,7 @@ use interaction::{InteractionContext, InteractionSourcesConfig};
 use lobby::Lobby;
 use openxr as xr;
 use passthrough::PassthroughLayer;
+use scene::SceneLoader;
 use std::{ffi::CStr, path::Path, rc::Rc, sync::Arc, thread, time::Duration};
 use stream::StreamContext;
 
@@ -241,6 +244,14 @@ pub fn entry_point() {
     exts.khr_opengl_es_enable = true;
     // XR data extensions (depth)
     exts.meta_environment_depth = available_extensions.meta_environment_depth;
+    // Scene model import (Space Setup rooms, furniture, global mesh)
+    exts.fb_spatial_entity = available_extensions.fb_spatial_entity;
+    exts.fb_spatial_entity_query = available_extensions.fb_spatial_entity_query;
+    exts.fb_spatial_entity_storage = available_extensions.fb_spatial_entity_storage;
+    exts.fb_spatial_entity_container = available_extensions.fb_spatial_entity_container;
+    exts.fb_scene = available_extensions.fb_scene;
+    exts.fb_scene_capture = available_extensions.fb_scene_capture;
+    exts.meta_spatial_entity_mesh = available_extensions.meta_spatial_entity_mesh;
     exts.other = available_extensions
         .other
         .into_iter()
@@ -406,6 +417,16 @@ pub fn entry_point() {
             .write()
             .select_sources(&lobby_interaction_sources);
 
+        // Scene permission is needed before the first query at stream start
+        #[cfg(target_os = "android")]
+        alvr_system_info::try_get_permission("com.oculus.permission.USE_SCENE");
+        let mut scene_loader = SceneLoader::new(xr_session.clone());
+        if scene_loader.is_none() {
+            info!("[SCENE] scene extensions unavailable, scene import disabled");
+        }
+        // Set while streaming with Video > XR Data Streaming > Scene Model enabled
+        let mut scene_enabled = false;
+
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
@@ -456,6 +477,36 @@ pub fn entry_point() {
                         if let Some(stream) = &mut stream_context {
                             stream.update_reference_space();
                         }
+
+                        if let Some(loader) = &mut scene_loader {
+                            loader.update_reference_space();
+                            if scene_enabled {
+                                loader.request();
+                            }
+                        }
+                    }
+                    xr::Event::SpaceQueryResultsAvailableFB(event) => {
+                        if let Some(loader) = &mut scene_loader {
+                            loader.on_query_results(event.request_id());
+                        }
+                    }
+                    xr::Event::SpaceQueryCompleteFB(event) => {
+                        if let Some(loader) = &mut scene_loader {
+                            loader.on_query_complete(event.request_id(), event.result());
+                        }
+                    }
+                    xr::Event::SpaceSetStatusCompleteFB(event) => {
+                        if let Some(loader) = &mut scene_loader {
+                            loader.on_set_status_complete(event.request_id(), event.result());
+                        }
+                    }
+                    xr::Event::SceneCaptureCompleteFB(event) => {
+                        if let Some(loader) = &mut scene_loader {
+                            loader.on_capture_complete(event.result());
+                            if scene_enabled {
+                                loader.request();
+                            }
+                        }
                     }
                     xr::Event::PerfSettingsEXT(event) => {
                         info!(
@@ -493,6 +544,14 @@ pub fn entry_point() {
                     }
                     ClientCoreEvent::StreamingStarted(config) => {
                         let config = ParsedStreamConfig::new(&config);
+
+                        scene_enabled = config
+                            .xr_data_config
+                            .as_ref()
+                            .is_some_and(|c| c.enable_scene);
+                        if scene_enabled && let Some(loader) = &mut scene_loader {
+                            loader.request();
+                        }
 
                         let context = StreamContext::new(
                             Arc::clone(&core_context),
@@ -535,6 +594,7 @@ pub fn entry_point() {
                             .select_sources(&lobby_interaction_sources);
 
                         stream_context = None;
+                        scene_enabled = false;
                     }
                     ClientCoreEvent::Haptics {
                         device_id,
@@ -593,6 +653,19 @@ pub fn entry_point() {
                             stream.update_real_time_config(&config);
                         }
                     }
+                    ClientCoreEvent::SceneRequest { recapture } => {
+                        if let Some(loader) = &mut scene_loader
+                            && scene_enabled
+                        {
+                            if recapture {
+                                // Space Setup pauses the app and would drop the stream
+                                warn!("[SCENE] recapture is only possible from the lobby, requerying");
+                            }
+                            loader.request();
+                        } else {
+                            info!("[SCENE] scene request ignored (scene import disabled)");
+                        }
+                    }
                     ClientCoreEvent::XrStreamControl {
                         depth_enabled,
                         camera_enabled,
@@ -624,6 +697,18 @@ pub fn entry_point() {
                     panic!();
                 }
             };
+            if let Some(loader) = &mut scene_loader
+                && let Some(snapshot) = loader.update(frame_state.predicted_display_time)
+            {
+                if scene_enabled {
+                    // Can be several MB with the global mesh: keep it off the render thread
+                    let core_context = Arc::clone(&core_context);
+                    thread::spawn(move || core_context.send_scene_snapshot(snapshot));
+                } else {
+                    info!("[SCENE] snapshot dropped, not streaming");
+                }
+            }
+
             let frame_interval =
                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
             let vsync_time =

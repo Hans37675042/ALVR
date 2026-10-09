@@ -25,7 +25,7 @@ use alvr_common::{
 };
 use alvr_packets::{
     BatteryInfo, ButtonEntry, CameraFrameHeader, ClientControlPacket, DepthFrameHeader,
-    RealTimeConfig, StreamConfig, TrackingData,
+    RealTimeConfig, SceneSnapshot, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -59,6 +59,9 @@ pub enum ClientCoreEvent {
     XrStreamControl {
         depth_enabled: bool,
         camera_enabled: bool,
+    },
+    SceneRequest {
+        recapture: bool,
     },
 }
 
@@ -237,6 +240,14 @@ impl ClientCoreContext {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender
                 .send(&ClientControlPacket::ProximityState(headset_is_worn))
+                .ok();
+        }
+    }
+
+    pub fn send_scene_snapshot(&self, snapshot: SceneSnapshot) {
+        if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
+            sender
+                .send(&ClientControlPacket::SceneSnapshot(snapshot))
                 .ok();
         }
     }
