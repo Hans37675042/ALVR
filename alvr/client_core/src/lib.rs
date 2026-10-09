@@ -264,7 +264,11 @@ impl ClientCoreContext {
 
     pub fn send_depth_frame(&self, header: &DepthFrameHeader, payload: &[u8]) {
         if let Some(sender) = &mut *self.connection_context.depth_sender.lock() {
-            sender.send_header_with_payload(header, payload).ok();
+            // Locks the socket per shard: a frame is hundreds of KB, and tracking and statistics
+            // packets must not wait until all of it is written
+            sender
+                .send_header_with_payload_interleaved(header, payload)
+                .ok();
         }
     }
 
