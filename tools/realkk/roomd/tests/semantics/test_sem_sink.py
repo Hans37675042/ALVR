@@ -201,3 +201,14 @@ def test_recenter_resets_tracking_and_forwards():
     assert out.objects == []
     sink.close()
     assert sink.inner.calls[-1] == ("close",)
+
+
+def test_structure_cut_follows_fusion_heightmap_cap():
+    inner = FakeInner(_room())
+    inner.fusion.config = SimpleNamespace(obstacle_max_height=1.9)
+    sink = SemanticsSink(inner, obb_cls=FakeFusionObb)
+    assert sink.semantics.p.structure_min_h == pytest.approx(1.85)
+    explicit = SemanticsSink(inner, params=__import__("roomd.semantics", fromlist=["x"]).SemanticsParams(
+        structure_min_h=1.5), obb_cls=FakeFusionObb)
+    assert explicit.semantics.p.structure_min_h == 1.5
+    assert SemanticsSink(FakeInner(_room()), obb_cls=FakeFusionObb).semantics.p.structure_min_h is None
