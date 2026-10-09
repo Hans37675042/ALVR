@@ -1476,7 +1476,8 @@ fn send_depth_frame(
     meta: &DepthFrameMeta,
     depth_bytes: &[u8],
 ) {
-    // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
+    // LZ4 compress the raw D16 depth bytes (lossless). On recorded rooms this saves ~15-20% of
+    // the 409,600 B per frame; it runs here on the worker, off the render thread.
     let lz4_start = Instant::now();
     let compressed = lz4_flex::compress_prepend_size(depth_bytes);
     perf.record("lz4_ms", elapsed_ms(lz4_start));
