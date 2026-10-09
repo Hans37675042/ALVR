@@ -68,26 +68,45 @@ impl MultiplexedSocketWriter for MultiplexedUdpWriter {
     }
 
     fn send(&mut self, stream_id: u16, packet_index: u32, buffer: &mut Vec<u8>) -> Result<()> {
+        for shard_idx in 0..self.piece_count(buffer.len()) {
+            self.send_piece(stream_id, packet_index, buffer, shard_idx)?;
+        }
+
+        Ok(())
+    }
+
+    // One piece is one shard (datagram)
+    fn piece_count(&self, buffer_len: usize) -> usize {
+        let max_shard_size = self.max_packet_size - SHARD_PREFIX_SIZE;
+        let payload_size = buffer_len - SHARD_PREFIX_SIZE;
+        // rounding up:
+        payload_size.div_ceil(max_shard_size)
+    }
+
+    fn send_piece(
+        &mut self,
+        stream_id: u16,
+        packet_index: u32,
+        buffer: &mut Vec<u8>,
+        shard_idx: usize,
+    ) -> Result<()> {
         let max_shard_size = self.max_packet_size - SHARD_PREFIX_SIZE;
         let payload_size = buffer.len() - SHARD_PREFIX_SIZE;
-        // rounding up:
-        let shards_count = payload_size.div_ceil(max_shard_size);
+        let shards_count = self.piece_count(buffer.len());
 
-        for shard_idx in 0..shards_count {
-            // this overlaps with the previous shard, this is intended behavior and allows to
-            // reduce allocations
-            let shard_start_position = shard_idx * max_shard_size;
-            let shard_size = usize::min(max_shard_size, payload_size - shard_start_position);
+        // this overlaps with the previous shard, this is intended behavior and allows to
+        // reduce allocations
+        let shard_start_position = shard_idx * max_shard_size;
+        let shard_size = usize::min(max_shard_size, payload_size - shard_start_position);
 
-            let shard_view = &mut buffer[shard_start_position..][..SHARD_PREFIX_SIZE + shard_size];
+        let shard_view = &mut buffer[shard_start_position..][..SHARD_PREFIX_SIZE + shard_size];
 
-            shard_view[0..2].copy_from_slice(&stream_id.to_le_bytes());
-            shard_view[2..6].copy_from_slice(&packet_index.to_le_bytes());
-            shard_view[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
-            shard_view[10..14].copy_from_slice(&(shard_idx as u32).to_le_bytes());
+        shard_view[0..2].copy_from_slice(&stream_id.to_le_bytes());
+        shard_view[2..6].copy_from_slice(&packet_index.to_le_bytes());
+        shard_view[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
+        shard_view[10..14].copy_from_slice(&(shard_idx as u32).to_le_bytes());
 
-            self.inner.send(shard_view)?;
-        }
+        self.inner.send(shard_view)?;
 
         Ok(())
     }

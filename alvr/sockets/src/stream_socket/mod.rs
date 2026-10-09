@@ -13,6 +13,8 @@
 // transmission of a big packet before. If we allow interleaving shards, small packets can be
 // transmitted quicker, with only minimal latency increase for the ongoing transmission of the big
 // packet.
+// realkk: `StreamSender::send()` actually locks per packet; `send_interleaved()` locks per shard
+// and is used for the large uplink frames (depth) so they do not hold up tracking and statistics.
 // Note: We can't clone the underlying socket for each StreamSender and the mutex around the socket
 // cannot be removed. This is because we need to make sure at least shards are written whole.
 
@@ -41,6 +43,25 @@ trait MultiplexedSocketWriter {
     fn payload_offset(&self) -> usize;
 
     fn send(&mut self, stream_id: u16, packet_index: u32, buffer: &mut Vec<u8>) -> Result<()>;
+
+    /// Number of pieces `send_piece()` splits a packet of `buffer_len` bytes into. Other packets
+    /// may be written between two pieces; a writer that cannot allow that returns 1.
+    fn piece_count(&self, _buffer_len: usize) -> usize {
+        1
+    }
+
+    /// Sends piece `piece` of `piece_count()`. Pieces of a packet must be sent in order, with
+    /// the same buffer.
+    fn send_piece(
+        &mut self,
+        stream_id: u16,
+        packet_index: u32,
+        buffer: &mut Vec<u8>,
+        piece: usize,
+    ) -> Result<()> {
+        debug_assert_eq!(piece, 0);
+        self.send(stream_id, packet_index, buffer)
+    }
 }
 
 struct ReconstructedPacket {
@@ -106,6 +127,44 @@ impl<H> StreamSender<H> {
 
         Ok(())
     }
+
+    /// Like `send()`, but locks the socket per shard instead of per packet, so small packets of
+    /// other streams (tracking, statistics) do not wait behind a large one. Only UDP can do this;
+    /// over TCP the packet is still written whole.
+    pub fn send_interleaved(&mut self, mut buffer: Buffer<H>) -> Result<()> {
+        let pieces = self.inner.lock().piece_count(buffer.inner.len());
+        for piece in 0..pieces {
+            self.inner.lock().send_piece(
+                self.stream_id,
+                self.next_packet_index,
+                &mut buffer.inner,
+                piece,
+            )?;
+        }
+
+        self.used_buffers.push(buffer.inner);
+
+        self.next_packet_index = self.next_packet_index.wrapping_add(1);
+
+        Ok(())
+    }
+
+    /// Sends the packet only if no other sender is writing to the socket right now, i.e. never
+    /// waits for the socket. Returns whether the packet was sent.
+    pub fn try_send(&mut self, mut buffer: Buffer<H>) -> Result<bool> {
+        let Some(mut socket) = self.inner.try_lock() else {
+            self.used_buffers.push(buffer.inner);
+            return Ok(false);
+        };
+        socket.send(self.stream_id, self.next_packet_index, &mut buffer.inner)?;
+        drop(socket);
+
+        self.used_buffers.push(buffer.inner);
+
+        self.next_packet_index = self.next_packet_index.wrapping_add(1);
+
+        Ok(true)
+    }
 }
 
 impl<H: Serialize> StreamSender<H> {
@@ -136,6 +195,23 @@ impl<H: Serialize> StreamSender<H> {
 
     pub fn send_header(&mut self, header: &H) -> Result<()> {
         self.send_header_with_payload(header, &[])
+    }
+
+    /// See `send_interleaved()`
+    pub fn send_header_with_payload_interleaved(
+        &mut self,
+        header: &H,
+        raw_payload: &[u8],
+    ) -> Result<()> {
+        let mut buffer = self.get_buffer(header, raw_payload.len())?;
+        buffer.copy_from_slice(raw_payload);
+        self.send_interleaved(buffer)
+    }
+
+    /// See `try_send()`
+    pub fn try_send_header(&mut self, header: &H) -> Result<bool> {
+        let buffer = self.get_buffer(header, 0)?;
+        self.try_send(buffer)
     }
 }
 
