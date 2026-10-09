@@ -511,6 +511,93 @@ mod tests {
         (a - b).abs() < 1e-3
     }
 
+    fn big_scene() -> SceneSnapshot {
+        let n = 30_000u32;
+        SceneSnapshot {
+            rooms: vec![SceneRoom {
+                uuid: [1; 16],
+                floor: Some([2; 16]),
+                ceiling: None,
+                walls: vec![[3; 16]],
+            }],
+            anchors: vec![SceneAnchor {
+                uuid: [4; 16],
+                labels: "GLOBAL_MESH".into(),
+                pose: Some(Pose::IDENTITY),
+                ..Default::default()
+            }],
+            meshes: vec![SceneMesh {
+                anchor_uuid: [4; 16],
+                pose: Pose::IDENTITY,
+                // Noisy coordinates so the mesh does not compress below one chunk
+                vertices: (0..n)
+                    .map(|i| {
+                        let f = (i as f32 * 0.618_034).fract();
+                        [f, (f * 7.3).fract(), i as f32 * 1e-3]
+                    })
+                    .collect(),
+                indices: (0..n * 3).map(|i| (i * 7919) % n).collect(),
+            }],
+        }
+    }
+
+    fn assemble(chunks: Vec<SceneSnapshotChunk>) -> Option<SceneSnapshot> {
+        let mut assembler = SceneChunkAssembler::default();
+        let mut out = None;
+        for chunk in chunks {
+            if let Some(snapshot) = assembler.push(chunk).unwrap() {
+                assert!(out.is_none(), "snapshot completed twice");
+                out = Some(snapshot);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scene_chunks_are_small_and_reassemble() {
+        let scene = big_scene();
+        let chunks = split_scene_snapshot(7, &scene);
+        assert!(chunks.len() > 1);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.data.len() <= SCENE_CHUNK_SIZE);
+            assert_eq!((chunk.id, chunk.index, chunk.count), (7, i as u32, chunks.len() as u32));
+        }
+        let out = assemble(chunks).unwrap();
+        assert_eq!(out.rooms[0].floor, Some([2; 16]));
+        assert_eq!(out.anchors[0].labels, "GLOBAL_MESH");
+        assert_eq!(out.meshes[0].vertices, scene.meshes[0].vertices);
+        assert_eq!(out.meshes[0].indices, scene.meshes[0].indices);
+    }
+
+    #[test]
+    fn empty_scene_is_one_chunk() {
+        let chunks = split_scene_snapshot(1, &SceneSnapshot::default());
+        assert_eq!(chunks.len(), 1);
+        let out = assemble(chunks).unwrap();
+        assert!(out.rooms.is_empty() && out.anchors.is_empty() && out.meshes.is_empty());
+    }
+
+    #[test]
+    fn newer_snapshot_discards_unfinished_one() {
+        let mut first = split_scene_snapshot(1, &big_scene());
+        first.truncate(1); // client restarted mid-transfer
+        let second = split_scene_snapshot(2, &SceneSnapshot::default());
+        let mut chunks = first;
+        chunks.extend(second);
+        let out = assemble(chunks).unwrap();
+        assert!(out.meshes.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_chunk_is_rejected_without_panic() {
+        let mut chunks = split_scene_snapshot(3, &big_scene());
+        chunks.swap(0, 1);
+        let mut assembler = SceneChunkAssembler::default();
+        let results: Vec<_> = chunks.into_iter().map(|c| assembler.push(c)).collect();
+        assert!(results.iter().any(|r| r.is_err()));
+        assert!(results.iter().all(|r| !matches!(r, Ok(Some(_)))));
+    }
+
     #[test]
     fn symmetric_fov_gives_centered_principal_point() {
         let a = std::f32::consts::FRAC_PI_4;

@@ -925,6 +925,46 @@ mod tests {
         assert_eq!(parse_room_request(&[]), None);
     }
 
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn stale_reader_cannot_clear_newer_connection() {
+        let slot = ConnectionSlot::default();
+        let (old, mut old_peer) = tcp_pair();
+        let old_gen = slot.replace(old);
+        let (new, _new_peer) = tcp_pair();
+        let new_gen = slot.replace(new);
+
+        assert!(!slot.clear_if(old_gen));
+        assert!(slot.is_current(new_gen));
+        assert!(slot.clear_if(new_gen));
+        assert!(!slot.is_current(new_gen));
+
+        // The replaced socket was shut down, so its viewer sees EOF
+        old_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(old_peer.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_write_shuts_the_socket_down() {
+        let slot = ConnectionSlot::default();
+        let (stream, mut peer) = tcp_pair();
+        let generation = slot.replace(stream);
+        slot.drop_connection();
+        assert!(!slot.is_current(generation));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+    }
+
     fn read_msg(stream: &mut TcpStream) -> (u32, Vec<u8>) {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header).unwrap();
