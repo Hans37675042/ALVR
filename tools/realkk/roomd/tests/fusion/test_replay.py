@@ -22,3 +22,12 @@ def test_replay_until_stops_at_tap_time(tmp_path):
     replay.write_synthetic_tap(tap, frames=20)  # 10 fps
     stats = replay.main([str(tap), "--out", str(tmp_path / "out"), "--until", "0.95"])
     assert stats["frames"] == 10
+
+
+def test_replay_saves_state(tmp_path):
+    from roomd.fusion import TsdfFusion
+
+    tap = tmp_path / "synth.rktap"
+    replay.write_synthetic_tap(tap, frames=12)
+    replay.main([str(tap), "--out", str(tmp_path / "out"), "--save-state", str(tmp_path / "s.npz")])
+    assert TsdfFusion.load_state(tmp_path / "s.npz").stats()["frames"] == 12

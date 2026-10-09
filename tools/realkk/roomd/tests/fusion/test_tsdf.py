@@ -240,3 +240,17 @@ def test_new_object_appears_within_n_frames():
             break
     print("box caught up after %s frames" % caught_up)
     assert caught_up is not None and caught_up <= 5
+
+
+def test_state_round_trip(scanned, tmp_path):
+    fusion, _ = scanned
+    path = tmp_path / "state.npz"
+    fusion.save_state(path)
+    loaded = TsdfFusion.load_state(path)
+    assert loaded.bounds() == fusion.bounds()
+    assert loaded.config == fusion.config
+    assert loaded.occupied_fraction(BOX_BODY) == fusion.occupied_fraction(BOX_BODY)
+    assert loaded.visible_fraction(BOX_BODY, 30) == fusion.visible_fraction(BOX_BODY, 30)
+    np.testing.assert_array_equal(loaded.heightmap().flags, fusion.heightmap().flags)
+    assert loaded.floor_plane().y == pytest.approx(fusion.floor_plane().y)
+    assert loaded.stats()["frames"] == fusion.stats()["frames"]
