@@ -267,28 +267,13 @@ fn describe(ctx: &XrCtx, fns: &Fns, a: &sys::SpaceQueryResultFB) -> Map<String, 
             | sys::SemanticLabelsSupportFlagsFB::ACCEPT_INVISIBLE_WALL_FACE,
         recognized_labels: RECOGNIZED_LABELS.as_ptr(),
     };
-    let mut labels = sys::SemanticLabelsFB {
-        ty: sys::SemanticLabelsFB::TYPE,
-        next: &support as *const _ as *const _,
-        buffer_capacity_input: 0,
-        buffer_count_output: 0,
-        buffer: ptr::null_mut(),
+    // Older XR_FB_scene versions may reject the support info; retry without it.
+    match semantic_labels(fns, session, a.space, &support as *const _ as *const _)
+        .or_else(|_| semantic_labels(fns, session, a.space, ptr::null()))
+    {
+        Ok(l) => e.insert("labels".into(), json!(l)),
+        Err(r) => e.insert("labels_error".into(), xr_result_json(r)),
     };
-    let r = unsafe { (fns.scene.get_space_semantic_labels)(session, a.space, &mut labels) };
-    if r.into_raw() >= 0 {
-        let mut buf = vec![0 as std::ffi::c_char; labels.buffer_count_output as usize];
-        labels.buffer_capacity_input = buf.len() as u32;
-        labels.buffer = buf.as_mut_ptr();
-        let r = unsafe { (fns.scene.get_space_semantic_labels)(session, a.space, &mut labels) };
-        if r.into_raw() >= 0 {
-            let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-            e.insert("labels".into(), json!(String::from_utf8_lossy(&bytes)));
-        } else {
-            e.insert("labels_error".into(), xr_result_json(r));
-        }
-    } else {
-        e.insert("labels_error".into(), xr_result_json(r));
-    }
 
     if comps.contains(&sys::SpaceComponentTypeFB::BOUNDED_3D) {
         let mut b: sys::Rect3DfFB = unsafe { std::mem::zeroed() };
@@ -313,6 +298,34 @@ fn describe(ctx: &XrCtx, fns: &Fns, a: &sys::SpaceQueryResultFB) -> Map<String, 
         e.insert("mesh".into(), triangle_mesh(fns, a.space));
     }
     e
+}
+
+fn semantic_labels(
+    fns: &Fns,
+    session: sys::Session,
+    space: sys::Space,
+    next: *const std::ffi::c_void,
+) -> Result<String, sys::Result> {
+    let mut labels = sys::SemanticLabelsFB {
+        ty: sys::SemanticLabelsFB::TYPE,
+        next,
+        buffer_capacity_input: 0,
+        buffer_count_output: 0,
+        buffer: ptr::null_mut(),
+    };
+    let r = unsafe { (fns.scene.get_space_semantic_labels)(session, space, &mut labels) };
+    if r.into_raw() < 0 {
+        return Err(r);
+    }
+    let mut buf = vec![0 as std::ffi::c_char; labels.buffer_count_output as usize];
+    labels.buffer_capacity_input = buf.len() as u32;
+    labels.buffer = buf.as_mut_ptr();
+    let r = unsafe { (fns.scene.get_space_semantic_labels)(session, space, &mut labels) };
+    if r.into_raw() < 0 {
+        return Err(r);
+    }
+    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn triangle_mesh(fns: &Fns, space: sys::Space) -> Value {

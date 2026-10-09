@@ -19,6 +19,10 @@ use std::{
 
 const VERSION: &str = concat!("link_spike ", env!("CARGO_PKG_VERSION"));
 const MIN_FPS: f64 = 9.0;
+/// A depth stream that stalls longer than this inside the window does not count as continuous.
+const MAX_GAP_MS: f64 = 500.0;
+const PROVIDER_SETTLE: Duration = Duration::from_secs(2);
+const PROVIDER_ATTEMPTS: u32 = 5;
 
 /// Extensions the spike enables when the runtime offers them.
 const WANTED: &[&str] = &[
@@ -314,16 +318,34 @@ fn run_depth(args: &Args, report: &mut Report, ctx: &mut XrCtx, mut d3d: Option<
         return report.step("depth", false, json!("no reference space"));
     };
     let with_images = d3d.is_some();
-    let mut steps = Map::new();
-    let probe = depth::create(&ctx.instance, ctx.session.as_raw(), with_images, &mut steps);
-    let Some(mut probe) = probe else {
-        return report.step("depth_create", false, Value::Object(steps));
-    };
-    let started = probe.start(&mut steps, with_images);
-    report.step("depth_create", started, Value::Object(steps));
-    if !started {
-        return;
+
+    // Like the fork client: let the session settle, then retry transient creation failures.
+    tick_for(ctx, PROVIDER_SETTLE);
+    let mut attempts = Vec::new();
+    let mut probe = None;
+    for attempt in 1..=PROVIDER_ATTEMPTS {
+        let mut steps = Map::new();
+        steps.insert("attempt".into(), json!(attempt));
+        steps.insert("session_state".into(), json!(format!("{:?}", ctx.state)));
+        if let Some(mut p) = depth::create(&ctx.instance, ctx.session.as_raw(), with_images, &mut steps)
+            && p.start(&mut steps, with_images)
+        {
+            probe = Some(p);
+            attempts.push(Value::Object(steps));
+            break;
+        }
+        attempts.push(Value::Object(steps));
+        if ctx.exit {
+            break;
+        }
+        tick_for(ctx, Duration::from_secs(1));
     }
+    report.step("depth_create", probe.is_some(), json!(attempts));
+    let Some(mut probe) = probe else {
+        return;
+    };
+    // Skip one frame between start and the first acquire.
+    ctx.tick(|_| {});
 
     let tap_path = args.out.join("depth.rktap");
     let meta = json!({
@@ -345,7 +367,7 @@ fn run_depth(args: &Args, report: &mut Report, ctx: &mut XrCtx, mut d3d: Option<
         let d3d_now = d3d.as_deref_mut();
         ctx.tick(|time| probe.poll(space, time, d3d_now, offset));
     }
-    let summary = probe.summary(MIN_FPS);
+    let summary = probe.summary(t0.elapsed().as_secs_f64(), MIN_FPS, MAX_GAP_MS);
     drop(probe);
     write_json(&args.out.join("depth_summary.json"), &summary);
     let ok = summary["new_frames"].as_u64().unwrap_or(0) > 0;
@@ -353,6 +375,8 @@ fn run_depth(args: &Args, report: &mut Report, ctx: &mut XrCtx, mut d3d: Option<
         "seconds": args.seconds,
         "new_frames": summary["new_frames"],
         "fps": summary["fps"],
+        "span_fps": summary["span_fps"],
+        "max_gap_ms": summary["max_gap_ms"],
         "fps_ok": summary["fps_ok"],
         "resolution_per_view": summary["resolution_per_view"],
         "acquire": [summary["acquire_ok"], summary["acquire_not_available"], summary["acquire_errors"]],
@@ -361,6 +385,13 @@ fn run_depth(args: &Args, report: &mut Report, ctx: &mut XrCtx, mut d3d: Option<
         "pixels_ok": summary["pixels_ok"],
         "tap": tap_path.display().to_string(),
     }));
+}
+
+fn tick_for(ctx: &mut XrCtx, d: Duration) {
+    let t0 = Instant::now();
+    while t0.elapsed() < d && !ctx.exit {
+        ctx.tick(|_| {});
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -452,15 +483,17 @@ fn verdict(report: &Report) -> Value {
     let step = |name: &str| report.steps.iter().find(|s| s["step"] == name);
     let depth = step("depth_capture");
     let fps = depth.and_then(|d| d["detail"]["fps"].as_f64()).unwrap_or(0.0);
+    let fps_ok = depth.is_some_and(|d| d["detail"]["fps_ok"] == true);
     let pixels = depth.is_some_and(|d| d["detail"]["pixels_ok"] == true);
     let scene_ok = step("scene").is_some_and(|s| s["ok"] == true);
     let last_failure = report.steps.iter().rev().find(|s| s["ok"] == false).map(|s| s["step"].clone());
     json!({
         "depth_fps": fps,
         "depth_pixels_ok": pixels,
-        "depth_ok": depth.is_some_and(|d| d["ok"] == true) && pixels && fps >= MIN_FPS,
+        "depth_fps_ok": fps_ok,
+        "depth_ok": depth.is_some_and(|d| d["ok"] == true) && pixels && fps_ok,
         "scene_ok": scene_ok,
-        "feasible": depth.is_some_and(|d| d["ok"] == true) && pixels && fps >= MIN_FPS && scene_ok,
+        "feasible": depth.is_some_and(|d| d["ok"] == true) && pixels && fps_ok && scene_ok,
         "last_failed_step": last_failure,
     })
 }

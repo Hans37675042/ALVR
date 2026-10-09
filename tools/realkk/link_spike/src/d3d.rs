@@ -89,11 +89,23 @@ impl D3d {
 
     /// Copy both array slices of a runtime depth texture to the CPU, stacked top (slice 0) to
     /// bottom (slice 1), as little-endian u16 rows (D3D11 row 0 is the top row, no flip needed).
-    pub fn read_depth_slices(&mut self, texture: *mut c_void) -> Result<Vec<u8>, String> {
+    /// `width` x `height` is the per-view size the runtime reported for the swapchain.
+    pub fn read_depth_slices(&mut self, texture: *mut c_void, width: u32, height: u32) -> Result<Vec<u8>, String> {
         unsafe {
             let src = ID3D11Texture2D::from_raw_borrowed(&texture).ok_or("null depth texture")?;
+            // CopyResource across devices would remove the device instead of failing cleanly.
+            let owner = src.GetDevice().map_err(|e| format!("texture GetDevice: {e}"))?;
+            if owner.as_raw() != self.device.as_raw() {
+                return Err("depth texture belongs to a different D3D11 device".into());
+            }
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             src.GetDesc(&mut desc);
+            if (desc.Width, desc.Height) != (width, height) {
+                return Err(format!(
+                    "texture is {}x{} but the swapchain state says {width}x{height}",
+                    desc.Width, desc.Height
+                ));
+            }
             if !is_16bit(desc.Format) {
                 return Err(format!("unsupported depth texture format {}", desc.Format.0));
             }

@@ -86,7 +86,30 @@ pub struct LoadedRuntime {
     pub manifest: Value,
     pub library_path: PathBuf,
     pub negotiation: Value,
-    _lib: libloading::Library,
+    /// Never unloaded: runtimes may keep threads alive after xrDestroyInstance.
+    _lib: std::mem::ManuallyDrop<libloading::Library>,
+}
+
+/// Like the Khronos loader: plain LoadLibrary first, then again with the runtime's own
+/// directory on the dependency search path (runtime DLLs often ship their dependencies there).
+#[cfg(windows)]
+fn load_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
+    };
+    match unsafe { libloading::Library::new(path) } {
+        Ok(lib) => Ok(lib),
+        Err(first) => unsafe {
+            Library::load_with_flags(path, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR)
+                .map(Into::into)
+                .map_err(|_| first)
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn load_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    unsafe { libloading::Library::new(path) }
 }
 
 type NegotiateFn = unsafe extern "system" fn(
@@ -108,14 +131,20 @@ pub fn load_runtime(json_path: &Path) -> Result<LoadedRuntime, String> {
         json_path.parent().unwrap_or(Path::new(".")).join(lib_rel)
     };
 
-    let lib = unsafe { libloading::Library::new(&library_path) }
+    let lib = load_library(&library_path)
         .map_err(|e| format!("cannot load runtime library {}: {e}", library_path.display()))?;
 
     let (gipa, negotiation) = unsafe { negotiate(&lib)? };
     let entry = unsafe { xr::Entry::from_get_instance_proc_addr(gipa) }
         .map_err(|e| format!("Entry::from_get_instance_proc_addr failed: {e:?}"))?;
 
-    Ok(LoadedRuntime { entry, manifest, library_path, negotiation, _lib: lib })
+    Ok(LoadedRuntime {
+        entry,
+        manifest,
+        library_path,
+        negotiation,
+        _lib: std::mem::ManuallyDrop::new(lib),
+    })
 }
 
 unsafe fn negotiate(

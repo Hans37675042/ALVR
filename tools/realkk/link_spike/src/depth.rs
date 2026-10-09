@@ -33,6 +33,8 @@ pub struct DepthProbe {
     index_changes: u64,
     last_index: Option<u32>,
     last_key: Option<u64>,
+    last_pixel_hash: Option<u64>,
+    pixel_changes: u64,
     frame_times_ns: Vec<u64>,
     near_far: Vec<(f32, f32)>,
     first_frame: Option<Value>,
@@ -83,6 +85,8 @@ pub fn create(
         index_changes: 0,
         last_index: None,
         last_key: None,
+        last_pixel_hash: None,
+        pixel_changes: 0,
         frame_times_ns: Vec::new(),
         near_far: Vec::new(),
         first_frame: None,
@@ -218,8 +222,18 @@ impl DepthProbe {
         }
         self.last_index = Some(image.swapchain_index);
 
+        // A frame is new when the runtime hands out another image (index) or capture pose; pixel
+        // hashes are not used for this because a half-written or recycled image would inflate fps.
+        let key = fnv1a(
+            &[image.swapchain_index.to_le_bytes().as_slice(), &pose_bytes(&image.views[0].pose)].concat(),
+        );
+        if self.last_key == Some(key) {
+            return;
+        }
+        self.last_key = Some(key);
+
         let pixels = match (d3d, self.images.get(image.swapchain_index as usize)) {
-            (Some(d3d), Some(&tex)) => match d3d.read_depth_slices(tex) {
+            (Some(d3d), Some(&tex)) => match d3d.read_depth_slices(tex, self.width, self.height) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     *self.readback_errors.entry(e).or_default() += 1;
@@ -228,19 +242,13 @@ impl DepthProbe {
             },
             _ => None,
         };
-
-        // A frame is new when its pixels change; without pixels fall back to index + pose.
-        let key = match &pixels {
-            Some(p) => fnv1a(p),
-            None => fnv1a(
-                &[image.swapchain_index.to_le_bytes().as_slice(), &pose_bytes(&image.views[0].pose)]
-                    .concat(),
-            ),
-        };
-        if self.last_key == Some(key) {
-            return;
+        if let Some(p) = &pixels {
+            let h = fnv1a(p);
+            if self.last_pixel_hash != Some(h) {
+                self.pixel_changes += 1;
+            }
+            self.last_pixel_hash = Some(h);
         }
-        self.last_key = Some(key);
         self.frame_times_ns.push(recv_ns);
         self.near_far.push((image.near_z, image.far_z));
 
@@ -277,7 +285,10 @@ impl DepthProbe {
         }
     }
 
-    pub fn summary(&mut self, min_fps: f64) -> Value {
+    /// `window_s` is the capture window; fps counts new frames over the whole window so that a
+    /// stream that stalls after a burst does not pass. `max_gap_ms` must also stay below
+    /// `max_gap_limit_ms`.
+    pub fn summary(&mut self, window_s: f64, min_fps: f64, max_gap_limit_ms: f64) -> Value {
         if let Some(w) = self.writer.as_mut() {
             let _ = w.flush();
         }
@@ -287,7 +298,8 @@ impl DepthProbe {
         } else {
             0.0
         };
-        let fps = if span_s > 0.0 { (n - 1) as f64 / span_s } else { 0.0 };
+        let span_fps = if span_s > 0.0 { (n - 1) as f64 / span_s } else { 0.0 };
+        let fps = if window_s > 0.0 { n as f64 / window_s } else { 0.0 };
         let intervals_ms: Vec<f64> =
             self.frame_times_ns.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
         let max_gap_ms = intervals_ms.iter().cloned().fold(0.0, f64::max);
@@ -314,7 +326,10 @@ impl DepthProbe {
             "new_frames": n,
             "frames_written": self.frames_written,
             "pixels_ok": self.frames_written > 0 && self.readback_errors.is_empty(),
+            "pixel_changes": self.pixel_changes,
             "fps": fps,
+            "window_s": window_s,
+            "span_fps": span_fps,
             "span_s": span_s,
             "max_gap_ms": max_gap_ms,
             "near_z_range": if n > 0 { json!([near_min, near_max]) } else { Value::Null },
@@ -322,7 +337,8 @@ impl DepthProbe {
             "readback_errors": self.readback_errors,
             "first_frame": self.first_frame,
             "last_frame": self.last_frame,
-            "fps_ok": fps >= min_fps,
+            "max_gap_limit_ms": max_gap_limit_ms,
+            "fps_ok": fps >= min_fps && n > 1 && max_gap_ms < max_gap_limit_ms,
         })
     }
 }
