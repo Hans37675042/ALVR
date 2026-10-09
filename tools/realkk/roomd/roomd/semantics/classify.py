@@ -308,7 +308,7 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
         else:
             kind, conf = Kind.CHAIR, p.conf_chair
         sittable = True
-    elif flat and _in(s, p.table_h):
+    elif flat and _in(s, p.table_h) and sx * sz >= p.table_min_area and min(sx, sz) >= p.table_min_side:
         kind, sittable, conf = Kind.TABLE, False, p.conf_table
     elif flat and not has_back and _in(s, p.perch_h):
         perch = True

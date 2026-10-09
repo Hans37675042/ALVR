@@ -40,6 +40,8 @@ class SemanticsParams:
     seat_max_overhung: float = 0.5     # seat seen mostly under an overhang (loft desk zone) is not a seat
     couch_min_len: float = 1.2
     table_h: Tuple[float, float] = (0.65, 0.80)
+    table_min_area: float = 0.30       # m^2; smaller table-height surfaces are shelves/ledges
+    table_min_side: float = 0.40       # m
     bed_min_area: float = 1.5          # m^2
     bed_h: Tuple[float, float] = (0.25, 0.70)
     bed_sittable: bool = False
