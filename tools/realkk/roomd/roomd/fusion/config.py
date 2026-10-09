@@ -41,7 +41,7 @@ class FusionConfig:
     heightmap_cell: float = 0.05
     floor_tolerance: float = 0.05     # an upward surface this close to floor_y counts as floor
     obstacle_min_height: float = 0.05
-    obstacle_max_height: float = 1.9  # above this (relative to floor) nothing blocks walking
+    obstacle_max_height: float = 1.7  # character height (1.5-1.6 m) + margin: loft underside blocks, beams do not
     obstacle_min_voxels: int = 2
     upward_min_normal_y: float = 0.85  # surface_points keeps normals at most ~32 deg from +Y
     stats_window: int = 200
