@@ -25,6 +25,7 @@ class FusionConfig:
     max_incidence_deg: float = 75.0   # drop pixels whose surface is seen more edge-on than this
     body_radius: float = 0.4          # user's body: vertical cylinder below the head
     body_top_offset: float = 0.1      # cylinder top relative to the head height
+    below_floor_tolerance: float = 0.05  # drop samples this far below floor_y (glossy/textureless floor)
     flip_rows: bool = False           # set if the depth rows turn out to be bottom-up
     device: Optional[str] = None      # Warp device; None = cuda:0 when available
 

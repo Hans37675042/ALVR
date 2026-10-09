@@ -34,7 +34,7 @@ def mask_depth(depth: wp.array3d(dtype=float), out: wp.array3d(dtype=float),
                intr: wp.array(dtype=wp.vec4), rot_cw: wp.array(dtype=wp.mat33),
                cam_pos: wp.array(dtype=wp.vec3), head: wp.vec3,
                crop_u: int, crop_v: int, min_d: float, max_d: float, cos_max_inc: float,
-               body_r2: float, body_top: float):
+               body_r2: float, body_top: float, min_y: float):
     view, v, u = wp.tid()
     h = depth.shape[1]
     w = depth.shape[2]
@@ -68,6 +68,9 @@ def mask_depth(depth: wp.array3d(dtype=float), out: wp.array3d(dtype=float),
             dx = wx[0] - head[0]
             dz = -wx[2] - head[2]
             if dx * dx + dz * dz < body_r2 and wx[1] < body_top:
+                keep = False
+            # nothing exists below the stage floor; such samples would carve the floor away
+            if wx[1] < min_y:
                 keep = False
     if keep:
         out[view, v, u] = d

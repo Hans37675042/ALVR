@@ -146,7 +146,8 @@ class TsdfFusion:
                   inputs=[depth, out, intr, rot_cw, pos, wp.vec3(*head),
                           int(round(cfg.border_crop * w)), int(round(cfg.border_crop * h)),
                           cfg.min_depth, cfg.max_depth, math.cos(math.radians(cfg.max_incidence_deg)),
-                          cfg.body_radius ** 2, float(head[1] + cfg.body_top_offset)])
+                          cfg.body_radius ** 2, float(head[1] + cfg.body_top_offset),
+                          float(cfg.floor_y - cfg.below_floor_tolerance)])
         return out
 
     def _decode(self, frame):
