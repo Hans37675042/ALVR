@@ -13,7 +13,7 @@ class SemanticsParams:
     up_normal_min: float = 0.65        # normal.y for "horizontal surface" points (TSDF normals are noisy)
     blob_min_h: float = 0.05           # m above floor; lower = floor
     blob_max_h: float = 2.0            # m above floor; higher = structure, ignored
-    structure_min_h: Optional[float] = None  # m; capped heightmap: cells this high = walls/unknown, ignored
+    structure_min_h: Optional[float] = 1.5   # m; walls, loft, capped heightmap tops: ignored for furniture
     split_dh: float = 0.10             # m, neighbour step that cuts a blob in two
     overhang_min_h: float = 1.4        # m; heightmap tops this high may be an overhang (loft bed)
     overhang_free_min: float = 0.5     # free share under a tall piece that makes it an overhang
@@ -76,7 +76,7 @@ class SemanticsParams:
 
     # --- tracking
     gate_dist: float = 3.0
-    gate_surface_dh: float = 0.05
+    gate_surface_dh: float = 0.10      # m; real seat height reads 0.375-0.46 across views
     cost_w_size: float = 1.0
     cost_w_surface: float = 2.0
     cost_w_hist: float = 0.5

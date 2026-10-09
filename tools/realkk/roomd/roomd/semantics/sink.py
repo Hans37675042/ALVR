@@ -51,8 +51,9 @@ class SemanticsSink(FusionSink):
             params = SemanticsParams()
             cap = getattr(getattr(inner.fusion, "config", None), "obstacle_max_height", None)
             if cap is not None:
-                # the heightmap stops at the cap: walls and tall cabinets both read as cap
-                params.structure_min_h = float(cap) - CAP_MARGIN
+                # the heightmap stops at the cap: walls and tall cabinets both read as cap,
+                # so the structure cut never sits above it
+                params.structure_min_h = min(params.structure_min_h, float(cap) - CAP_MARGIN)
         self.params = params
         self.clock = clock
         self.publish_scene_objects = publish_scene_objects
