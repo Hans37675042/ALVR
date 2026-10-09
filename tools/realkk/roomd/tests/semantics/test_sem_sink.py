@@ -205,13 +205,17 @@ def test_recenter_resets_tracking_and_forwards():
 
 def test_structure_cut_follows_fusion_heightmap_cap():
     inner = FakeInner(_room())
+    # structure_min_h = min(default 1.5, cap - 0.05)
     inner.fusion.config = SimpleNamespace(obstacle_max_height=1.9)
     sink = SemanticsSink(inner, obb_cls=FakeFusionObb)
-    assert sink.semantics.p.structure_min_h == pytest.approx(1.85)
+    assert sink.semantics.p.structure_min_h == pytest.approx(1.5)
+    inner.fusion.config = SimpleNamespace(obstacle_max_height=1.5)
+    low = SemanticsSink(inner, obb_cls=FakeFusionObb)
+    assert low.semantics.p.structure_min_h == pytest.approx(1.45)
     explicit = SemanticsSink(inner, params=__import__("roomd.semantics", fromlist=["x"]).SemanticsParams(
-        structure_min_h=1.5), obb_cls=FakeFusionObb)
-    assert explicit.semantics.p.structure_min_h == 1.5
-    assert SemanticsSink(FakeInner(_room()), obb_cls=FakeFusionObb).semantics.p.structure_min_h is None
+        structure_min_h=1.2), obb_cls=FakeFusionObb)
+    assert explicit.semantics.p.structure_min_h == 1.2
+    assert SemanticsSink(FakeInner(_room()), obb_cls=FakeFusionObb).semantics.p.structure_min_h == 1.5
 
 
 def test_fused_other_objects_are_not_published_but_scene_other_is():

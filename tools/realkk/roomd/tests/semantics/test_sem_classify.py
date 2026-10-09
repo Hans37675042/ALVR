@@ -63,7 +63,7 @@ def test_backless_stool_not_sittable():
     assert c.kind == "Other" and not c.sittable and c.perch
 
 
-@pytest.mark.parametrize("h", [0.9, 1.9])
+@pytest.mark.parametrize("h", [0.9, 1.4])  # below structure_min_h (1.5)
 def test_storage_is_other_obstacle(h):
     c = _one(storage(0.0, 0.0, 0.0, h=h))
     assert c.kind == "Other" and not c.sittable

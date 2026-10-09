@@ -117,15 +117,16 @@ def test_swapping_identical_chairs_keeps_ids_in_place():
 
 
 def test_swapping_distinguishable_chairs_ids_follow_chairs():
+    # seat heights differ by more than gate_surface_dh (0.10)
     room = make_room()
-    room.place("lo", chair(-0.8, 0.0, 0.0, seat_h=0.42))
-    room.place("hi", chair(0.8, 0.0, 0.0, seat_h=0.52))
+    room.place("lo", chair(-0.8, 0.0, 0.0, seat_h=0.40))
+    room.place("hi", chair(0.8, 0.0, 0.0, seat_h=0.55))
     sem = new_sem()
     out, t = run(sem, room, 3, 0.0)
     ids = {round(pos(o)[0]): o["Id"] for o in live(out)}
     lo_id, hi_id = ids[-1], ids[1]
-    room.place("lo", chair(0.8, 0.0, 0.0, seat_h=0.42))
-    room.place("hi", chair(-0.8, 0.0, 0.0, seat_h=0.52))
+    room.place("lo", chair(0.8, 0.0, 0.0, seat_h=0.40))
+    room.place("hi", chair(-0.8, 0.0, 0.0, seat_h=0.55))
     out, t = run(sem, room, 4, t)
     objs = by_id(out)
     assert near(pos(objs[lo_id]), (0.8, 0.0), 0.06)
