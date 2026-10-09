@@ -235,6 +235,51 @@ impl<F, M> SlotRing<F, M> {
     }
 }
 
+/// Fence of the last GPU work that read a runtime depth image. The runtime may reuse an image as
+/// soon as the next one is acquired, and an app fence cannot hold back the runtime's writes, so a
+/// new image is only acquired once the reads of the previous one finished on the GPU.
+pub struct ReleaseGuard<F> {
+    fence: Option<F>,
+}
+
+impl<F> Default for ReleaseGuard<F> {
+    fn default() -> Self {
+        Self { fence: None }
+    }
+}
+
+impl<F> ReleaseGuard<F> {
+    /// Guards a newly acquired image with the fence placed after its last read. Returns the fence
+    /// it replaced, if any, for the caller to delete.
+    pub fn arm(&mut self, fence: F) -> Option<F> {
+        self.fence.replace(fence)
+    }
+
+    /// Whether the previous image may be released (i.e. a new one acquired) now. Never waits: a
+    /// finished fence is handed to `delete` and cleared, an unfinished one is kept.
+    pub fn try_release(
+        &mut self,
+        is_signaled: impl FnOnce(&F) -> bool,
+        delete: impl FnOnce(F),
+    ) -> bool {
+        match &self.fence {
+            None => true,
+            Some(fence) if is_signaled(fence) => {
+                if let Some(fence) = self.fence.take() {
+                    delete(fence);
+                }
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Removes the fence without checking it, e.g. to delete it on teardown.
+    pub fn take(&mut self) -> Option<F> {
+        self.fence.take()
+    }
+}
+
 pub enum SubmitOutcome {
     Queued,
     /// The worker is still busy with the previous frame; this one was dropped.

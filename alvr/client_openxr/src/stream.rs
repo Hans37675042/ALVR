@@ -5,7 +5,7 @@ use crate::{
 use alvr_client_core::{
     ClientCoreContext,
     depth_pipeline::{
-        CapturePacer, SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows,
+        CapturePacer, ReleaseGuard, SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows,
         detailed_gl_check_due, send_link,
     },
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
@@ -135,6 +135,8 @@ struct DepthReadback {
     r16ui_tex: glow::NativeTexture,     // R16UI for integer readback
     pbos: [glow::NativeBuffer; DEPTH_READBACK_SLOTS],
     ring: SlotRing<glow::NativeFence, DepthFrameMeta>,
+    // Placed after the last read of the runtime image; see ReleaseGuard
+    runtime_guard: ReleaseGuard<glow::NativeFence>,
     tex_width: u32,
     tex_height: u32,
     frame_count: u32,
@@ -151,6 +153,7 @@ impl DepthReadback {
                 r16ui_tex: gl.create_texture().unwrap(),
                 pbos: [(); DEPTH_READBACK_SLOTS].map(|_| gl.create_buffer().unwrap()),
                 ring: SlotRing::new(DEPTH_READBACK_SLOTS),
+                runtime_guard: ReleaseGuard::default(),
                 tex_width: 0,
                 tex_height: 0,
                 frame_count: 0,
@@ -284,6 +287,10 @@ impl DepthReadback {
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_write));
                 gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::DEPTH_BUFFER_BIT, glow::NEAREST);
                 let blit_err = step_error(gl);
+                if eye == 1 {
+                    // Last read of the runtime image; the rest works on app-owned textures
+                    self.guard_runtime_reads(gl);
+                }
 
                 // Step 3: CopyImageSubData from local D16 → R16UI (bitwise, both 16-bit)
                 gl.copy_image_sub_data(
@@ -348,6 +355,44 @@ impl DepthReadback {
         }
     }
 
+    /// Arms `runtime_guard` with a fence after the reads of the runtime image queued so far.
+    unsafe fn guard_runtime_reads(&mut self, gl: &glow::Context) {
+        unsafe {
+            match gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                Ok(fence) => {
+                    if let Some(old) = self.runtime_guard.arm(fence) {
+                        gl.delete_sync(old);
+                    }
+                }
+                Err(e) => {
+                    // Without a fence the release cannot be checked later: finish the reads now
+                    alvr_common::warn!("[XR_DATA] depth guard fence failed ({e}), waiting for GPU");
+                    gl.finish();
+                }
+            }
+        }
+    }
+
+    /// Whether the runtime image acquired last may be released by acquiring a new one.
+    unsafe fn runtime_image_released(&mut self, gl: &glow::Context) -> bool {
+        unsafe {
+            self.runtime_guard.try_release(
+                |fence| Self::is_signaled(gl, fence),
+                |fence| gl.delete_sync(fence),
+            )
+        }
+    }
+
+    /// Drops every frame still in flight without reading it. Returns how many were dropped.
+    unsafe fn discard_pending(&mut self, gl: &glow::Context) -> usize {
+        let fences = self.ring.drain();
+        let count = fences.len();
+        for fence in fences {
+            unsafe { gl.delete_sync(fence) };
+        }
+        count
+    }
+
     unsafe fn is_signaled(gl: &glow::Context, fence: &glow::NativeFence) -> bool {
         unsafe { gl.get_sync_status(*fence) == glow::SIGNALED }
     }
@@ -393,6 +438,9 @@ impl DepthReadback {
             for fence in self.ring.drain() {
                 gl.delete_sync(fence);
             }
+            if let Some(fence) = self.runtime_guard.take() {
+                gl.delete_sync(fence);
+            }
             for pbo in self.pbos {
                 gl.delete_buffer(pbo);
             }
@@ -435,6 +483,8 @@ pub struct StreamContext {
     depth_perf_captures: u64,
     depth_frame_index: u64,
     depth_ring_full: u64,
+    // Due captures that waited for the GPU to finish reading the previous runtime image
+    depth_runtime_busy: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -651,6 +701,7 @@ impl StreamContext {
             depth_perf_captures: 0,
             depth_frame_index: 0,
             depth_ring_full: 0,
+            depth_runtime_busy: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -837,18 +888,8 @@ impl StreamContext {
                 cam.destroy_async();
             }
         }
-        // A started provider keeps the runtime computing depth even when nothing reads it.
-        // maybe_enqueue_depth() starts it again (and re-enumerates its images) when re-enabled.
-        if !depth
-            && self.xr_depth_enabled
-            && let Some(provider) = &mut self.depth_provider
-            && provider.is_started()
-        {
-            match provider.stop() {
-                Ok(()) => alvr_common::info!("[XR_DATA] Depth provider stopped (stream disabled)"),
-                Err(e) => alvr_common::warn!("[XR_DATA] Failed to stop depth provider: {e:?}"),
-            }
-        }
+        // Disabling depth drops the frames in flight and stops the provider on the render thread,
+        // once the GPU finished reading its last image (see retire_disabled_depth())
         self.xr_depth_enabled = depth;
         self.xr_camera_enabled = camera;
     }
@@ -1062,6 +1103,11 @@ impl StreamContext {
         let frame_start = Instant::now();
         let mut did_work = false;
 
+        if !self.xr_depth_enabled {
+            self.retire_disabled_depth();
+            return;
+        }
+
         // Collect readbacks queued on earlier frames whose GPU work has finished
         if self.depth_readback.as_ref().is_some_and(|r| r.ring.pending() > 0) {
             did_work |= self.collect_depth_readbacks();
@@ -1071,6 +1117,38 @@ impl StreamContext {
 
         if did_work {
             self.depth_perf.record("render_thread_ms", elapsed_ms(frame_start));
+        }
+    }
+
+    /// With depth disabled by the viewer: drops the frames still in flight (they must not be sent
+    /// any more) and stops the provider, which keeps the runtime computing depth otherwise. The
+    /// stop waits, without blocking, until the GPU finished reading the last acquired image.
+    /// maybe_enqueue_depth() starts the provider again (and re-enumerates its images) when
+    /// re-enabled.
+    fn retire_disabled_depth(&mut self) {
+        let provider_started = self.depth_provider.as_ref().is_some_and(|p| p.is_started());
+        let Some(readback) = &mut self.depth_readback else {
+            return;
+        };
+        if readback.ring.pending() == 0 && !provider_started {
+            return;
+        }
+        self.gfx_ctx.make_current();
+        let gl = &self.gfx_ctx.gl_context;
+        let dropped = unsafe { readback.discard_pending(gl) };
+        if dropped > 0 {
+            alvr_common::info!(
+                "[XR_DATA] Dropped {dropped} depth frames in flight (stream disabled)"
+            );
+        }
+        if !provider_started || !unsafe { readback.runtime_image_released(gl) } {
+            return;
+        }
+        if let Some(provider) = &mut self.depth_provider {
+            match provider.stop() {
+                Ok(()) => alvr_common::info!("[XR_DATA] Depth provider stopped (stream disabled)"),
+                Err(e) => alvr_common::warn!("[XR_DATA] Failed to stop depth provider: {e:?}"),
+            }
         }
     }
 
@@ -1120,10 +1198,11 @@ impl StreamContext {
                             if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
                                 alvr_common::info!(
                                     "[XR_PERF] depth {} frames read back, {} skipped, {} ring-full frames, \
-                                     {} dropped at the worker, {} buffers: {}",
+                                     {} runtime-busy frames, {} dropped at the worker, {} buffers: {}",
                                     self.depth_perf_captures,
                                     self.depth_skipped_frames,
                                     self.depth_ring_full,
+                                    self.depth_runtime_busy,
                                     link.dropped(),
                                     link.allocations(),
                                     self.depth_perf.format_and_reset()
@@ -1201,6 +1280,15 @@ impl StreamContext {
             self.depth_ring_full += 1;
             return false;
         };
+
+        // Acquiring releases the previous image to the runtime, which may then overwrite it. Only
+        // do so once the GPU finished reading it, else the frame sent could mix newer depth with
+        // an older pose. Normally done long before the next capture is due; else retry next frame.
+        self.gfx_ctx.make_current();
+        if !unsafe { readback.runtime_image_released(&self.gfx_ctx.gl_context) } {
+            self.depth_runtime_busy += 1;
+            return false;
+        }
 
         // Acquire depth image
         let acquire_start = Instant::now();
