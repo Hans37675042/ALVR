@@ -6,6 +6,7 @@ use crate::{
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
     tracking::{self, TrackingManager},
+    xr_data_relay,
 };
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
@@ -1103,6 +1104,8 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut depth_frame_count: u64 = 0;
+            let mut clock_offset_estimator =
+                xr_data_relay::ClientClockOffsetEstimator::new(Duration::from_secs(10));
             while is_streaming(&client_hostname) {
                 let data = match depth_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(data) => data,
@@ -1118,8 +1121,16 @@ fn connection_pipeline(
                     info!("XR Data: depth frame #{} {}x{} ({} bytes)", depth_frame_count, header.width, header.height, payload.len());
                 }
 
+                // Map the client timestamp to the server clock before relaying
+                let timing = xr_data_relay::DepthTiming::new(
+                    &mut clock_offset_estimator,
+                    &header,
+                    Instant::now(),
+                    xr_data_relay::unix_now_ns(),
+                );
+
                 // Forward to test viewer via TCP relay
-                ctx.xr_data_relay.send_depth_frame(&header, payload);
+                ctx.xr_data_relay.send_depth_frame(&header, &timing, payload);
 
                 ctx.events_sender
                     .send(ServerCoreEvent::DepthFrame {

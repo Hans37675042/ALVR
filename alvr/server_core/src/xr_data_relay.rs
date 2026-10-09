@@ -1,9 +1,10 @@
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     net::TcpStream,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alvr_common::{info, warn};
@@ -109,11 +110,11 @@ impl XrDataRelay {
         Arc::clone(&self.stream_flags)
     }
 
-    pub fn send_depth_frame(&self, header: &DepthFrameHeader, data: &[u8]) {
+    pub fn send_depth_frame(&self, header: &DepthFrameHeader, timing: &DepthTiming, data: &[u8]) {
         if !self.stream_flags.lock().unwrap().depth_enabled {
             return;
         }
-        let payload = encode_depth_frame(header, data);
+        let payload = encode_depth_frame(header, timing, data);
         self.broadcast(MSG_DEPTH_FRAME_V2, &payload);
     }
 
@@ -205,6 +206,87 @@ fn read_viewer_commands(
     }
 }
 
+/// Current server wall-clock time as nanoseconds since the Unix epoch.
+pub fn unix_now_ns() -> i128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0)
+}
+
+/// Estimates `server_unix_ns - client_xr_ns` from (client send time, server receive time) pairs.
+///
+/// Each sample equals the true clock offset plus that packet's one-way latency, so the minimum
+/// over a sliding window is the best estimate (the residual bias is the minimum one-way latency,
+/// typically a few ms over USB/Wi-Fi). The window lets the estimate follow clock drift and
+/// headset sleep/resume.
+pub struct ClientClockOffsetEstimator {
+    samples: VecDeque<(Instant, i128)>,
+    window: Duration,
+}
+
+impl ClientClockOffsetEstimator {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            window,
+        }
+    }
+
+    /// Record one sample and return the current offset estimate in nanoseconds.
+    pub fn report(
+        &mut self,
+        now: Instant,
+        server_receive_unix_ns: i128,
+        client_send_ns: i128,
+    ) -> i128 {
+        self.samples
+            .push_back((now, server_receive_unix_ns - client_send_ns));
+        while let Some(&(t, _)) = self.samples.front() {
+            if self.samples.len() > 1 && now.saturating_duration_since(t) > self.window {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.samples.iter().map(|&(_, offset)| offset).min().unwrap()
+    }
+}
+
+/// Server-side timing attached to a relayed depth frame.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthTiming {
+    /// `header.timestamp` mapped to the server clock (Unix epoch ns).
+    pub server_timestamp_unix_ns: u64,
+    /// Estimated `server_unix_ns - client_xr_ns`.
+    pub clock_offset_ns: i64,
+    /// When the server received the frame (Unix epoch ns).
+    pub server_receive_unix_ns: u64,
+}
+
+impl DepthTiming {
+    pub fn new(
+        estimator: &mut ClientClockOffsetEstimator,
+        header: &DepthFrameHeader,
+        now: Instant,
+        server_receive_unix_ns: i128,
+    ) -> Self {
+        let offset = estimator.report(
+            now,
+            server_receive_unix_ns,
+            header.client_send_time.as_nanos() as i128,
+        );
+        let server_timestamp = header.timestamp.as_nanos() as i128 + offset;
+
+        Self {
+            server_timestamp_unix_ns: server_timestamp.max(0) as u64,
+            clock_offset_ns: offset as i64,
+            server_receive_unix_ns: server_receive_unix_ns.max(0) as u64,
+        }
+    }
+}
+
 fn put_pose(buf: &mut Vec<u8>, pose: &alvr_common::Pose) {
     // qx, qy, qz, qw, px, py, pz
     for v in [
@@ -222,7 +304,7 @@ fn put_pose(buf: &mut Vec<u8>, pose: &alvr_common::Pose) {
 
 /// Size of the MSG_DEPTH_FRAME_V2 header. New fields are only ever appended, and the header
 /// starts with its own size, so viewers can skip fields they do not know.
-pub const DEPTH_FRAME_V2_HEADER_SIZE: u32 = 152;
+pub const DEPTH_FRAME_V2_HEADER_SIZE: u32 = 176;
 
 /// MSG_DEPTH_FRAME_V2 payload layout (all little-endian):
 ///
@@ -241,8 +323,11 @@ pub const DEPTH_FRAME_V2_HEADER_SIZE: u32 = 152;
 /// | 104    | f32 x 4   | fov_angles[1]                                                |
 /// | 120    | f32 x 4   | intrinsics[0] fx fy cx cy (pixels, per-view image, y down)   |
 /// | 136    | f32 x 4   | intrinsics[1]                                                |
-/// | 152    | u8[]      | pixel data                                                   |
-pub fn encode_depth_frame(header: &DepthFrameHeader, data: &[u8]) -> Vec<u8> {
+/// | 152    | u64       | server_timestamp_unix_ns (client_timestamp on server clock)  |
+/// | 160    | i64       | clock_offset_ns (server_unix_ns - client_xr_ns, estimated)   |
+/// | 168    | u64       | server_receive_unix_ns                                       |
+/// | 176    | u8[]      | pixel data                                                   |
+pub fn encode_depth_frame(header: &DepthFrameHeader, timing: &DepthTiming, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(DEPTH_FRAME_V2_HEADER_SIZE as usize + data.len());
 
     buf.extend_from_slice(&DEPTH_FRAME_V2_HEADER_SIZE.to_le_bytes());
@@ -275,6 +360,10 @@ pub fn encode_depth_frame(header: &DepthFrameHeader, data: &[u8]) -> Vec<u8> {
             buf.extend_from_slice(&val.to_le_bytes());
         }
     }
+
+    buf.extend_from_slice(&timing.server_timestamp_unix_ns.to_le_bytes());
+    buf.extend_from_slice(&timing.clock_offset_ns.to_le_bytes());
+    buf.extend_from_slice(&timing.server_receive_unix_ns.to_le_bytes());
 
     debug_assert_eq!(buf.len(), DEPTH_FRAME_V2_HEADER_SIZE as usize);
 
@@ -335,6 +424,7 @@ mod tests {
     fn sample_header() -> DepthFrameHeader {
         DepthFrameHeader {
             timestamp: Duration::from_nanos(123_456_789),
+            client_send_time: Duration::from_nanos(100_000_000),
             view_poses: [
                 Pose {
                     orientation: Quat::IDENTITY,
@@ -358,7 +448,12 @@ mod tests {
     fn depth_v2_layout_matches_documented_offsets() {
         let header = sample_header();
         let data = [1u8, 2, 3];
-        let buf = encode_depth_frame(&header, &data);
+        let timing = DepthTiming {
+            server_timestamp_unix_ns: 1_700_000_000_000_000_000,
+            clock_offset_ns: -5,
+            server_receive_unix_ns: 1_700_000_000_100_000_000,
+        };
+        let buf = encode_depth_frame(&header, &timing, &data);
 
         assert_eq!(buf.len(), DEPTH_FRAME_V2_HEADER_SIZE as usize + data.len());
         assert_eq!(u32_at(&buf, 0), DEPTH_FRAME_V2_HEADER_SIZE);
@@ -385,6 +480,53 @@ mod tests {
         assert_eq!(f32_at(&buf, 120), header.view_intrinsics(0)[0]);
         assert_eq!(f32_at(&buf, 136 + 8), intr1[2]);
 
+        assert_eq!(
+            u64::from_le_bytes(buf[152..160].try_into().unwrap()),
+            timing.server_timestamp_unix_ns
+        );
+        assert_eq!(i64::from_le_bytes(buf[160..168].try_into().unwrap()), -5);
+        assert_eq!(
+            u64::from_le_bytes(buf[168..176].try_into().unwrap()),
+            timing.server_receive_unix_ns
+        );
+
         assert_eq!(&buf[DEPTH_FRAME_V2_HEADER_SIZE as usize..], &data);
+    }
+
+    #[test]
+    fn clock_offset_uses_minimum_latency_sample_in_window() {
+        let mut est = ClientClockOffsetEstimator::new(Duration::from_secs(10));
+        let t0 = Instant::now();
+        // true offset 1_000_000 ns; one-way latencies 30 ms, 4 ms, 12 ms
+        assert_eq!(est.report(t0, 1_000_000 + 30_000_000, 0), 31_000_000);
+        assert_eq!(
+            est.report(t0 + Duration::from_secs(1), 1_000_000 + 4_000_000 + 1_000, 1_000),
+            5_000_000
+        );
+        assert_eq!(
+            est.report(t0 + Duration::from_secs(2), 1_000_000 + 12_000_000 + 2_000, 2_000),
+            5_000_000
+        );
+    }
+
+    #[test]
+    fn clock_offset_forgets_samples_outside_window() {
+        let mut est = ClientClockOffsetEstimator::new(Duration::from_secs(10));
+        let t0 = Instant::now();
+        est.report(t0, 5, 0); // stale sample with a very low offset
+        let offset = est.report(t0 + Duration::from_secs(11), 1_000, 0);
+        assert_eq!(offset, 1_000);
+    }
+
+    #[test]
+    fn depth_timing_maps_client_timestamp_to_server_clock() {
+        let mut est = ClientClockOffsetEstimator::new(Duration::from_secs(10));
+        let header = sample_header(); // timestamp 123_456_789, send 100_000_000
+        let recv = 2_000_000_000_i128;
+        let timing = DepthTiming::new(&mut est, &header, Instant::now(), recv);
+        let offset = recv - 100_000_000;
+        assert_eq!(timing.clock_offset_ns as i128, offset);
+        assert_eq!(timing.server_timestamp_unix_ns as i128, 123_456_789 + offset);
+        assert_eq!(timing.server_receive_unix_ns as i128, recv);
     }
 }

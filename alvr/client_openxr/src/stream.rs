@@ -936,8 +936,15 @@ impl StreamContext {
         let compressed = lz4_flex::compress_prepend_size(&depth_bytes);
         let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
 
+        // Sampled after readback and compression, as close to the send as possible, so that the
+        // server-side offset estimate (receive time - send time) only contains network latency.
+        let client_send_time = crate::xr_runtime_now(self.xr_session.instance())
+            .map(crate::from_xr_time)
+            .unwrap_or_else(|| crate::from_xr_time(display_time));
+
         let header = DepthFrameHeader {
             timestamp: crate::from_xr_time(display_time),
+            client_send_time,
             view_poses,
             width,
             height: stacked_height,

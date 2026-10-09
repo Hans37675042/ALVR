@@ -266,7 +266,12 @@ pub enum DepthFrameFormat {
 /// view 1 (right) in the bottom half, each `width` x `height / 2`, rows ordered top-down.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DepthFrameHeader {
+    /// Client XR time (predicted display time) the depth image was acquired for. This is in the
+    /// client's clock domain; the server maps it to its own clock before relaying.
     pub timestamp: Duration,
+    /// Client XR time ("now") right before the frame was handed to the network layer. The server
+    /// uses it to estimate the client-to-server clock offset.
+    pub client_send_time: Duration,
     /// Pose of each depth view (0 = left, 1 = right), as returned by
     /// xrAcquireEnvironmentDepthImageMETA in the client's stage reference space.
     /// The depth cameras are not the eye cameras, so each view must be unprojected with its own
@@ -473,6 +478,7 @@ mod tests {
         let a = std::f32::consts::FRAC_PI_4;
         let header = DepthFrameHeader {
             timestamp: Duration::ZERO,
+            client_send_time: Duration::ZERO,
             view_poses: [Pose::IDENTITY; 2],
             width: 320,
             height: 640, // two stacked 320x320 views
