@@ -7,8 +7,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alvr_common::{info, warn};
-use alvr_packets::{CameraFrameHeader, DepthFrameHeader};
+use alvr_common::{Pose, info, warn};
+use alvr_packets::{CameraFrameHeader, DepthFrameHeader, SceneSnapshot, scene_uuid_string};
+use serde_json::json;
 
 pub const DEFAULT_VIEWER_PORT: u16 = 9944;
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -16,7 +17,10 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // intrinsics) is no longer sent; viewers must parse MSG_DEPTH_FRAME_V2.
 const MSG_CAMERA_FRAME: u32 = 2;
 const MSG_DEPTH_FRAME_V2: u32 = 3;
+pub const MSG_ROOM_SNAPSHOT: u32 = 4;
+pub const MSG_PLAYSPACE_CHANGED: u32 = 5;
 const MSG_STREAM_CONTROL: u32 = 100;
+pub const MSG_ROOM_REQUEST: u32 = 101;
 
 #[derive(Clone, Debug)]
 pub struct XrStreamFlags {
@@ -34,98 +38,26 @@ impl Default for XrStreamFlags {
 }
 
 pub type StreamControlCallback = Box<dyn Fn(bool, bool) + Send + Sync>;
+/// Called with the `recapture` flag of a MSG_ROOM_REQUEST.
+pub type SceneRequestCallback = Box<dyn Fn(bool) + Send + Sync>;
 
-pub struct XrDataRelay {
-    connection: Arc<Mutex<Option<TcpStream>>>,
-    stream_flags: Arc<Mutex<XrStreamFlags>>,
-    _connector_thread: thread::JoinHandle<()>,
-    control_callback: Arc<Mutex<Option<StreamControlCallback>>>,
+/// Latest scene received from the client, kept in client space so it can be re-sent with
+/// whatever recentering is current.
+struct SceneCache {
+    snapshot: Option<(u32, SceneSnapshot)>,
+    next_snapshot_id: u32,
+    recenter_pose: Pose,
 }
 
-impl XrDataRelay {
-    pub fn new(port: u16) -> Self {
-        let viewer_addr = format!("127.0.0.1:{port}");
-        let connection: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-        let stream_flags: Arc<Mutex<XrStreamFlags>> = Arc::new(Mutex::new(XrStreamFlags::default()));
-        let control_callback: Arc<Mutex<Option<StreamControlCallback>>> = Arc::new(Mutex::new(None));
+struct Shared {
+    connection: Mutex<Option<TcpStream>>,
+    stream_flags: Mutex<XrStreamFlags>,
+    control_callback: Mutex<Option<StreamControlCallback>>,
+    scene_request_callback: Mutex<Option<SceneRequestCallback>>,
+    scene: Mutex<SceneCache>,
+}
 
-        let connector_thread = {
-            let connection = Arc::clone(&connection);
-            let stream_flags = Arc::clone(&stream_flags);
-            let control_callback = Arc::clone(&control_callback);
-            thread::spawn(move || {
-                loop {
-                    // Only try to connect if we don't already have a connection
-                    {
-                        let conn = connection.lock().unwrap();
-                        if conn.is_some() {
-                            drop(conn);
-                            thread::sleep(RETRY_INTERVAL);
-                            continue;
-                        }
-                    }
-
-                    match TcpStream::connect(&viewer_addr) {
-                        Ok(stream) => {
-                            info!("XR Data Relay connected to viewer at {viewer_addr}");
-                            stream.set_nodelay(true).ok();
-                            stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
-
-                            // Spawn reader thread for incoming commands from viewer
-                            if let Ok(reader_stream) = stream.try_clone() {
-                                let flags = Arc::clone(&stream_flags);
-                                let cb = Arc::clone(&control_callback);
-                                let conn_ref = Arc::clone(&connection);
-                                thread::spawn(move || {
-                                    read_viewer_commands(reader_stream, flags, cb, conn_ref);
-                                });
-                            }
-
-                            *connection.lock().unwrap() = Some(stream);
-                        }
-                        Err(_) => {
-                            // Viewer not running yet, retry silently
-                        }
-                    }
-
-                    thread::sleep(RETRY_INTERVAL);
-                }
-            })
-        };
-
-        Self {
-            connection,
-            stream_flags,
-            _connector_thread: connector_thread,
-            control_callback,
-        }
-    }
-
-    pub fn set_control_callback(&self, cb: StreamControlCallback) {
-        *self.control_callback.lock().unwrap() = Some(cb);
-    }
-
-    #[allow(dead_code)]
-    pub fn stream_flags(&self) -> Arc<Mutex<XrStreamFlags>> {
-        Arc::clone(&self.stream_flags)
-    }
-
-    pub fn send_depth_frame(&self, header: &DepthFrameHeader, timing: &DepthTiming, data: &[u8]) {
-        if !self.stream_flags.lock().unwrap().depth_enabled {
-            return;
-        }
-        let payload = encode_depth_frame(header, timing, data);
-        self.broadcast(MSG_DEPTH_FRAME_V2, &payload);
-    }
-
-    pub fn send_camera_frame(&self, header: &CameraFrameHeader, data: &[u8]) {
-        if !self.stream_flags.lock().unwrap().camera_enabled {
-            return;
-        }
-        let payload = encode_camera_frame(header, data);
-        self.broadcast(MSG_CAMERA_FRAME, &payload);
-    }
-
+impl Shared {
     fn broadcast(&self, msg_type: u32, payload: &[u8]) {
         let mut conn = self.connection.lock().unwrap();
 
@@ -140,14 +72,133 @@ impl XrDataRelay {
             }
         }
     }
+
+    // The scene lock is held while sending so that a concurrent recenter or new snapshot cannot
+    // be overtaken by an older one.
+    fn send_cached_scene(&self) {
+        let scene = self.scene.lock().unwrap();
+        if let Some((id, snapshot)) = &scene.snapshot {
+            let payload = encode_room_snapshot(*id, scene.recenter_pose, snapshot);
+            self.broadcast(MSG_ROOM_SNAPSHOT, &payload);
+        }
+    }
 }
 
-fn read_viewer_commands(
-    mut stream: TcpStream,
-    flags: Arc<Mutex<XrStreamFlags>>,
-    control_callback: Arc<Mutex<Option<StreamControlCallback>>>,
-    connection: Arc<Mutex<Option<TcpStream>>>,
-) {
+pub struct XrDataRelay {
+    shared: Arc<Shared>,
+    _connector_thread: thread::JoinHandle<()>,
+}
+
+impl XrDataRelay {
+    pub fn new(port: u16) -> Self {
+        let viewer_addr = format!("127.0.0.1:{port}");
+        let shared = Arc::new(Shared {
+            connection: Mutex::new(None),
+            stream_flags: Mutex::new(XrStreamFlags::default()),
+            control_callback: Mutex::new(None),
+            scene_request_callback: Mutex::new(None),
+            scene: Mutex::new(SceneCache {
+                snapshot: None,
+                next_snapshot_id: 1,
+                recenter_pose: Pose::IDENTITY,
+            }),
+        });
+
+        let connector_thread = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                loop {
+                    // Only try to connect if we don't already have a connection
+                    if shared.connection.lock().unwrap().is_some() {
+                        thread::sleep(RETRY_INTERVAL);
+                        continue;
+                    }
+
+                    match TcpStream::connect(&viewer_addr) {
+                        Ok(stream) => {
+                            info!("XR Data Relay connected to viewer at {viewer_addr}");
+                            stream.set_nodelay(true).ok();
+                            stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
+
+                            // Spawn reader thread for incoming commands from viewer
+                            if let Ok(reader_stream) = stream.try_clone() {
+                                let shared = Arc::clone(&shared);
+                                thread::spawn(move || {
+                                    read_viewer_commands(reader_stream, &shared);
+                                });
+                            }
+
+                            *shared.connection.lock().unwrap() = Some(stream);
+
+                            // A new viewer has no room model yet
+                            shared.send_cached_scene();
+                        }
+                        Err(_) => {
+                            // Viewer not running yet, retry silently
+                        }
+                    }
+
+                    thread::sleep(RETRY_INTERVAL);
+                }
+            })
+        };
+
+        Self {
+            shared,
+            _connector_thread: connector_thread,
+        }
+    }
+
+    pub fn set_control_callback(&self, cb: StreamControlCallback) {
+        *self.shared.control_callback.lock().unwrap() = Some(cb);
+    }
+
+    pub fn set_scene_request_callback(&self, cb: SceneRequestCallback) {
+        *self.shared.scene_request_callback.lock().unwrap() = Some(cb);
+    }
+
+    pub fn send_depth_frame(&self, header: &DepthFrameHeader, timing: &DepthTiming, data: &[u8]) {
+        if !self.shared.stream_flags.lock().unwrap().depth_enabled {
+            return;
+        }
+        let payload = encode_depth_frame(header, timing, data);
+        self.shared.broadcast(MSG_DEPTH_FRAME_V2, &payload);
+    }
+
+    pub fn send_camera_frame(&self, header: &CameraFrameHeader, data: &[u8]) {
+        if !self.shared.stream_flags.lock().unwrap().camera_enabled {
+            return;
+        }
+        let payload = encode_camera_frame(header, data);
+        self.shared.broadcast(MSG_CAMERA_FRAME, &payload);
+    }
+
+    /// Cache a scene snapshot (client space) and send it to the viewer, recentered. Scene
+    /// messages are not gated by the stream flags. Returns the assigned snapshot id.
+    pub fn set_scene_snapshot(&self, snapshot: SceneSnapshot) -> u32 {
+        let id = {
+            let mut scene = self.shared.scene.lock().unwrap();
+            let id = scene.next_snapshot_id;
+            scene.next_snapshot_id = scene.next_snapshot_id.wrapping_add(1).max(1);
+            scene.snapshot = Some((id, snapshot));
+            id
+        };
+        self.shared.send_cached_scene();
+
+        id
+    }
+
+    /// Mirror of `TrackingManager::recenter_pose`'s transform. Sends MSG_PLAYSPACE_CHANGED and
+    /// re-sends the cached snapshot in the new space.
+    pub fn set_recenter_pose(&self, recenter_pose: Pose) {
+        self.shared.scene.lock().unwrap().recenter_pose = recenter_pose;
+        self.shared
+            .broadcast(MSG_PLAYSPACE_CHANGED, &encode_playspace_changed(recenter_pose));
+        self.shared.send_cached_scene();
+    }
+}
+
+fn read_viewer_commands(mut stream: TcpStream, shared: &Shared) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     loop {
@@ -157,15 +208,14 @@ fn read_viewer_commands(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
                 // Check if the write side is still connected
-                let conn = connection.lock().unwrap();
-                if conn.is_none() {
+                if shared.connection.lock().unwrap().is_none() {
                     return;
                 }
                 continue;
             }
             Err(_) => {
                 info!("XR Data Relay: viewer reader disconnected");
-                *connection.lock().unwrap() = None;
+                *shared.connection.lock().unwrap() = None;
                 return;
             }
         }
@@ -176,7 +226,7 @@ fn read_viewer_commands(
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             if stream.read_exact(&mut payload).is_err() {
-                *connection.lock().unwrap() = None;
+                *shared.connection.lock().unwrap() = None;
                 return;
             }
         }
@@ -185,7 +235,7 @@ fn read_viewer_commands(
             let stream_id = payload[0];
             let enabled = payload[1] != 0;
 
-            let mut f = flags.lock().unwrap();
+            let mut f = shared.stream_flags.lock().unwrap();
             match stream_id {
                 0 => f.depth_enabled = enabled,
                 1 => f.camera_enabled = enabled,
@@ -199,11 +249,162 @@ fn read_viewer_commands(
                 snapshot.depth_enabled, snapshot.camera_enabled
             );
 
-            if let Some(cb) = control_callback.lock().unwrap().as_ref() {
+            if let Some(cb) = shared.control_callback.lock().unwrap().as_ref() {
                 cb(snapshot.depth_enabled, snapshot.camera_enabled);
+            }
+        } else if msg_type == MSG_ROOM_REQUEST {
+            let Some(recapture) = parse_room_request(&payload) else {
+                warn!("XR Data Relay: empty MSG_ROOM_REQUEST ignored");
+                continue;
+            };
+            info!("XR Data Relay: room request from viewer (recapture={recapture})");
+
+            // Answer right away from the cache; the client query refreshes it afterwards
+            if !recapture {
+                shared.send_cached_scene();
+            }
+            if let Some(cb) = shared.scene_request_callback.lock().unwrap().as_ref() {
+                cb(recapture);
             }
         }
     }
+}
+
+/// MSG_ROOM_REQUEST payload: `u8 recapture`.
+pub fn parse_room_request(payload: &[u8]) -> Option<bool> {
+    payload.first().map(|&b| b != 0)
+}
+
+/// Bring every anchor and mesh pose of a client-space snapshot into the recentered space.
+/// Bounds and mesh vertices are anchor-local and stay unchanged.
+pub fn recenter_scene(snapshot: &SceneSnapshot, recenter_pose: Pose) -> SceneSnapshot {
+    let mut out = snapshot.clone();
+    for anchor in &mut out.anchors {
+        anchor.pose = anchor.pose.map(|pose| recenter_pose * pose);
+    }
+    for mesh in &mut out.meshes {
+        mesh.pose = recenter_pose * mesh.pose;
+    }
+
+    out
+}
+
+fn pose_position_first(pose: &Pose) -> [f32; 7] {
+    [
+        pose.position.x,
+        pose.position.y,
+        pose.position.z,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    ]
+}
+
+fn put_pose_position_first(buf: &mut Vec<u8>, pose: &Pose) {
+    for v in pose_position_first(pose) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Scene JSON of MSG_ROOM_SNAPSHOT (see CONTRACT-roomd.md). Poses are written as given,
+/// `[px, py, pz, qx, qy, qz, qw]`; UUIDs use `scene_uuid_string`.
+pub fn scene_snapshot_json(snapshot: &SceneSnapshot) -> String {
+    let rooms = snapshot
+        .rooms
+        .iter()
+        .map(|room| {
+            json!({
+                "uuid": scene_uuid_string(&room.uuid),
+                "floor": room.floor.as_ref().map(scene_uuid_string),
+                "ceiling": room.ceiling.as_ref().map(scene_uuid_string),
+                "walls": room.walls.iter().map(scene_uuid_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let anchors = snapshot
+        .anchors
+        .iter()
+        .map(|anchor| {
+            json!({
+                "uuid": scene_uuid_string(&anchor.uuid),
+                "labels": anchor.labels,
+                "pose": anchor.pose.as_ref().map(pose_position_first),
+                "bbox2d": anchor.bbox2d,
+                "boundary2d": anchor.boundary2d,
+                "bbox3d": anchor.bbox3d,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({ "rooms": rooms, "anchors": anchors }).to_string()
+}
+
+/// Size of the fixed MSG_ROOM_SNAPSHOT header; `json_len` follows at this offset.
+pub const ROOM_SNAPSHOT_HEADER_SIZE: u32 = 40;
+const ROOM_SNAPSHOT_VERSION: u32 = 1;
+const PLAYSPACE_CHANGED_VERSION: u32 = 1;
+
+/// MSG_ROOM_SNAPSHOT payload (all little-endian). `snapshot` is in client space; the
+/// recentering is applied here.
+///
+/// | offset | type      | field                                                        |
+/// |--------|-----------|--------------------------------------------------------------|
+/// | 0      | u32       | header_size (40)                                             |
+/// | 4      | u32       | version (1)                                                  |
+/// | 8      | u32       | snapshot_id                                                  |
+/// | 12     | f32 x 7   | recenter_pose px py pz qx qy qz qw                           |
+/// | 40     | u32       | json_len                                                     |
+/// | 44     | u8[]      | UTF-8 JSON (`scene_snapshot_json`, recentered poses)         |
+/// |        | u32       | mesh_count                                                   |
+/// |        | per mesh  | u8[16] anchor_uuid, f32 x 7 pose (px..qw, recentered),       |
+/// |        |           | u32 vcount, u32 icount, f32 x 3 [vcount], u32 [icount]       |
+pub fn encode_room_snapshot(snapshot_id: u32, recenter_pose: Pose, snapshot: &SceneSnapshot) -> Vec<u8> {
+    let recentered = recenter_scene(snapshot, recenter_pose);
+    let json = scene_snapshot_json(&recentered);
+    let mesh_bytes: usize = recentered
+        .meshes
+        .iter()
+        .map(|m| 52 + m.vertices.len() * 12 + m.indices.len() * 4)
+        .sum();
+
+    let mut buf =
+        Vec::with_capacity(ROOM_SNAPSHOT_HEADER_SIZE as usize + 8 + json.len() + mesh_bytes);
+    buf.extend_from_slice(&ROOM_SNAPSHOT_HEADER_SIZE.to_le_bytes());
+    buf.extend_from_slice(&ROOM_SNAPSHOT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&snapshot_id.to_le_bytes());
+    put_pose_position_first(&mut buf, &recenter_pose);
+    debug_assert_eq!(buf.len(), ROOM_SNAPSHOT_HEADER_SIZE as usize);
+
+    buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    buf.extend_from_slice(json.as_bytes());
+
+    buf.extend_from_slice(&(recentered.meshes.len() as u32).to_le_bytes());
+    for mesh in &recentered.meshes {
+        buf.extend_from_slice(&mesh.anchor_uuid);
+        put_pose_position_first(&mut buf, &mesh.pose);
+        buf.extend_from_slice(&(mesh.vertices.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(mesh.indices.len() as u32).to_le_bytes());
+        for vertex in &mesh.vertices {
+            for v in vertex {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for index in &mesh.indices {
+            buf.extend_from_slice(&index.to_le_bytes());
+        }
+    }
+
+    buf
+}
+
+/// MSG_PLAYSPACE_CHANGED payload: `u32 version, f32 x 7 recenter_pose (px..qw)`.
+pub fn encode_playspace_changed(recenter_pose: Pose) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&PLAYSPACE_CHANGED_VERSION.to_le_bytes());
+    put_pose_position_first(&mut buf, &recenter_pose);
+
+    buf
 }
 
 /// Current server wall-clock time as nanoseconds since the Unix epoch.

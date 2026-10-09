@@ -113,6 +113,11 @@ impl TrackingManager {
         self.inverse_recentering_origin * pose
     }
 
+    /// The transform `recenter_pose` applies (recentered = transform * client pose).
+    pub fn recenter_transform(&self) -> Pose {
+        self.inverse_recentering_origin
+    }
+
     pub fn recenter_motion(&self, motion: DeviceMotion) -> DeviceMotion {
         self.inverse_recentering_origin * motion
     }

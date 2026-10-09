@@ -1186,7 +1186,17 @@ fn connection_pipeline(
 
     let control_sender = Arc::new(Mutex::new(control_sender));
 
-    // Wire up relay stream control callback to forward to client
+    // Wire up relay stream control and room request callbacks to forward to client
+    {
+        let control_sender = Arc::clone(&control_sender);
+        ctx.xr_data_relay
+            .set_scene_request_callback(Box::new(move |recapture| {
+                control_sender
+                    .lock()
+                    .send(&ServerControlPacket::SceneRequest { recapture })
+                    .ok();
+            }));
+    }
     {
         let control_sender = Arc::clone(&control_sender);
         ctx.xr_data_relay.set_control_callback(Box::new(
@@ -1301,10 +1311,15 @@ fn connection_pipeline(
                         if !initial_settings.headset.tracking_ref_only {
                             let session_manager_lock = SESSION_MANAGER.read();
                             let config = &session_manager_lock.settings().headset;
-                            ctx.tracking_manager.write().recenter(
-                                config.position_recentering_mode,
-                                config.rotation_recentering_mode,
-                            );
+                            let recenter_transform = {
+                                let mut tracking_manager = ctx.tracking_manager.write();
+                                tracking_manager.recenter(
+                                    config.position_recentering_mode,
+                                    config.rotation_recentering_mode,
+                                );
+                                tracking_manager.recenter_transform()
+                            };
+                            ctx.xr_data_relay.set_recenter_pose(recenter_transform);
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
                             let wh = area.x * area.y;
@@ -1413,9 +1428,16 @@ fn connection_pipeline(
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
                     }
-                    ClientControlPacket::Reserved(_)
-                    | ClientControlPacket::ReservedBuffer(_)
-                    | ClientControlPacket::SceneSnapshot(_) => (),
+                    ClientControlPacket::SceneSnapshot(snapshot) => {
+                        let mesh_triangles: usize =
+                            snapshot.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                        let (rooms, anchors) = (snapshot.rooms.len(), snapshot.anchors.len());
+                        let id = ctx.xr_data_relay.set_scene_snapshot(snapshot);
+                        info!(
+                            "XR Data: scene snapshot #{id}: {rooms} rooms, {anchors} anchors,                              {mesh_triangles} mesh triangles"
+                        );
+                    }
+                    ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
                 }
 
                 disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
