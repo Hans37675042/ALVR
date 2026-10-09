@@ -176,3 +176,12 @@ def test_contoured_seat_is_still_a_seat():
     c = _one(chair(0.0, 0.0, 30.0, seat_h=0.44, seat_contour=0.07))
     assert c.kind == "Chair" and c.sittable
     assert abs(c.surface_h - 0.44) < 0.05
+
+
+def test_narrow_ledge_with_tall_back_is_not_a_chair():
+    # real tap: 0.2 m deep shelf edges at seat height in front of taller stuff read as chairs
+    from roomd.semantics import Obb
+    ledge = Obb(0.0, 0.0, 0.0, 0.5, 0.2, 0.40, 0.45)
+    back = Obb(0.0, -0.125, 0.0, 0.5, 0.05, 0.0, 1.1)
+    cands = _detect([ledge, back])
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands)
