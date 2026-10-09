@@ -5,7 +5,7 @@ use crate::{
 use alvr_client_core::{
     ClientCoreContext,
     depth_pipeline::{
-        SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows, send_link,
+        CapturePacer, SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows, send_link,
     },
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
@@ -405,7 +405,7 @@ pub struct StreamContext {
     depth_init_start: Instant,
     depth_last_retry: Instant,
     system: xr::SystemId,
-    last_depth_capture: Instant,
+    depth_pacer: CapturePacer,
     depth_readback: Option<DepthReadback>,
     // Compression and sending run on a worker; the render thread only hands frames over
     depth_link: Option<SendLink<DepthFrameMeta>>,
@@ -622,7 +622,7 @@ impl StreamContext {
             depth_init_start: Instant::now(),
             depth_last_retry: Instant::now(),
             system,
-            last_depth_capture: Instant::now(),
+            depth_pacer: CapturePacer::default(),
             depth_readback,
             depth_link,
             depth_skipped_frames: 0,
@@ -1086,7 +1086,8 @@ impl StreamContext {
                             self.depth_perf_captures += 1;
                             if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
                                 alvr_common::info!(
-                                    "[XR_PERF] depth {} frames read back, {} skipped, {} ring full,                                      {} dropped at the worker, {} buffers: {}",
+                                    "[XR_PERF] depth {} frames read back, {} skipped, {} ring-full frames, \
+                                     {} dropped at the worker, {} buffers: {}",
                                     self.depth_perf_captures,
                                     self.depth_skipped_frames,
                                     self.depth_ring_full,
@@ -1135,7 +1136,8 @@ impl StreamContext {
             .unwrap_or(10.0);
         let depth_interval = Duration::from_secs_f32(1.0 / depth_fps);
 
-        if self.last_depth_capture.elapsed() < depth_interval {
+        let now = Instant::now();
+        if !self.depth_pacer.is_due(now) {
             return false;
         }
 
@@ -1144,12 +1146,12 @@ impl StreamContext {
             alvr_common::info!("[XR_DATA] Starting depth provider...");
             if let Err(e) = depth_provider.start() {
                 alvr_common::info!("[XR_DATA] Failed to start depth provider: {e:?}");
-                self.last_depth_capture = Instant::now();
+                self.depth_pacer.defer(now, depth_interval);
                 return false;
             }
             alvr_common::info!("[XR_DATA] Depth provider started");
             // Runtime needs at least one frame after start before acquire works
-            self.last_depth_capture = Instant::now();
+            self.depth_pacer.defer(now, depth_interval);
             return false;
         }
 
@@ -1157,14 +1159,13 @@ impl StreamContext {
         // 0x8080 image that viewers would take for real depth.
         let Some(readback) = &mut self.depth_readback else {
             Self::note_depth_skip(&mut self.depth_skipped_frames, None);
-            self.last_depth_capture = Instant::now();
+            self.depth_pacer.defer(now, depth_interval);
             return false;
         };
 
-        // Never wait for the GPU: with every slot still in flight this capture is dropped
+        // Never wait for the GPU: with every slot still in flight, try again next frame
         let Some(slot) = readback.ring.free_slot() else {
             self.depth_ring_full += 1;
-            self.last_depth_capture = Instant::now();
             return false;
         };
 
@@ -1175,13 +1176,11 @@ impl StreamContext {
             display_time,
         ) {
             Ok(Some(image)) => image,
-            Ok(None) => {
-                self.last_depth_capture = Instant::now();
-                return false;
-            }
+            // No new depth image yet: retry on the next frame
+            Ok(None) => return false,
             Err(e) => {
                 alvr_common::info!("[XR_DATA] Failed to acquire depth image: {e:?}");
-                self.last_depth_capture = Instant::now();
+                self.depth_pacer.defer(now, depth_interval);
                 return false;
             }
         };
@@ -1197,7 +1196,7 @@ impl StreamContext {
             .unwrap_or(0);
         let Some(texture_id) = std::num::NonZeroU32::new(texture_id) else {
             Self::note_depth_skip(&mut self.depth_skipped_frames, None);
-            self.last_depth_capture = Instant::now();
+            self.depth_pacer.on_captured(now, depth_interval);
             return false;
         };
 
@@ -1230,7 +1229,7 @@ impl StreamContext {
             // A failed GL step leaves zeros or stale data in the buffer
             Err(failure) => Self::note_depth_skip(&mut self.depth_skipped_frames, Some(failure)),
         }
-        self.last_depth_capture = Instant::now();
+        self.depth_pacer.on_captured(now, depth_interval);
         true
     }
 
