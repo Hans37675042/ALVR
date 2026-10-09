@@ -166,11 +166,16 @@ APK 簽章：
    adb logcat | Select-String "XR_DIAG|XR_DATA"     # client log tag is "[ALVR NATIVE-RUST]"
    ```
    看到 `[XR_DIAG] Depth system props: supports_depth=1`，就代表 supportsEnvironmentDepth=true。接著應該出現 `Deferred depth provider created successfully!`。
-6. **收深度、記錄解析度和 fps**：在 PC 另開一個 PowerShell：
+6. **收深度並原樣錄成 tap 檔**：在 PC 另開一個 PowerShell（檔名的日期換成當天）：
    ```powershell
-   python D:\AIP\projects\alvr-realkk\tools\realkk\depth_listener.py --seconds 30
+   cd D:\AIP\projects\alvr-realkk\tools\realkk
+   python depth_listener.py --seconds 0 --tap D:\AIP\Data\realkk\taps\2026-10-09-room.rktap --mark-key
    ```
    - streamer 每 5 秒重試連線一次，所以要等最多 5 秒。
+   - `--seconds 0` 表示一直錄，錄完按 **Ctrl+C** 停止；streamer 斷線時也會自動停。結束時印出 `tap: N messages written`。
+   - `--tap` 把收到的每則 relay 訊息連同 PC 收到的時間原樣寫進檔案（含 pose、內參等 header），之後可以離線回放。錄製只需要標準 Python，不用裝 lz4／numpy。格式見 `tools/realkk/rktap.py` 開頭。
+   - 讀 socket 和寫檔在不同 thread，寫檔慢不會拖到 relay 的 500 ms 寫入逾時。
+   - `--mark-key`：在這個視窗按 **Enter** 就寫入一筆 marker（依序叫 `mark 1`、`mark 2`…；先打字再按 Enter 就用打的字當標籤），畫面會印出 `marker #N ... at <UTC 時間>`。
    - 腳本連上後會自動開啟 depth feed，然後印出：
      - stacked 寬高、單一 view 的寬高、format
      - near／far
@@ -180,6 +185,37 @@ APK 簽章：
    - 把首幀資訊和最後一行 `total N frames in T s -> X fps` 記下來。P2b 的通過標準是 ≥9 fps。
    - 同時 Dashboard 的 log 會出現 `XR Data: depth frame #1 WxH (...)`。
    - 要存幀的話加 `--dump D:\AIP\Data\realkk\depth_dump`，需要 `pip install numpy lz4`。
+
+   **錄製腳本**（listener 連上、開始印 fps 之後照順序做，全程約 2.5 分鐘）：
+
+   | 步驟 | 動作 | 時間 |
+   |---|---|---|
+   | 1 | 慢慢轉頭、走動，掃過整個房間 | 60 s |
+   | 2 | 站定，盯著椅子不動 | 10 s |
+   | 3 | 把椅子移動約 1 m，放好後回到鍵盤按一次 **Enter**（記下 `mark 1`） | — |
+   | 4 | 從椅子前方走過去 | 約 5–10 s |
+   | 5 | 坐到椅子上，保持不動 | 20 s |
+   | 6 | 坐著在面前揮手 | 約 10 s |
+   | 7 | 回到鍵盤按 **Ctrl+C** 停止錄製 | — |
+
+   **檢查錄到的內容**（需要 lz4）：
+   ```powershell
+   uv run --no-project --with lz4 python tap_inspect.py D:\AIP\Data\realkk\taps\2026-10-09-room.rktap
+   ```
+   - 印出訊息數、各型別數量、時長、depth fps、首幀 header（寬高、near／far、FOV、內參、pose）、marker 列表。
+   - `fake frames`：頭盔 readback 失敗時會送出整張都是 0x80 的假幀（解壓後 D16 全為 0x8080），這一行統計有幾張、是第幾幀。比例高就代表 readback 有問題，要回報。
+   - 沒有 lz4 時可以加 `--no-decode` 跳過假幀檢查。
+
+   **回放給 viewer（不需要頭盔）**：先關掉 ALVR Dashboard（它也會連 9944），開好要測的 viewer（例如另一個視窗跑 `python depth_listener.py`），再執行：
+   ```powershell
+   python tap_replay.py D:\AIP\Data\realkk\taps\2026-10-09-room.rktap            # 原速播一次
+   python tap_replay.py D:\AIP\Data\realkk\taps\2026-10-09-room.rktap --speed 2  # 兩倍速
+   python tap_replay.py D:\AIP\Data\realkk\taps\2026-10-09-room.rktap --loop     # 無限重播，Ctrl+C 停
+   ```
+   - 行為和 ALVR streamer 一樣：主動連 `127.0.0.1:9944`（`--port` 可改），viewer 沒開就每秒重試。
+   - feed 預設全關，viewer 送 `MSG_STREAM_CONTROL` 開啟後才開始播；播放中關掉的 feed，該類訊息直接略過。
+   - 訊息依錄製時的間隔送出，內容一個 byte 都不改，header 裡的時間戳仍是錄製當時的值。
+   - marker 不會送給 viewer，只在回放視窗印出。
 7. **量 overhead**：比較 listener 開啟前和開啟中，Dashboard 統計頁的串流 fps 和 total latency（P2b③：fps 下降 ≤5%）。
 
 ## 和 Virtual Desktop 共存
