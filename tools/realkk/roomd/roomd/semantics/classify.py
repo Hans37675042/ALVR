@@ -72,6 +72,7 @@ class _Geom:
     surface_h: float
     flat_ratio: float
     upper_refilled: Optional[np.ndarray] = None
+    base_refilled: float = 0.0       # share of base cells seen only under an overhang
 
 
 def _nearest(seeds, queries):
@@ -221,9 +222,10 @@ def _segment(raster, floor_y, p: SemanticsParams, is_overhang=None) -> List[_Geo
         surface_h, flat = _dominant_band(rel[biz, bix], p.surface_band)
         refilled = (raster.refilled[uiz, uix] if raster.refilled is not None and len(uiz)
                     else np.zeros(len(uiz), dtype=bool))
+        base_refilled = float(raster.refilled[biz, bix].mean()) if raster.refilled is not None else 0.0
         out.append(_Geom(raster.centres(biz, bix), rel[biz, bix],
                          raster.centres(uiz, uix), rel[uiz, uix] if len(uiz) else np.empty(0),
-                         surface_h, flat, refilled))
+                         surface_h, flat, refilled, base_refilled))
     return out
 
 
@@ -300,7 +302,7 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     if area >= p.bed_min_area and _in(s, p.bed_h) and flat and not couch_like:
         kind, sittable, conf = Kind.BED, p.bed_sittable, p.conf_bed
     elif (has_back and flat and _in(s, p.seat_h) and min(sx, sz) >= p.seat_min_side
-          and sz <= p.seat_max_depth):
+          and sz <= p.seat_max_depth and g.base_refilled <= p.seat_max_overhung):
         if sx >= p.couch_min_len:
             kind, conf = Kind.COUCH, p.conf_couch
         else:
