@@ -25,7 +25,7 @@ use alvr_common::{
 };
 use alvr_packets::{
     BatteryInfo, ButtonEntry, CameraFrameHeader, ClientControlPacket, DepthFrameHeader,
-    RealTimeConfig, StreamConfig, TrackingData,
+    RealTimeConfig, SceneSnapshot, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -59,6 +59,9 @@ pub enum ClientCoreEvent {
     XrStreamControl {
         depth_enabled: bool,
         camera_enabled: bool,
+    },
+    SceneRequest {
+        recapture: bool,
     },
 }
 
@@ -238,6 +241,23 @@ impl ClientCoreContext {
             sender
                 .send(&ClientControlPacket::ProximityState(headset_is_worn))
                 .ok();
+        }
+    }
+
+    /// Blocking: sends the snapshot as small chunks, taking the control socket lock per chunk so
+    /// other control packets can interleave. Call from a worker thread.
+    pub fn send_scene_snapshot(&self, id: u32, snapshot: &SceneSnapshot) {
+        for chunk in alvr_packets::split_scene_snapshot(id, snapshot) {
+            let mut sender_lock = self.connection_context.control_sender.lock();
+            let Some(sender) = &mut *sender_lock else {
+                return;
+            };
+            if sender
+                .send(&ClientControlPacket::SceneSnapshotChunk(chunk))
+                .is_err()
+            {
+                return;
+            }
         }
     }
 

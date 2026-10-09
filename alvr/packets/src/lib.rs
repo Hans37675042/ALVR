@@ -165,6 +165,11 @@ pub enum ServerControlPacket {
     },
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    /// Ask the client to send a fresh `ClientControlPacket::SceneSnapshot`. With `recapture`
+    /// the client may launch Space Setup (only honoured outside of streaming).
+    SceneRequest {
+        recapture: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -207,6 +212,144 @@ pub enum ClientControlPacket {
     ProximityState(bool),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    SceneSnapshotChunk(SceneSnapshotChunk),
+}
+
+/// Raw 16-byte XrUuidEXT of a Quest scene anchor.
+pub type SceneUuid = [u8; 16];
+
+/// Canonical lowercase 8-4-4-4-12 form of a scene UUID, bytes in XrUuidEXT order
+/// (same as Python's `str(uuid.UUID(bytes=raw))`).
+pub fn scene_uuid_string(uuid: &SceneUuid) -> String {
+    let hex = uuid.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneRoom {
+    pub uuid: SceneUuid,
+    pub floor: Option<SceneUuid>,
+    pub ceiling: Option<SceneUuid>,
+    pub walls: Vec<SceneUuid>,
+}
+
+/// One scene anchor. Bounds are in the anchor's local space (XR_FB_scene conventions).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneAnchor {
+    pub uuid: SceneUuid,
+    /// Comma separated semantic labels as returned by xrGetSpaceSemanticLabelsFB.
+    pub labels: String,
+    /// Client STAGE space pose; None when the anchor could not be located.
+    pub pose: Option<Pose>,
+    /// x, y, width, height
+    pub bbox2d: Option<[f32; 4]>,
+    pub boundary2d: Option<Vec<[f32; 2]>>,
+    /// offset x, y, z, width, height, depth
+    pub bbox3d: Option<[f32; 6]>,
+}
+
+/// Triangle mesh of an anchor (e.g. GLOBAL_MESH); vertices are in the anchor's local space.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneMesh {
+    pub anchor_uuid: SceneUuid,
+    /// Client STAGE space pose of the mesh anchor.
+    pub pose: Pose,
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
+/// Quest Space Setup scene model, located in the client's STAGE reference space.
+/// An empty snapshot means the headset has no captured room.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneSnapshot {
+    pub rooms: Vec<SceneRoom>,
+    pub anchors: Vec<SceneAnchor>,
+    pub meshes: Vec<SceneMesh>,
+}
+
+/// Max payload bytes per scene chunk. A snapshot with the global mesh can be several MB; small
+/// control packets keep the control socket free for other packets and keepalives.
+pub const SCENE_CHUNK_SIZE: usize = 60 * 1024;
+
+/// Part `index` of `count` of an LZ4 compressed (size prepended) bincode `SceneSnapshot`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SceneSnapshotChunk {
+    pub id: u32,
+    pub index: u32,
+    pub count: u32,
+    pub data: Vec<u8>,
+}
+
+pub fn split_scene_snapshot(id: u32, snapshot: &SceneSnapshot) -> Vec<SceneSnapshotChunk> {
+    let encoded = bincode::serde::encode_to_vec(snapshot, bincode::config::standard()).unwrap();
+    let compressed = lz4_flex::compress_prepend_size(&encoded);
+    let count = compressed.len().div_ceil(SCENE_CHUNK_SIZE).max(1) as u32;
+
+    (0..count)
+        .map(|index| {
+            let start = index as usize * SCENE_CHUNK_SIZE;
+            let end = (start + SCENE_CHUNK_SIZE).min(compressed.len());
+            SceneSnapshotChunk {
+                id,
+                index,
+                count,
+                data: compressed[start..end].to_vec(),
+            }
+        })
+        .collect()
+}
+
+/// Reassembles chunks sent in order over the control socket. A chunk with index 0 starts a
+/// new snapshot and discards any unfinished one.
+#[derive(Default)]
+pub struct SceneChunkAssembler {
+    id: Option<u32>,
+    count: u32,
+    next_index: u32,
+    data: Vec<u8>,
+}
+
+impl SceneChunkAssembler {
+    pub fn push(&mut self, chunk: SceneSnapshotChunk) -> Result<Option<SceneSnapshot>> {
+        if chunk.index == 0 {
+            self.id = Some(chunk.id);
+            self.count = chunk.count;
+            self.next_index = 0;
+            self.data.clear();
+        } else if self.id != Some(chunk.id)
+            || chunk.index != self.next_index
+            || chunk.count != self.count
+        {
+            self.id = None;
+            self.data.clear();
+            alvr_common::anyhow::bail!(
+                "unexpected scene chunk {}/{} of snapshot {}",
+                chunk.index,
+                chunk.count,
+                chunk.id
+            );
+        }
+
+        self.data.extend_from_slice(&chunk.data);
+        self.next_index += 1;
+        if self.next_index < self.count {
+            return Ok(None);
+        }
+
+        self.id = None;
+        let encoded = lz4_flex::decompress_size_prepended(&std::mem::take(&mut self.data))?;
+        let (snapshot, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard())?;
+
+        Ok(Some(snapshot))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -444,6 +587,93 @@ mod tests {
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
+    }
+
+    fn big_scene() -> SceneSnapshot {
+        let n = 30_000u32;
+        SceneSnapshot {
+            rooms: vec![SceneRoom {
+                uuid: [1; 16],
+                floor: Some([2; 16]),
+                ceiling: None,
+                walls: vec![[3; 16]],
+            }],
+            anchors: vec![SceneAnchor {
+                uuid: [4; 16],
+                labels: "GLOBAL_MESH".into(),
+                pose: Some(Pose::IDENTITY),
+                ..Default::default()
+            }],
+            meshes: vec![SceneMesh {
+                anchor_uuid: [4; 16],
+                pose: Pose::IDENTITY,
+                // Noisy coordinates so the mesh does not compress below one chunk
+                vertices: (0..n)
+                    .map(|i| {
+                        let f = (i as f32 * 0.618_034).fract();
+                        [f, (f * 7.3).fract(), i as f32 * 1e-3]
+                    })
+                    .collect(),
+                indices: (0..n * 3).map(|i| (i * 7919) % n).collect(),
+            }],
+        }
+    }
+
+    fn assemble(chunks: Vec<SceneSnapshotChunk>) -> Option<SceneSnapshot> {
+        let mut assembler = SceneChunkAssembler::default();
+        let mut out = None;
+        for chunk in chunks {
+            if let Some(snapshot) = assembler.push(chunk).unwrap() {
+                assert!(out.is_none(), "snapshot completed twice");
+                out = Some(snapshot);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scene_chunks_are_small_and_reassemble() {
+        let scene = big_scene();
+        let chunks = split_scene_snapshot(7, &scene);
+        assert!(chunks.len() > 1);
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(chunk.data.len() <= SCENE_CHUNK_SIZE);
+            assert_eq!((chunk.id, chunk.index, chunk.count), (7, i as u32, chunks.len() as u32));
+        }
+        let out = assemble(chunks).unwrap();
+        assert_eq!(out.rooms[0].floor, Some([2; 16]));
+        assert_eq!(out.anchors[0].labels, "GLOBAL_MESH");
+        assert_eq!(out.meshes[0].vertices, scene.meshes[0].vertices);
+        assert_eq!(out.meshes[0].indices, scene.meshes[0].indices);
+    }
+
+    #[test]
+    fn empty_scene_is_one_chunk() {
+        let chunks = split_scene_snapshot(1, &SceneSnapshot::default());
+        assert_eq!(chunks.len(), 1);
+        let out = assemble(chunks).unwrap();
+        assert!(out.rooms.is_empty() && out.anchors.is_empty() && out.meshes.is_empty());
+    }
+
+    #[test]
+    fn newer_snapshot_discards_unfinished_one() {
+        let mut first = split_scene_snapshot(1, &big_scene());
+        first.truncate(1); // client restarted mid-transfer
+        let second = split_scene_snapshot(2, &SceneSnapshot::default());
+        let mut chunks = first;
+        chunks.extend(second);
+        let out = assemble(chunks).unwrap();
+        assert!(out.meshes.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_chunk_is_rejected_without_panic() {
+        let mut chunks = split_scene_snapshot(3, &big_scene());
+        chunks.swap(0, 1);
+        let mut assembler = SceneChunkAssembler::default();
+        let results: Vec<_> = chunks.into_iter().map(|c| assembler.push(c)).collect();
+        assert!(results.iter().any(|r| r.is_err()));
+        assert!(results.iter().all(|r| !matches!(r, Ok(Some(_)))));
     }
 
     #[test]

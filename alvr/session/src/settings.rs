@@ -836,6 +836,12 @@ pub struct XrDataConfig {
     ))]
     #[schema(gui(slider(min = 1024, max = 65535, step = 1)))]
     pub viewer_port: u16,
+
+    #[schema(strings(
+        display_name = "Scene Model",
+        help = "Send the Quest Space Setup scene (room layout, furniture, global mesh) to the viewer when streaming starts and when the playspace changes. Run Space Setup on the headset first."
+    ))]
+    pub enable_scene: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1987,6 +1993,7 @@ pub fn session_settings_default() -> SettingsDefault {
                     camera_height: 480,
                     camera_bitrate_mbps: 15.0,
                     viewer_port: 9944,
+                    enable_scene: true,
                 },
             },
         },
