@@ -45,6 +45,8 @@ patch 在基底上 `git apply --check` 可以乾淨套用，原樣收成一個 c
 | Fix: Skip depth frames when the GPU readback is unavailable | S8，不再送 0x8080 假幀 |
 | Chore: Tag version as 21.0.0-dev12-realkk.2 | protocol 升版 |
 | Test／Feat: depth_listener room snapshot | `--request-room`、快照摘要 |
+| Fix: Ship libvpl.dll with the Windows streamer build | 修 SteamVR 載入 driver error 126，見 Build 段 |
+| Test＋Fix ×5（審查後） | relay 連線 generation／非阻塞送出、快照分塊、失敗不送、label fallback 警告、GL 錯誤跳幀 |
 
 ### patch 本體做了什麼
 
@@ -113,7 +115,7 @@ D16 換成線性距離（標準 GL 投影，d ∈ [0,1]）：
 
 ### 假幀與 hand removal（S8，feat/scene-import）
 
-- 讀回不可用時（深度 swapchain 的 GL texture 還是 0，或 readback pipeline 沒建立）client 直接**跳過這一幀**，不再送整張 0x8080 的假幀。頭盔 log 會出現 `[XR_DATA] depth readback unavailable, frame skipped (N so far)`（前 3 次和每 100 次印一行）。舊的 tap 錄檔仍可能有假幀，`tap_inspect.py` 照樣統計。
+- 讀回不可用時（深度 swapchain 的 GL texture 還是 0，或 readback pipeline 沒建立）client 直接**跳過這一幀**，不再送整張 0x8080 的假幀。blit／copy／ReadPixels 任一步 GL 報錯或 framebuffer 不完整時也一樣跳過。頭盔 log 會出現 `[XR_DATA] depth readback unavailable, frame skipped (N so far)`，GL 失敗時附上是哪一步（前 3 次和每 100 次印一行）。舊的 tap 錄檔仍可能有假幀，`tap_inspect.py` 照樣統計。
 - 系統回報 `supports_hand_removal=1` 時，建立 provider 後呼叫 `xrSetEnvironmentDepthHandRemovalMETA(enabled)`，深度圖裡的手會被移除。log：`[XR_DIAG] Depth hand removal enabled: SUCCESS`。
 
 **以下尚未實機驗證，PM 實測時確認：**
@@ -134,12 +136,14 @@ D16 換成線性距離（標準 GL 投影，d ∈ [0,1]）：
    - 再以 UUID 查詢所有 anchor（含 GLOBAL_MESH），必要時開 LOCATABLE 並等 `SpaceSetStatusComplete` 事件。
    - 讀 semantic labels、bbox2D、boundary2D、bbox3D；有 TRIANGLE_MESH 元件的用 `xrGetSpaceTriangleMeshMETA` 取網格；`xrLocateSpace` 到 STAGE。
    - 查詢觸發時機：串流開始、`ReferenceSpaceChangePending`、server 轉來的 `SceneRequest`。
-   - 查無房間時送空快照，log `[SCENE] no Space Setup room found on the headset`。整個查詢 10 秒逾時，逾時就送已載入的部分。
-   - 快照走 TCP control（`ClientControlPacket::SceneSnapshot`），在背景 thread 送，不卡 render loop。
+   - 查詢成功但沒有房間時才送空快照，log `[SCENE] no Space Setup room found on the headset`。
+   - 查詢失敗、10 秒逾時、或 USE_SCENE 權限未授予時**不送**（log 有 `nothing sent` 或 `permission not granted`），server 保留上一份快取。
+   - 傳輸：快照用 bincode 序列化、LZ4 壓縮，切成 ≤60 KB 的 `ClientControlPacket::SceneSnapshotChunk` 依序走 TCP control；每塊各自取放 control socket 的 lock，按鍵等其他 control 封包可以穿插，server 的 keepalive 也不會因大封包逾時。每個 session 一條常駐 sender thread，只送最新的一份。server 用 `SceneChunkAssembler` 重組。
 2. server：快取最新快照（client 座標），套當下的 recenter 轉換後送 `MSG_ROOM_SNAPSHOT`。下列時機會重送同一個 `snapshot_id`：
    - viewer（roomd）新連上；
    - server recenter（client 送 PlayspaceSync），此時先送 `MSG_PLAYSPACE_CHANGED`，再送快照；
-   - viewer 送 `MSG_ROOM_REQUEST`（recapture=0 時先回快取，再轉給 client 重查）。
+   - viewer 送 `MSG_ROOM_REQUEST`（先回快取，再轉給 client 重查）。
+   - 送出都在 relay 自己的 thread 做，不阻塞 control 接收與 recenter；viewer 連線帶 generation，舊的讀取 thread 不會清掉新連線，斷線的 socket 會 shutdown，roomd 會立刻收到 EOF。
    - 場景訊息不受 `MSG_STREAM_CONTROL` 的 depth／camera 開關影響。
 3. 設定：`Video > XR Data Streaming > Scene Model`（預設開）。XR Data Streaming 整個停用時不查場景。
 
@@ -176,7 +180,7 @@ JSON：
 
 **MSG_PLAYSPACE_CHANGED = 5**：`u32 version = 1`、`f32×7 recenter_pose`，共 32 bytes。
 
-**MSG_ROOM_REQUEST = 101（viewer → ALVR）**：`u8 recapture`。0 = 重送快取並請 client 重查；1 = 要求 Space Setup。Space Setup 會暫停 app、中斷串流，所以串流中 client 不執行 1，只記 log 並改為重查；請在頭盔上先做好 Space Setup。
+**MSG_ROOM_REQUEST = 101（viewer → ALVR）**：`u8 recapture`。v1 中 0 和 1 行為相同：重送快取並請 client 重查。Space Setup 會暫停 app、中斷串流，本 fork 不會觸發它；請在頭盔設定裡先做好 Space Setup。
 
 ## Build
 
@@ -188,7 +192,7 @@ cd D:\AIP\projects\alvr-realkk
 git checkout feat/depth-uplink
 git submodule update --init --recursive   # openvr headers
 
-cargo xtask build-streamer --release      # -> build\alvr_streamer_windows\
+cargo xtask build-streamer --release      # -> build\alvr_streamer_windows\（含 bin\win64\libvpl.dll）
 cargo xtask build-client --release        # -> build\alvr_client_android\alvr_client_android.apk
 ```
 
@@ -212,6 +216,7 @@ cargo xtask build-client --release        # -> build\alvr_client_android\alvr_cl
   - `deps\android_openxr\arm64-v8a\libopenxr_loader.so`：Khronos 1.1.36。
 - `deps\` 被 gitignore，重新 clone 時要再準備一次，指令同上。
 - APK 只帶 generic loader，Quest 2／3／Pro 可用，Quest 1、Pico、YVR、Lynx 不能用。
+- libvpl 2.15 預設建成 shared library，`vpl.lib` 只是 import library，`driver_alvr_server.dll` 會依賴 `libvpl.dll`。上游 xtask 只複製 `openvr_api.dll`，少了它 SteamVR 載入 driver 會報 error 126。本 fork 的 `build-streamer` 會把 `deps\windows\libvpl\alvr_build\bin\libvpl.dll` 複製到 `build\alvr_streamer_windows\bin\win64\`；舊的 build 要手動補這個檔，或用新版 xtask 重 build。
 - streamer 是**非 GPL** build（沒加 `--gpl`），所以沒有軟體編碼，NVENC 照常可用。
 
 APK 簽章：
@@ -325,7 +330,7 @@ APK 簽章：
 - server 會把每張深度幀複製一份成 `ServerCoreEvent::DepthFrame`，丟給 OpenVR event loop，但那邊會直接忽略。這是 patch 原有的行為，有額外記憶體成本，但不影響功能。
 - 沒有自動化 build 測試 Android 執行期。目前只驗證過：單元測試（`cargo test -p alvr_packets -p alvr_server_core`）、兩個平台都 build 成功。
 - 場景匯入（feat/scene-import）尚未實機驗證：
-  - 串流中無法觸發 Space Setup（`MSG_ROOM_REQUEST recapture=1` 只會重查）；lobby 也沒有觸發 UI，請在頭盔設定裡先做。
+  - 不會觸發 Space Setup（`MSG_ROOM_REQUEST recapture=1` 視同 0，只會重查）；lobby 也沒有觸發 UI，請在頭盔設定裡先做。
   - 快照只在上述時機產生，不追蹤 Space Setup 以外的場景變化（家具移動靠 roomd 的深度融合）。
-  - USE_SCENE 權限在 session 建立時請求；第一次安裝若在串流開始後才按允許，要重連一次或用 `adb shell pm grant` 先授權。
+  - USE_SCENE 權限在 session 建立時請求；未授權時查詢會跳過（不送空快照）。第一次安裝若在串流開始後才按允許，要重連一次，或用 `adb shell pm grant` 先授權。
   - 9944 relay 仍只接受單一 viewer，roomd 與 depth_listener 不能同時接。
