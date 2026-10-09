@@ -112,3 +112,13 @@ def test_detection_reports_floor_and_walls():
     d = detect(room)
     assert abs(d.floor_y) < 0.005
     assert len(d.walls) == 4
+
+
+def test_backrest_across_one_cell_gap_still_attaches():
+    # TSDF drops tilted-normal points at the seat/backrest edge: a 2-3 cm gap remains
+    from roomd.semantics import Obb
+    seat = Obb(0.0, 0.0, 0.0, 0.45, 0.40, 0.41, 0.45)
+    back = Obb(0.0, -0.20 - 0.03 - 0.025, 0.0, 0.45, 0.05, 0.0, 0.9)
+    c = _one([seat, back])
+    assert c.kind == "Chair" and c.has_back
+    assert yaw_diff(c.yaw, 0.0) < 8.0
