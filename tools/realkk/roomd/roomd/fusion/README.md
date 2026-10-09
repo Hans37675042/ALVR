@@ -34,12 +34,12 @@ uv run python -m roomd --fusion roomd.fusion:create_sink
 
 | 方法 | 行為 |
 |---|---|
-| `integrate(protocol.DepthFrame)` | 用 `frame.header`＋`frame.d16()` 解碼後整合（同步，單幀約 3–4 ms） |
+| `integrate(protocol.DepthFrame)` | 取 `views[i].pose_xr`／`intrinsics` 與 `view_z(i)` 組成 DepthFrame 後整合（同步，單幀約 3–4 ms） |
 | `snapshot_outputs()` | `map_revision`、`floor_y`／`floor_rms`（地板擬合）、`nav_heightmap`（最新一份，f16）、有新圖才 `nav_revision += 1`、`mesh_chunks`（這次要送的）；`objects`／`seats`／`walls` 回 None，由語意層負責 |
 | `set_scene_prior(ScenePrior)` | 體積還沒建立時用 `floor_y` 當地板；有 GLOBAL_MESH 就以先驗權重寫入 |
 | `on_playspace_changed(pose)` | pose 和上次不同（>1 mm 或 >0.1°）就清掉體積：已送過的 chunk 下次以 `vcount=0`、更高 revision 送出移除，高度圖改送全未知並遞增 `nav_revision` |
 
-`tests/fusion/roomd_io_stubs.py` 在 roomd-io 模組不存在時補上同欄位的替身；模組存在時用真的。
+9945 payload 的編解碼由 `roomd.protocol` 負責；`roomd.fusion.outputs` 只是轉成 protocol 型別的薄包裝。
 
 ## 對外 API
 
@@ -66,15 +66,14 @@ out = fusion.snapshot_outputs(now=None, force=False)
 | `visible_fraction(obb, max_age_frames=10)` | OBB 內最近 N 幀有被更新的體素比例 |
 | `region_stats(obb, max_age_frames)` | 上面三者的原始計數（含 `total`） |
 | `extract_mesh()` | 整個體積的網格（除錯／離線用） |
+| `save_state(path)`／`TsdfFusion.load_state(path)` | 體積與計數器存成 .npz（約 10–15 MB）再讀回，查詢與 snapshot 都能用；給語意層離線試跑 |
 
 - 三種比例的分母都是 OBB 內的全部體素；未觀測（例如物體內部）兩邊都不算。判斷物件消失時，
   建議同時看 `visible_fraction`（有沒有被看到）和 `free_fraction`（看到的是空的）。
 - `Obb(center, half_extents, yaw)`：yaw 為繞 +Y 的弧度，Unity 慣例（正值把 +Z 轉向 +X）。
 
-### 9945 payload 編碼（`roomd.fusion.outputs`）
+### 9945 payload 約定
 
-- `encode_mesh_chunk(chunk)`、`encode_nav_heightmap(hm)` 產生契約 payload（不含 `u32 type, u32 len` 外框）；
-  `decode_*` 是對應的解碼器，測試與 plugin 端對照用。
 - MESH_CHUNK：頂點是**絕對** Unity stage 座標；三角形繞向採 Unity 正面慣例
   （`cross(b−a, c−a)` 指向自由空間）；`vcount = 0` 表示該 chunk 已清空。離地 3 cm 內的三角形已排除。
 - NAV_HEIGHTMAP：`originX, originZ` 是格 (0,0) 的最小角；第 `z*w + x` 筆對應格 `(x, z)`。
@@ -89,8 +88,9 @@ out = fusion.snapshot_outputs(now=None, force=False)
    使用者身體圓柱（頭部下方、水平半徑 0.4 m）內的量測點丟棄、落在 `floor_y − 0.05 m` 以下的量測點丟棄
    （實錄房間往下看時約 40% 的地板樣本落在地板後方 5–30 cm，不擋的話會把地板 carve 掉）。
 3. **整合**：每個體素投影到兩個 view，`sdf = (d − z) · |p| / z`；`sdf < −trunc` 不更新，
-   其餘 `tsdf = min(1, sdf/trunc)` 做移動平均 `1/(n+1)`、權重上限 16。截斷帶前方全部寫成自由空間（carving），
-   所以家具搬走後舊位置會被清掉（合成測試：6 幀）。
+   其餘 `tsdf = min(1, sdf/trunc)` 做移動平均 `1/(n+1)`、權重上限 16。截斷帶前方全部寫成自由空間（carving）。
+   場景變動：體素原本有把握（|tsdf| > 0.5）而新樣本號相反時，權重先乘 0.25 再平均，
+   所以家具搬走後舊位置數幀內清掉、搬來的位置也幾乎和「從沒看過」一樣快出現（合成測試：清除 3 幀、出現落後 ≤ 2 幀）。
 4. **變化里程表**：每個 1 m chunk 累加 `|Δtsdf|`，超過門檻才重新 MC。
 5. **MC**：每個 chunk 帶一格接縫做 marching cubes；只保留 8 角都觀測過、且沒有截斷跳變的格子，
    避免已知／未知邊界與截斷帶背面的假面。
@@ -104,7 +104,7 @@ uv run --no-project --with warp-lang==1.18.0 --with numpy --with lz4 python -m r
 uv run --no-project --with warp-lang==1.18.0 --with numpy --with lz4 python -m roomd.fusion.replay --make-synthetic synth.rktap
 ```
 
-輸出 `mesh.ply`、`heightmap.png`（黑＝未知、灰＝可走、紅到黃＝障礙高度，圖上方＝+Z）、`stats.json`。
+`--until S` 只融合 tap 開頭 S 秒；`--save-state FILE.npz` 另存體積。輸出 `mesh.ply`、`heightmap.png`（黑＝未知、灰＝可走、紅到黃＝障礙高度，圖上方＝+Z）、`stats.json`。
 
 ## 實機資料驗證（2026-10-09 smoke／room tap）
 
@@ -113,6 +113,10 @@ uv run --no-project --with warp-lang==1.18.0 --with numpy --with lz4 python -m r
   地板量測深度與預期深度的比值在影像中央各帶都在 1.00 ± 2%。
 - pose 與深度沒有固定時間差（±100 ms 掃描，0 ms 最佳），但轉頭越快幀間越不一致：
   <10°/s 1.5 cm、10–30°/s 2.6 cm、30–60°/s 3.3 cm、>60°/s 5.9 cm。
+
+- room2 tap（129 s，PM 移椅子約 1.36 m）：地板 y = +1.7 cm、RMS 7.5 mm；主牆面偏離垂直 0.4°。
+  舊位置第一次重新入鏡後約 0.9 s（4 幀）清空；新位置入鏡後 1 s 達一半、4–6 s 與從未看過的體積同樣完整
+  （未加衝突衰減前要 4 倍時間）。坐上新椅子時身體圓柱擋住，椅子沒被侵蝕、人也沒進地圖；之後在桌前的動作沒有在頭前留下殘影。
 
 ## 已知限制
 
