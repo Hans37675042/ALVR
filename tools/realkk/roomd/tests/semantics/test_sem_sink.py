@@ -143,10 +143,10 @@ def test_no_floor_means_no_objects():
     assert out.objects is None and out.seats is None and out.walls is None
 
 
-def test_scene_prior_suppresses_duplicate_and_supplies_walls():
+def test_scene_objects_can_be_left_to_roomd_and_prior_supplies_walls():
     room = _room()
     room.place("k", couch(0.0, 0.5, 0.0))
-    sink = _sink(room)
+    sink = _sink(room, publish_scene_objects=False)
     prior_obj = M.RoomObject(Id="scene:u1", Kind=M.Kind.Couch, Source=M.SOURCE_SCENE, Label="COUCH",
                              Pose=M.Pose(M.Vec3(0.0, 0.0, 0.5), M.Quat.from_yaw(0.0)),
                              Size=M.Vec3(2.0, 0.85, 0.9), Locked=False)
@@ -160,10 +160,10 @@ def test_scene_prior_suppresses_duplicate_and_supplies_walls():
     assert out.walls == walls  # fusion surface points are upward only: no fused walls
 
 
-def test_publish_scene_objects_option():
+def test_scene_objects_published_by_default_and_follow_geometry():
     room = _room()
     room.place("k", couch(0.0, 0.5, 0.0))
-    sink = _sink(room, publish_scene_objects=True)
+    sink = _sink(room)
     prior_obj = M.RoomObject(Id="scene:u1", Kind=M.Kind.Couch, Source=M.SOURCE_SCENE, Label="COUCH",
                              Pose=M.Pose(M.Vec3(0.1, 0.0, 0.6), M.Quat.from_yaw(0.0)),
                              Size=M.Vec3(2.0, 0.85, 0.9), Locked=False)
