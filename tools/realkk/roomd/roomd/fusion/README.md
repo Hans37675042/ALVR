@@ -77,7 +77,7 @@ out = fusion.snapshot_outputs(now=None, force=False)
 - MESH_CHUNK：頂點是**絕對** Unity stage 座標；三角形繞向採 Unity 正面慣例
   （`cross(b−a, c−a)` 指向自由空間）；`vcount = 0` 表示該 chunk 已清空。離地 3 cm 內的三角形已排除。
 - NAV_HEIGHTMAP：`originX, originZ` 是格 (0,0) 的最小角；第 `z*w + x` 筆對應格 `(x, z)`。
-  `topY = floorY` 表示沒有障礙。flags：bit0 known、bit1 obstacle（離地 5 cm–1.9 m 內有佔用）、
+  `topY = floorY` 表示沒有障礙。flags：bit0 known、bit1 obstacle（離地 5 cm–1.7 m 內有佔用；角色身高 1.5–1.6 m＋餘裕，上舖底面約 1.55 m 擋路、天花板梁不擋）、
   bit2 walkable（known、無障礙、看到地板）。
 
 ## 演算法

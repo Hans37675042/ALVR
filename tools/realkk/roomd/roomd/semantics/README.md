@@ -69,9 +69,12 @@ Meta anchor already converted to Unity stage space.
 1. Raster: the map's heightmap (`raster_source="heightmap"`, default; TSDF upward points
    are too sparse for chair seats), or upward surface points on a 2 cm grid aligned to the
    points' lattice phase with single-cell dropouts filled (`"points"`). Cells 5 cm–2 m
-   above the floor; with a capped heightmap (fusion stops at `obstacle_max_height`) cells
-   at `structure_min_h` and above are walls/unknown and ignored (the sink sets it to the
-   cap − 5 cm).
+   above the floor; cells at `structure_min_h` (1.5 m) and above are structure (walls, loft
+   bed, beams, tall cabinets) and ignored. The fusion heightmap only scans up to
+   `FusionConfig.obstacle_max_height` (1.7 m: character height 1.5–1.6 m + margin, so a
+   loft underside at ~1.55 m blocks walking and a ~1.9 m beam does not), so the sink uses
+   min(1.5, cap − 0.05): the cut always sits below the cap, where walls and tall cabinets
+   are indistinguishable, and above every seat and table top (≤ 1.25 m backrests).
 2. Blobs = 8-connected cells, cut where neighbours step > `split_dh`; a blob holding
    two large solid flat patches more than `split_patch_dh` apart is split between them.
 3. Thin pieces (short side <= `thin_max`) higher than a neighbour within
@@ -110,13 +113,13 @@ on it at t≈95–102 s. Replayed through RoomService + SemanticsSink + TsdfFusi
 
 | | chair ids | id kept across move | OccupiedByUser | false chairs | Table ids |
 |---|---|---|---|---|---|
-| defaults | 2 | yes, plus a duplicate id at the new spot | yes | 1 (short-lived) | 3 |
-| + `structure_min_h` 1.5, `gate_surface_dh` 0.10 | 1 | yes (Missing t=86, Present t=92) | yes (t=95–102) | 0 | 2 |
+| old 5 cm seat gate, 1.85 m cut | 2 | yes, plus a duplicate id at the new spot | yes | 1 (short-lived) | 3 |
+| defaults (1.5 m cut, 0.10 m gate, fusion cap 1.7 m) | 1 | yes (Missing t=86, Present t=92) | yes (t=95–102) | 0 | 2 |
 
-With both values: one desk-zone Table at (2.26, −1.00), 2.06 × 0.56 m (both desks and the
-basket unit merge), and one low not-sittable Table at (−1.05, 0.60) (likely the suitcase).
-These two values are not defaults yet: they break existing tests (1.9 m wardrobe as Other,
-sink cap derivation, 0.42/0.52 m chair swap).
+With the defaults: the desk zone under the loft is one Table at (2.26, −1.01), 2.07 × 0.57 m
+(both desks and the basket unit merge); a second Table id first appears at (−0.13, 0.25) and
+ends at (1.67, −1.10) (0.94 × 0.51 m, overlapping the desk zone): the 3 m gate lets table ids
+wander across the room.
 
 Real-data rules (each from a failure on this tap): heightmap segmentation (points too
 sparse), overhang refill + free-space probe (desk under the loft), refilled cells are never a
@@ -137,6 +140,12 @@ ends Moving. Geometry-only `Other` objects are not published by the sink.
   user sits on it the fusion body mask hides it too, so the chair the PM sat on at the
   start of the tap is first seen at t≈60 s (OccupiedByUser cannot fire before that).
 - Seats seen only under an overhang (loft desk zone) are never offered.
+- A re-measured pose can shift ~9 cm (room2 t≈105 s, after the user stood up): the seat
+  area then covers the armrests/backrest and the seat reads Blocked. Anchoring size and
+  seat height to the tracked template does not help (56 % high cells at the shifted
+  centre vs 36 % before); needs pose anchoring (e.g. backrest edge) or hysteresis.
+- Table ids can jump to another table-like candidate within `gate_dist` (3 m); a per-kind
+  gate (≈1 m for tables) is the next step.
 - Seat states have no hysteresis; a single noisy frame can flip Blocked.
 - Beds are not sittable by default (`bed_sittable`); SeatGenerator would put the
   seat in the middle of the mattress.
