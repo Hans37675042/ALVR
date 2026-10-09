@@ -269,13 +269,21 @@ class TsdfFusion:
             p, _ = self.surface_points(cfg.floor_y - 0.15, cfg.floor_y + 0.15)
             if len(p) < 50:
                 return None
-            keep = np.ones(len(p), bool)
+            # Low furniture (rugs, platforms, bed frames) also lies in the search band and can
+            # outnumber the visible floor: seed with the well-populated 1 cm height bin closest
+            # to the STAGE floor instead of fitting everything.
+            hist, edges = np.histogram(p[:, 1], bins=np.arange(cfg.floor_y - 0.15, cfg.floor_y + 0.155, 0.01))
+            smooth = np.convolve(hist, np.ones(3), mode="same")
+            centers = (edges[:-1] + edges[1:]) / 2
+            dense = smooth >= 0.5 * smooth.max()
+            seed_y = centers[dense][np.argmin(np.abs(centers[dense] - cfg.floor_y))]
+            keep = np.abs(p[:, 1] - seed_y) < 0.03
             for _ in range(3):
                 a = np.c_[p[keep, 0], p[keep, 2], np.ones(keep.sum())]
                 coef, *_ = np.linalg.lstsq(a, p[keep, 1], rcond=None)
                 res = p[:, 1] - (coef[0] * p[:, 0] + coef[1] * p[:, 2] + coef[2])
                 sigma = max(np.std(res[keep]), 1e-4)
-                keep = np.abs(res) < 3 * sigma
+                keep = np.abs(res) < min(3 * sigma, 0.03)
             normal = np.array([-coef[0], 1.0, -coef[1]])
             normal /= np.linalg.norm(normal)
             centroid = p[keep].mean(axis=0)
