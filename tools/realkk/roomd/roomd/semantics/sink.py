@@ -3,9 +3,9 @@
 
 The wrapped sink keeps doing depth integration, mesh chunks and the nav heightmap;
 ``snapshot_outputs`` additionally fills ``objects`` / ``seats`` / ``walls`` with
-roomd.model records. Scene API objects already reach ROOM_MODEL through roomd's
-scene model, so by default only Fused objects are published here (the scene labels
-still steer kinds and absorb the geometry under them).
+roomd.model records. Tracked Scene API objects (``scene:<uuid>``, pose following the
+fused geometry) are published too; roomd's service prefers them over its own scene
+copy with the same id. ``publish_scene_objects=False`` leaves scene objects to roomd.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class SemanticsSink(FusionSink):
     name = "semantics"
 
     def __init__(self, inner, params: Optional[SemanticsParams] = None, clock=time.time,
-                 obb_cls=None, publish_scene_objects: bool = False):
+                 obb_cls=None, publish_scene_objects: bool = True):
         self.inner = inner
         self.params = params
         self.clock = clock
