@@ -334,15 +334,24 @@ impl ClientCoreContext {
     pub fn report_submit(&self, timestamp: Duration, vsync_queue: Duration) {
         dbg_client_core!("report_submit");
 
-        if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+        // The summary is taken first and the statistics lock released, so the video receive
+        // thread (which reports into the same manager) never waits for the socket
+        let summary = {
+            let Some(stats) = &mut *self.connection_context.statistics_manager.lock() else {
+                return;
+            };
             stats.report_submit(timestamp, vsync_queue);
+            stats.summary(timestamp)
+        };
 
-            if let Some(sender) = &mut *self.connection_context.statistics_sender.lock() {
-                if let Some(stats) = stats.summary(timestamp) {
-                    sender.send_header(&stats).ok();
-                } else {
-                    warn!("Statistics summary not ready!");
-                }
+        if let Some(sender) = &mut *self.connection_context.statistics_sender.lock() {
+            if let Some(summary) = summary {
+                // Runs on the render thread right before xrEndFrame: when another stream (e.g.
+                // a large depth uplink frame over TCP) is writing to the socket, skip these
+                // statistics instead of stalling the frame
+                sender.try_send_header(&summary).ok();
+            } else {
+                warn!("Statistics summary not ready!");
             }
         }
     }
