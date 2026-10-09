@@ -23,6 +23,10 @@ static TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META: LazyLock<xr::Structure
 static TYPE_SYSTEM_ENVIRONMENT_DEPTH_PROPERTIES_META: LazyLock<xr::StructureType> =
     LazyLock::new(|| xr::StructureType::from_raw(1000291007));
 
+// Hand removal on the depth provider. Build with `false` to A/B its cost (Client System latency,
+// GPU load) against the extra geometry hands leave in the depth for roomd.
+const DEPTH_HAND_REMOVAL: bool = true;
+
 // XR_ENVIRONMENT_DEPTH_NOT_AVAILABLE_META = 1000291000
 const ENVIRONMENT_DEPTH_NOT_AVAILABLE_META: i32 = 1000291000;
 
@@ -248,7 +252,7 @@ impl EnvironmentDepthMeta {
         alvr_common::error!("[XR_DIAG] Depth init step 2: provider created OK (handle={provider})");
 
         // Hands in front of the headset would otherwise show up as room geometry
-        if supports_hand_removal {
+        if supports_hand_removal && DEPTH_HAND_REMOVAL {
             match get_instance_proc::<_, SetEnvironmentDepthHandRemovalMETA>(
                 &session,
                 "xrSetEnvironmentDepthHandRemovalMETA",
@@ -266,6 +270,8 @@ impl EnvironmentDepthMeta {
                     "[XR_DIAG] Failed to load xrSetEnvironmentDepthHandRemovalMETA: {e:?}"
                 ),
             }
+        } else if supports_hand_removal {
+            alvr_common::info!("[XR_DIAG] Depth hand removal disabled at build time");
         } else {
             alvr_common::info!("[XR_DIAG] Depth hand removal not supported");
         }
