@@ -9,6 +9,8 @@ Thread safety: every public method takes an internal lock, so integrate() may ru
 depth thread while snapshot_outputs() / queries run elsewhere.
 """
 
+import dataclasses
+import json
 import math
 import threading
 import time
@@ -123,6 +125,44 @@ class TsdfFusion:
             self._floor_cache = None
             self._hm_dirty = False
             self._head = None
+
+    def save_state(self, path):
+        """Write the volume and counters to a compressed .npz (offline analysis, semantics
+        experiments). Publishing state (chunk revisions) is not saved."""
+        with self._lock:
+            if self._origin is None:
+                raise ValueError("nothing to save: no frame integrated yet")
+            np.savez_compressed(
+                path, tsdf=self._tsdf.numpy(), weight=self._weight.numpy(), last_seen=self._last_seen.numpy(),
+                odometer=self._odo.numpy(), origin=self._origin, chunk_lo=self._chunk_lo,
+                chunk_dims=self._chunk_dims, counters=np.array([self._frame, self._fake, self._map_revision]),
+                head=np.asarray(self._head if self._head is not None else [np.nan] * 3, dtype=np.float64),
+                config=json.dumps(dataclasses.asdict(self.config)))
+
+    @classmethod
+    def load_state(cls, path, device=None):
+        """Inverse of save_state(); queries and snapshot_outputs() work on the result."""
+        with np.load(path) as z:
+            cfg = json.loads(str(z["config"]))
+            if cfg.get("center_xz") is not None:
+                cfg["center_xz"] = tuple(cfg["center_xz"])
+            if device is not None:
+                cfg["device"] = device
+            fusion = cls(FusionConfig(**cfg))
+            d = fusion._device
+            fusion._origin = z["origin"]
+            fusion._chunk_lo = z["chunk_lo"]
+            fusion._chunk_dims = z["chunk_dims"]
+            fusion._dims = tuple(int(n) for n in z["tsdf"].shape)
+            fusion._tsdf = wp.array(z["tsdf"], dtype=float, device=d)
+            fusion._weight = wp.array(z["weight"], dtype=float, device=d)
+            fusion._last_seen = wp.array(z["last_seen"], dtype=wp.int32, device=d)
+            fusion._odo = wp.array(z["odometer"], dtype=float, device=d)
+            fusion._frame, fusion._fake, fusion._map_revision = (int(c) for c in z["counters"])
+            head = z["head"]
+            fusion._head = None if np.isnan(head).any() else head
+            fusion._hm_dirty = True
+        return fusion
 
     # ------------------------------------------------------------- integration
 

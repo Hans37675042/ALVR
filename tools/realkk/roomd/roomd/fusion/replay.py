@@ -131,6 +131,8 @@ def main(argv=None):
     ap.add_argument("--until", type=float, default=0.0, metavar="S",
                     help="stop at this many seconds after the first tap record (host receive time)")
     ap.add_argument("--voxel", type=float, default=None, help="voxel size in metres")
+    ap.add_argument("--save-state", type=Path, default=None, metavar="FILE.npz",
+                    help="also save the fused volume (TsdfFusion.load_state reads it back)")
     ap.add_argument("--flip-rows", action="store_true", help="depth rows are bottom-up")
     ap.add_argument("--make-synthetic", type=Path, default=None, metavar="FILE",
                     help="write a synthetic tap to FILE (and replay it when no TAP is given)")
@@ -202,6 +204,8 @@ def main(argv=None):
                                    "obstacle": int(np.count_nonzero(f & FLAG_OBSTACLE)),
                                    "walkable": int(np.count_nonzero(f & FLAG_WALKABLE))}
     (out / "stats.json").write_text(json.dumps(stats, indent=2))
+    if args.save_state:
+        fusion.save_state(args.save_state)
     print(json.dumps({k: stats[k] for k in ("frames", "fakeFrames", "integrateMsP50", "integrateMsP95",
                                             "meshVertices", "meshTriangles", "floor")}, indent=2))
     print("written to", out)
