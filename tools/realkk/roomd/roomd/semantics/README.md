@@ -101,20 +101,28 @@ Meta anchor already converted to Unity stage space.
 
 All thresholds live in `SemanticsParams` (`params.py`) for on-device tuning.
 
-## Real tap (2026-10-09-room2.rktap, 129 s, office chair moved ~1 m at t≈74 s, PM sits)
+## Real tap (2026-10-09-room2.rktap, 129 s)
 
-Replayed through RoomService + SemanticsSink + TsdfFusionSink (feat/roomd-fusion defaults).
+Room (PM): ~10 m², loft bed over the desks (underside ~1.55 m), ceiling beam, 2 desks with a
+basket drawer unit between them, wardrobe, glass cabinet, suitcase, floor fan, one office
+chair. PM sat on the chair under the desk at the start, moved it ~1.3 m at t≈74 s and sat
+on it at t≈95–102 s. Replayed through RoomService + SemanticsSink + TsdfFusionSink.
 
-| setting | chair ids | id kept across move | OccupiedByUser | false chairs |
-|---|---|---|---|---|
-| shipped defaults (+ cap cut 1.85) | 2 | no (Removed, new id) | yes | 0 |
-| suggested (below) | 1 | yes | yes (t≈95–102 s) | 0 |
+| | chair ids | id kept across move | OccupiedByUser | false chairs | Table ids |
+|---|---|---|---|---|---|
+| defaults | 2 | yes, plus a duplicate id at the new spot | yes | 1 (short-lived) | 3 |
+| + `structure_min_h` 1.5, `gate_surface_dh` 0.10 | 1 | yes (Missing t=86, Present t=92) | yes (t=95–102) | 0 | 2 |
 
-Suggested on-device values: `structure_min_h` 1.5, `back_min_cover` 0.45 (the top of an
-office chair backrest is narrower than seat + armrests), `flat_min_ratio` 0.35 (cushion +
-armrests), `gate_surface_dh` 0.10 (seat height read 0.375–0.46 m from different views),
-`move_yaw` 25 (yaw of a real chair jitters ±20°). Many `Other` fragments (walls under the
-cut, clutter) remain; tables were not verified against ground truth.
+With both values: one desk-zone Table at (2.26, −1.00), 2.06 × 0.56 m (both desks and the
+basket unit merge), and one low not-sittable Table at (−1.05, 0.60) (likely the suitcase).
+These two values are not defaults yet: they break existing tests (1.9 m wardrobe as Other,
+sink cap derivation, 0.42/0.52 m chair swap).
+
+Real-data rules (each from a failure on this tap): heightmap segmentation (points too
+sparse), overhang refill + free-space probe (desk under the loft), refilled cells are never a
+backrest and seats seen mostly under an overhang are not seats, backrest ≤ 0.8 × seat,
+seat side ≥ 0.30 m and depth ≤ 1.1 m, table ≥ 0.30 m² with side ≥ 0.40 m, a user sitting
+ends Moving. Geometry-only `Other` objects are not published by the sink.
 
 ## Known limits
 
@@ -125,7 +133,10 @@ cut, clutter) remain; tables were not verified against ground truth.
   similar height (bed + nightstand) can merge.
 - Yaw-only boxes; no ICP refinement (R15 mentions ICP): pose comes from the
   min-area rectangle of the 2 cm raster (~1 cm / ~3° jitter).
-- A chair whose seat is fully under a table is not detected until pulled out.
+- A chair whose seat is fully under a table is not detected until pulled out; while the
+  user sits on it the fusion body mask hides it too, so the chair the PM sat on at the
+  start of the tap is first seen at t≈60 s (OccupiedByUser cannot fire before that).
+- Seats seen only under an overhang (loft desk zone) are never offered.
 - Seat states have no hysteresis; a single noisy frame can flip Blocked.
 - Beds are not sittable by default (`bed_sittable`); SeatGenerator would put the
   seat in the middle of the mattress.
