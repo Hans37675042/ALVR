@@ -128,6 +128,7 @@ pub struct StreamContext {
     system: xr::SystemId,
     last_depth_capture: Instant,
     depth_readback: Option<DepthReadback>,
+    depth_skipped_frames: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -337,6 +338,7 @@ impl StreamContext {
             system,
             last_depth_capture: Instant::now(),
             depth_readback,
+            depth_skipped_frames: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -789,12 +791,13 @@ impl StreamContext {
 
         let swapchain_idx = depth_image.swapchain_index as usize;
         let pixel_count = (width * height) as usize;
+        let mut readback_failure = None::<String>;
         let depth_bytes = if swapchain_idx < depth_provider.swapchain_images.len()
             && let Some(ref mut readback) = self.depth_readback
         {
             let texture_id = depth_provider.swapchain_images[swapchain_idx];
             if texture_id == 0 {
-                vec![0x80u8; pixel_count * 2 * 2]
+                None
             } else {
                 self.gfx_ctx.make_current();
                 let gl = &self.gfx_ctx.gl_context;
@@ -890,11 +893,21 @@ impl StreamContext {
                         );
                         let read_err = gl.get_error();
 
-                        let _ = (read_status, attach_err, blit_err, copy_err, read_err);
+                        let errors = [attach_err, blit_err, copy_err, read_err];
+                        if read_status != glow::FRAMEBUFFER_COMPLETE
+                            || errors.iter().any(|&e| e != glow::NO_ERROR)
+                        {
+                            readback_failure.get_or_insert(format!(
+                                "eye {eye}: fbo status {read_status:#x}, GL errors attach/blit/\
+                                 copy/read {attach_err:#x}/{blit_err:#x}/{copy_err:#x}/\
+                                 {read_err:#x}"
+                            ));
+                        }
                     }
 
                     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                     readback.frame_count += 1;
+
 
                     // Flip rows: glReadPixels returns bottom-up, send top-down
                     let row_bytes = width as usize * 2;
@@ -910,12 +923,30 @@ impl StreamContext {
                         }
                     }
 
-                    depth_bytes
+                    // A failed GL step leaves zeros or stale data in the buffer
+                    readback_failure.is_none().then_some(depth_bytes)
                 }
             }
         } else {
-            // Fallback: dummy data
-            vec![0x80u8; pixel_count * 2 * 2]
+            // No readback pipeline
+            None
+        };
+
+        // Without a readback there is no depth: skip the frame instead of sending a constant
+        // 0x8080 image that viewers would take for real depth.
+        let Some(depth_bytes) = depth_bytes else {
+            self.depth_skipped_frames += 1;
+            if self.depth_skipped_frames <= 3 || self.depth_skipped_frames % 100 == 0 {
+                alvr_common::warn!(
+                    "[XR_DATA] depth readback unavailable, frame skipped ({} so far){}",
+                    self.depth_skipped_frames,
+                    readback_failure
+                        .map(|f| format!(": {f}"))
+                        .unwrap_or_default()
+                );
+            }
+            self.last_depth_capture = Instant::now();
+            return;
         };
 
         // Each depth view has its own pose (stage space) and FOV; the depth cameras are not

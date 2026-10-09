@@ -12,6 +12,7 @@ use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
     AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult, ConnectionError, ConnectionState,
     LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, con_bail, dbg_connection, debug, error,
+    Pose,
     glam::{UVec2, Vec2},
     info,
     parking_lot::{Condvar, Mutex, RwLock},
@@ -23,6 +24,7 @@ use alvr_packets::{
     AUDIO, CAMERA, CameraFrameHeader, ClientConnectionResult, ClientConnectionsAction,
     ClientControlPacket, ClientStatistics, DEPTH, DepthFrameHeader, HAPTICS,
     NegotiatedStreamingConfig, NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS,
+    SceneChunkAssembler,
     ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
@@ -1046,6 +1048,8 @@ fn connection_pipeline(
 
     *ctx.tracking_manager.write() =
         TrackingManager::new(initial_settings.connection.statistics_history_size);
+    // Keep the relay's recentering in sync with the fresh TrackingManager
+    ctx.xr_data_relay.set_recenter_pose(Pose::IDENTITY);
     let hand_gesture_manager = Arc::new(Mutex::new(HandGestureManager::new()));
 
     let tracking_receive_thread = thread::spawn({
@@ -1186,7 +1190,17 @@ fn connection_pipeline(
 
     let control_sender = Arc::new(Mutex::new(control_sender));
 
-    // Wire up relay stream control callback to forward to client
+    // Wire up relay stream control and room request callbacks to forward to client
+    {
+        let control_sender = Arc::clone(&control_sender);
+        ctx.xr_data_relay
+            .set_scene_request_callback(Box::new(move |recapture| {
+                control_sender
+                    .lock()
+                    .send(&ServerControlPacket::SceneRequest { recapture })
+                    .ok();
+            }));
+    }
     {
         let control_sender = Arc::clone(&control_sender);
         ctx.xr_data_relay.set_control_callback(Box::new(
@@ -1279,6 +1293,7 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             let mut disconnection_deadline = Instant::now() + KEEPALIVE_TIMEOUT;
+            let mut scene_assembler = SceneChunkAssembler::default();
             while is_streaming(&client_hostname) {
                 let packet = match control_receiver.recv(STREAMING_RECV_TIMEOUT) {
                     Ok(packet) => packet,
@@ -1299,12 +1314,20 @@ fn connection_pipeline(
                 match packet {
                     ClientControlPacket::PlayspaceSync(packet) => {
                         if !initial_settings.headset.tracking_ref_only {
-                            let session_manager_lock = SESSION_MANAGER.read();
-                            let config = &session_manager_lock.settings().headset;
-                            ctx.tracking_manager.write().recenter(
-                                config.position_recentering_mode,
-                                config.rotation_recentering_mode,
-                            );
+                            let (position_mode, rotation_mode) = {
+                                let session_manager_lock = SESSION_MANAGER.read();
+                                let config = &session_manager_lock.settings().headset;
+                                (
+                                    config.position_recentering_mode,
+                                    config.rotation_recentering_mode,
+                                )
+                            };
+                            let recenter_transform = {
+                                let mut tracking_manager = ctx.tracking_manager.write();
+                                tracking_manager.recenter(position_mode, rotation_mode);
+                                tracking_manager.recenter_transform()
+                            };
+                            ctx.xr_data_relay.set_recenter_pose(recenter_transform);
 
                             let area = packet.unwrap_or(Vec2::new(2.0, 2.0));
                             let wh = area.x * area.y;
@@ -1412,6 +1435,23 @@ fn connection_pipeline(
                         ctx.events_sender
                             .send(ServerCoreEvent::ProximityState(headset_is_worn))
                             .ok();
+                    }
+                    ClientControlPacket::SceneSnapshotChunk(chunk) => {
+                        match scene_assembler.push(chunk) {
+                            Ok(Some(snapshot)) => {
+                                let mesh_triangles: usize =
+                                    snapshot.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                                let (rooms, anchors) =
+                                    (snapshot.rooms.len(), snapshot.anchors.len());
+                                let id = ctx.xr_data_relay.set_scene_snapshot(snapshot);
+                                info!(
+                                    "XR Data: scene snapshot #{id}: {rooms} rooms, \
+                                     {anchors} anchors, {mesh_triangles} mesh triangles"
+                                );
+                            }
+                            Ok(None) => (),
+                            Err(e) => warn!("XR Data: dropped scene snapshot: {e}"),
+                        }
                     }
                     ClientControlPacket::Reserved(_) | ClientControlPacket::ReservedBuffer(_) => (),
                 }

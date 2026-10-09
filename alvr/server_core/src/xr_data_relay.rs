@@ -1,14 +1,19 @@
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    net::TcpStream,
-    sync::{Arc, Mutex},
+    net::{Shutdown, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alvr_common::{info, warn};
-use alvr_packets::{CameraFrameHeader, DepthFrameHeader};
+use alvr_common::{Pose, info, warn};
+use alvr_packets::{CameraFrameHeader, DepthFrameHeader, SceneSnapshot, scene_uuid_string};
+use serde_json::json;
 
 pub const DEFAULT_VIEWER_PORT: u16 = 9944;
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -16,7 +21,10 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // intrinsics) is no longer sent; viewers must parse MSG_DEPTH_FRAME_V2.
 const MSG_CAMERA_FRAME: u32 = 2;
 const MSG_DEPTH_FRAME_V2: u32 = 3;
+pub const MSG_ROOM_SNAPSHOT: u32 = 4;
+pub const MSG_PLAYSPACE_CHANGED: u32 = 5;
 const MSG_STREAM_CONTROL: u32 = 100;
+pub const MSG_ROOM_REQUEST: u32 = 101;
 
 #[derive(Clone, Debug)]
 pub struct XrStreamFlags {
@@ -34,35 +42,160 @@ impl Default for XrStreamFlags {
 }
 
 pub type StreamControlCallback = Box<dyn Fn(bool, bool) + Send + Sync>;
+/// Called with the `recapture` flag of a MSG_ROOM_REQUEST.
+pub type SceneRequestCallback = Box<dyn Fn(bool) + Send + Sync>;
+
+/// The current viewer socket plus a generation counter, so that the reader thread of a replaced
+/// connection can never clear a newer one. Dropped sockets are shut down so the viewer (and the
+/// reader thread holding a cloned handle) see EOF right away.
+#[derive(Default)]
+struct ConnectionSlot {
+    inner: Mutex<(u64, Option<TcpStream>)>,
+}
+
+impl ConnectionSlot {
+    fn replace(&self, stream: TcpStream) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner.1.take() {
+            old.shutdown(Shutdown::Both).ok();
+        }
+        inner.0 += 1;
+        inner.1 = Some(stream);
+
+        inner.0
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.0 == generation && inner.1.is_some()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.inner.lock().unwrap().1.is_some()
+    }
+
+    /// Clears the connection only if it is still `generation`.
+    fn clear_if(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.0 != generation || inner.1.is_none() {
+            return false;
+        }
+        if let Some(stream) = inner.1.take() {
+            stream.shutdown(Shutdown::Both).ok();
+        }
+
+        true
+    }
+
+    // A partial write leaves the stream unusable: close it for both sides
+    fn shutdown_locked(inner: &mut (u64, Option<TcpStream>)) {
+        if let Some(stream) = inner.1.take() {
+            stream.shutdown(Shutdown::Both).ok();
+        }
+    }
+
+    #[cfg(test)]
+    fn drop_connection(&self) {
+        Self::shutdown_locked(&mut self.inner.lock().unwrap());
+    }
+
+    fn broadcast(&self, msg_type: u32, payload: &[u8]) {
+        let mut inner = self.inner.lock().unwrap();
+
+        if let Some(stream) = inner.1.as_mut() {
+            let mut header = [0u8; 8];
+            header[0..4].copy_from_slice(&msg_type.to_le_bytes());
+            header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+
+            if stream.write_all(&header).is_err() || stream.write_all(payload).is_err() {
+                warn!("XR Data Relay: viewer disconnected, will reconnect");
+                Self::shutdown_locked(&mut inner);
+            }
+        }
+    }
+}
+
+enum SceneCommand {
+    Snapshot(u32, SceneSnapshot),
+    Recenter(Pose),
+    Resend,
+}
+
+/// Owns the latest scene (client space) and does all scene sends on its own thread, so callers
+/// (control receive thread, recenter, reader thread) never block on viewer writes.
+fn scene_thread(connection: Arc<ConnectionSlot>, commands: mpsc::Receiver<SceneCommand>) {
+    let mut snapshot = None::<(u32, SceneSnapshot)>;
+    let mut recenter_pose = Pose::IDENTITY;
+
+    let send_snapshot = |snapshot: &Option<(u32, SceneSnapshot)>, recenter_pose: Pose| {
+        if let Some((id, snapshot)) = snapshot {
+            let payload = encode_room_snapshot(*id, recenter_pose, snapshot);
+            connection.broadcast(MSG_ROOM_SNAPSHOT, &payload);
+        }
+    };
+
+    while let Ok(command) = commands.recv() {
+        match command {
+            SceneCommand::Snapshot(id, new_snapshot) => {
+                snapshot = Some((id, new_snapshot));
+                send_snapshot(&snapshot, recenter_pose);
+            }
+            SceneCommand::Recenter(pose) => {
+                recenter_pose = pose;
+                connection.broadcast(MSG_PLAYSPACE_CHANGED, &encode_playspace_changed(pose));
+                send_snapshot(&snapshot, recenter_pose);
+            }
+            SceneCommand::Resend => send_snapshot(&snapshot, recenter_pose),
+        }
+    }
+}
+
+struct Shared {
+    connection: Arc<ConnectionSlot>,
+    stream_flags: Mutex<XrStreamFlags>,
+    control_callback: Mutex<Option<StreamControlCallback>>,
+    scene_request_callback: Mutex<Option<SceneRequestCallback>>,
+    scene_commands: Mutex<mpsc::Sender<SceneCommand>>,
+}
+
+impl Shared {
+    fn scene_command(&self, command: SceneCommand) {
+        self.scene_commands.lock().unwrap().send(command).ok();
+    }
+}
 
 pub struct XrDataRelay {
-    connection: Arc<Mutex<Option<TcpStream>>>,
-    stream_flags: Arc<Mutex<XrStreamFlags>>,
+    shared: Arc<Shared>,
+    next_snapshot_id: AtomicU32,
     _connector_thread: thread::JoinHandle<()>,
-    control_callback: Arc<Mutex<Option<StreamControlCallback>>>,
+    _scene_thread: thread::JoinHandle<()>,
 }
 
 impl XrDataRelay {
     pub fn new(port: u16) -> Self {
         let viewer_addr = format!("127.0.0.1:{port}");
-        let connection: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-        let stream_flags: Arc<Mutex<XrStreamFlags>> = Arc::new(Mutex::new(XrStreamFlags::default()));
-        let control_callback: Arc<Mutex<Option<StreamControlCallback>>> = Arc::new(Mutex::new(None));
+        let connection = Arc::new(ConnectionSlot::default());
+        let (scene_sender, scene_receiver) = mpsc::channel();
+        let scene_thread = thread::spawn({
+            let connection = Arc::clone(&connection);
+            move || scene_thread(connection, scene_receiver)
+        });
+        let shared = Arc::new(Shared {
+            connection,
+            stream_flags: Mutex::new(XrStreamFlags::default()),
+            control_callback: Mutex::new(None),
+            scene_request_callback: Mutex::new(None),
+            scene_commands: Mutex::new(scene_sender),
+        });
 
         let connector_thread = {
-            let connection = Arc::clone(&connection);
-            let stream_flags = Arc::clone(&stream_flags);
-            let control_callback = Arc::clone(&control_callback);
+            let shared = Arc::clone(&shared);
             thread::spawn(move || {
                 loop {
                     // Only try to connect if we don't already have a connection
-                    {
-                        let conn = connection.lock().unwrap();
-                        if conn.is_some() {
-                            drop(conn);
-                            thread::sleep(RETRY_INTERVAL);
-                            continue;
-                        }
+                    if shared.connection.is_connected() {
+                        thread::sleep(RETRY_INTERVAL);
+                        continue;
                     }
 
                     match TcpStream::connect(&viewer_addr) {
@@ -71,17 +204,18 @@ impl XrDataRelay {
                             stream.set_nodelay(true).ok();
                             stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
 
-                            // Spawn reader thread for incoming commands from viewer
                             if let Ok(reader_stream) = stream.try_clone() {
-                                let flags = Arc::clone(&stream_flags);
-                                let cb = Arc::clone(&control_callback);
-                                let conn_ref = Arc::clone(&connection);
-                                thread::spawn(move || {
-                                    read_viewer_commands(reader_stream, flags, cb, conn_ref);
-                                });
-                            }
+                                let generation = shared.connection.replace(stream);
 
-                            *connection.lock().unwrap() = Some(stream);
+                                // Reader thread for incoming commands from the viewer
+                                thread::spawn({
+                                    let shared = Arc::clone(&shared);
+                                    move || read_viewer_commands(reader_stream, generation, &shared)
+                                });
+
+                                // A new viewer has no room model yet
+                                shared.scene_command(SceneCommand::Resend);
+                            }
                         }
                         Err(_) => {
                             // Viewer not running yet, retry silently
@@ -94,60 +228,57 @@ impl XrDataRelay {
         };
 
         Self {
-            connection,
-            stream_flags,
+            shared,
+            next_snapshot_id: AtomicU32::new(1),
             _connector_thread: connector_thread,
-            control_callback,
+            _scene_thread: scene_thread,
         }
     }
 
     pub fn set_control_callback(&self, cb: StreamControlCallback) {
-        *self.control_callback.lock().unwrap() = Some(cb);
+        *self.shared.control_callback.lock().unwrap() = Some(cb);
     }
 
-    #[allow(dead_code)]
-    pub fn stream_flags(&self) -> Arc<Mutex<XrStreamFlags>> {
-        Arc::clone(&self.stream_flags)
+    pub fn set_scene_request_callback(&self, cb: SceneRequestCallback) {
+        *self.shared.scene_request_callback.lock().unwrap() = Some(cb);
     }
 
     pub fn send_depth_frame(&self, header: &DepthFrameHeader, timing: &DepthTiming, data: &[u8]) {
-        if !self.stream_flags.lock().unwrap().depth_enabled {
+        if !self.shared.stream_flags.lock().unwrap().depth_enabled {
             return;
         }
         let payload = encode_depth_frame(header, timing, data);
-        self.broadcast(MSG_DEPTH_FRAME_V2, &payload);
+        self.shared.connection.broadcast(MSG_DEPTH_FRAME_V2, &payload);
     }
 
     pub fn send_camera_frame(&self, header: &CameraFrameHeader, data: &[u8]) {
-        if !self.stream_flags.lock().unwrap().camera_enabled {
+        if !self.shared.stream_flags.lock().unwrap().camera_enabled {
             return;
         }
         let payload = encode_camera_frame(header, data);
-        self.broadcast(MSG_CAMERA_FRAME, &payload);
+        self.shared.connection.broadcast(MSG_CAMERA_FRAME, &payload);
     }
 
-    fn broadcast(&self, msg_type: u32, payload: &[u8]) {
-        let mut conn = self.connection.lock().unwrap();
+    /// Cache a scene snapshot (client space) and send it to the viewer, recentered. Scene
+    /// messages are not gated by the stream flags. Returns the assigned snapshot id; sending
+    /// happens asynchronously on the relay's scene thread.
+    pub fn set_scene_snapshot(&self, snapshot: SceneSnapshot) -> u32 {
+        let id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .scene_command(SceneCommand::Snapshot(id, snapshot));
 
-        if let Some(stream) = conn.as_mut() {
-            let mut header = [0u8; 8];
-            header[0..4].copy_from_slice(&msg_type.to_le_bytes());
-            header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        id
+    }
 
-            if stream.write_all(&header).is_err() || stream.write_all(payload).is_err() {
-                warn!("XR Data Relay: viewer disconnected, will reconnect");
-                *conn = None;
-            }
-        }
+    /// Mirror of `TrackingManager::recenter_transform`. Sends MSG_PLAYSPACE_CHANGED and re-sends
+    /// the cached snapshot in the new space (asynchronously).
+    pub fn set_recenter_pose(&self, recenter_pose: Pose) {
+        self.shared
+            .scene_command(SceneCommand::Recenter(recenter_pose));
     }
 }
 
-fn read_viewer_commands(
-    mut stream: TcpStream,
-    flags: Arc<Mutex<XrStreamFlags>>,
-    control_callback: Arc<Mutex<Option<StreamControlCallback>>>,
-    connection: Arc<Mutex<Option<TcpStream>>>,
-) {
+fn read_viewer_commands(mut stream: TcpStream, generation: u64, shared: &Shared) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     loop {
@@ -156,16 +287,15 @@ fn read_viewer_commands(
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Check if the write side is still connected
-                let conn = connection.lock().unwrap();
-                if conn.is_none() {
+                // Stop once this connection was dropped or replaced
+                if !shared.connection.is_current(generation) {
                     return;
                 }
                 continue;
             }
             Err(_) => {
                 info!("XR Data Relay: viewer reader disconnected");
-                *connection.lock().unwrap() = None;
+                shared.connection.clear_if(generation);
                 return;
             }
         }
@@ -176,7 +306,7 @@ fn read_viewer_commands(
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             if stream.read_exact(&mut payload).is_err() {
-                *connection.lock().unwrap() = None;
+                shared.connection.clear_if(generation);
                 return;
             }
         }
@@ -185,7 +315,7 @@ fn read_viewer_commands(
             let stream_id = payload[0];
             let enabled = payload[1] != 0;
 
-            let mut f = flags.lock().unwrap();
+            let mut f = shared.stream_flags.lock().unwrap();
             match stream_id {
                 0 => f.depth_enabled = enabled,
                 1 => f.camera_enabled = enabled,
@@ -199,11 +329,160 @@ fn read_viewer_commands(
                 snapshot.depth_enabled, snapshot.camera_enabled
             );
 
-            if let Some(cb) = control_callback.lock().unwrap().as_ref() {
+            if let Some(cb) = shared.control_callback.lock().unwrap().as_ref() {
                 cb(snapshot.depth_enabled, snapshot.camera_enabled);
+            }
+        } else if msg_type == MSG_ROOM_REQUEST {
+            let Some(recapture) = parse_room_request(&payload) else {
+                warn!("XR Data Relay: empty MSG_ROOM_REQUEST ignored");
+                continue;
+            };
+            info!("XR Data Relay: room request from viewer (recapture={recapture})");
+
+            // Answer right away from the cache; the client query refreshes it afterwards
+            shared.scene_command(SceneCommand::Resend);
+            if let Some(cb) = shared.scene_request_callback.lock().unwrap().as_ref() {
+                cb(recapture);
             }
         }
     }
+}
+
+/// MSG_ROOM_REQUEST payload: `u8 recapture`.
+pub fn parse_room_request(payload: &[u8]) -> Option<bool> {
+    payload.first().map(|&b| b != 0)
+}
+
+/// Bring every anchor and mesh pose of a client-space snapshot into the recentered space.
+/// Bounds and mesh vertices are anchor-local and stay unchanged.
+pub fn recenter_scene(snapshot: &SceneSnapshot, recenter_pose: Pose) -> SceneSnapshot {
+    let mut out = snapshot.clone();
+    for anchor in &mut out.anchors {
+        anchor.pose = anchor.pose.map(|pose| recenter_pose * pose);
+    }
+    for mesh in &mut out.meshes {
+        mesh.pose = recenter_pose * mesh.pose;
+    }
+
+    out
+}
+
+fn pose_position_first(pose: &Pose) -> [f32; 7] {
+    [
+        pose.position.x,
+        pose.position.y,
+        pose.position.z,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    ]
+}
+
+fn put_pose_position_first(buf: &mut Vec<u8>, pose: &Pose) {
+    for v in pose_position_first(pose) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Scene JSON of MSG_ROOM_SNAPSHOT (see CONTRACT-roomd.md). Poses are written as given,
+/// `[px, py, pz, qx, qy, qz, qw]`; UUIDs use `scene_uuid_string`.
+pub fn scene_snapshot_json(snapshot: &SceneSnapshot) -> String {
+    let rooms = snapshot
+        .rooms
+        .iter()
+        .map(|room| {
+            json!({
+                "uuid": scene_uuid_string(&room.uuid),
+                "floor": room.floor.as_ref().map(scene_uuid_string),
+                "ceiling": room.ceiling.as_ref().map(scene_uuid_string),
+                "walls": room.walls.iter().map(scene_uuid_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let anchors = snapshot
+        .anchors
+        .iter()
+        .map(|anchor| {
+            json!({
+                "uuid": scene_uuid_string(&anchor.uuid),
+                "labels": anchor.labels,
+                "pose": anchor.pose.as_ref().map(pose_position_first),
+                "bbox2d": anchor.bbox2d,
+                "boundary2d": anchor.boundary2d,
+                "bbox3d": anchor.bbox3d,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({ "rooms": rooms, "anchors": anchors }).to_string()
+}
+
+/// Size of the fixed MSG_ROOM_SNAPSHOT header; `json_len` follows at this offset.
+pub const ROOM_SNAPSHOT_HEADER_SIZE: u32 = 40;
+const ROOM_SNAPSHOT_VERSION: u32 = 1;
+const PLAYSPACE_CHANGED_VERSION: u32 = 1;
+
+/// MSG_ROOM_SNAPSHOT payload (all little-endian). `snapshot` is in client space; the
+/// recentering is applied here.
+///
+/// | offset | type      | field                                                        |
+/// |--------|-----------|--------------------------------------------------------------|
+/// | 0      | u32       | header_size (40)                                             |
+/// | 4      | u32       | version (1)                                                  |
+/// | 8      | u32       | snapshot_id                                                  |
+/// | 12     | f32 x 7   | recenter_pose px py pz qx qy qz qw                           |
+/// | 40     | u32       | json_len                                                     |
+/// | 44     | u8[]      | UTF-8 JSON (`scene_snapshot_json`, recentered poses)         |
+/// |        | u32       | mesh_count                                                   |
+/// |        | per mesh  | u8[16] anchor_uuid, f32 x 7 pose (px..qw, recentered),       |
+/// |        |           | u32 vcount, u32 icount, f32 x 3 [vcount], u32 [icount]       |
+pub fn encode_room_snapshot(snapshot_id: u32, recenter_pose: Pose, snapshot: &SceneSnapshot) -> Vec<u8> {
+    let recentered = recenter_scene(snapshot, recenter_pose);
+    let json = scene_snapshot_json(&recentered);
+    let mesh_bytes: usize = recentered
+        .meshes
+        .iter()
+        .map(|m| 52 + m.vertices.len() * 12 + m.indices.len() * 4)
+        .sum();
+
+    let mut buf =
+        Vec::with_capacity(ROOM_SNAPSHOT_HEADER_SIZE as usize + 8 + json.len() + mesh_bytes);
+    buf.extend_from_slice(&ROOM_SNAPSHOT_HEADER_SIZE.to_le_bytes());
+    buf.extend_from_slice(&ROOM_SNAPSHOT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&snapshot_id.to_le_bytes());
+    put_pose_position_first(&mut buf, &recenter_pose);
+    debug_assert_eq!(buf.len(), ROOM_SNAPSHOT_HEADER_SIZE as usize);
+
+    buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    buf.extend_from_slice(json.as_bytes());
+
+    buf.extend_from_slice(&(recentered.meshes.len() as u32).to_le_bytes());
+    for mesh in &recentered.meshes {
+        buf.extend_from_slice(&mesh.anchor_uuid);
+        put_pose_position_first(&mut buf, &mesh.pose);
+        buf.extend_from_slice(&(mesh.vertices.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(mesh.indices.len() as u32).to_le_bytes());
+        for vertex in &mesh.vertices {
+            for v in vertex {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for index in &mesh.indices {
+            buf.extend_from_slice(&index.to_le_bytes());
+        }
+    }
+
+    buf
+}
+
+/// MSG_PLAYSPACE_CHANGED payload: `u32 version, f32 x 7 recenter_pose (px..qw)`.
+pub fn encode_playspace_changed(recenter_pose: Pose) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&PLAYSPACE_CHANGED_VERSION.to_le_bytes());
+    put_pose_position_first(&mut buf, &recenter_pose);
+
+    buf
 }
 
 /// Current server wall-clock time as nanoseconds since the Unix epoch.
@@ -411,7 +690,10 @@ fn encode_camera_frame(header: &CameraFrameHeader, data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use alvr_common::{Pose, glam::{Quat, Vec3}};
-    use alvr_packets::DepthFrameFormat;
+    use alvr_packets::{
+        DepthFrameFormat, SceneAnchor, SceneMesh, SceneRoom, SceneSnapshot, SceneUuid,
+        scene_uuid_string,
+    };
 
     fn f32_at(buf: &[u8], offset: usize) -> f32 {
         f32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
@@ -516,6 +798,307 @@ mod tests {
         est.report(t0, 5, 0); // stale sample with a very low offset
         let offset = est.report(t0 + Duration::from_secs(11), 1_000, 0);
         assert_eq!(offset, 1_000);
+    }
+
+    fn uuid(n: u8) -> SceneUuid {
+        let mut u = [0u8; 16];
+        u[0] = n;
+        u[15] = 0xab;
+        u
+    }
+
+    fn sample_scene() -> SceneSnapshot {
+        SceneSnapshot {
+            rooms: vec![SceneRoom {
+                uuid: uuid(1),
+                floor: Some(uuid(2)),
+                ceiling: None,
+                walls: vec![uuid(3), uuid(4)],
+            }],
+            anchors: vec![
+                SceneAnchor {
+                    uuid: uuid(5),
+                    labels: "TABLE".into(),
+                    pose: Some(Pose {
+                        orientation: Quat::from_rotation_y(0.5),
+                        position: Vec3::new(1.0, 0.7, -2.0),
+                    }),
+                    bbox2d: Some([-0.5, -0.25, 1.0, 0.5]),
+                    boundary2d: Some(vec![[-0.5, -0.25], [0.5, -0.25], [0.5, 0.25]]),
+                    bbox3d: Some([-0.5, -0.25, -0.7, 1.0, 0.5, 0.7]),
+                },
+                SceneAnchor {
+                    uuid: uuid(6),
+                    labels: "GLOBAL_MESH".into(),
+                    pose: None,
+                    bbox2d: None,
+                    boundary2d: None,
+                    bbox3d: None,
+                },
+            ],
+            meshes: vec![SceneMesh {
+                anchor_uuid: uuid(6),
+                pose: Pose {
+                    orientation: Quat::IDENTITY,
+                    position: Vec3::new(0.0, 0.0, 0.5),
+                },
+                vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                indices: vec![0, 1, 2],
+            }],
+        }
+    }
+
+    fn sample_recenter() -> Pose {
+        Pose {
+            orientation: Quat::from_rotation_y(1.0),
+            position: Vec3::new(0.3, 0.0, -0.4),
+        }
+    }
+
+    fn pose_at(buf: &[u8], offset: usize) -> [f32; 7] {
+        std::array::from_fn(|i| f32_at(buf, offset + 4 * i))
+    }
+
+    fn pose_array(pose: Pose) -> [f32; 7] {
+        [
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ]
+    }
+
+    fn assert_pose_close(a: [f32; 7], b: [f32; 7]) {
+        for i in 0..7 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "{a:?} != {b:?}");
+        }
+    }
+
+    #[test]
+    fn recentered_scene_moves_anchor_and_mesh_poses_only() {
+        let scene = sample_scene();
+        let recenter = sample_recenter();
+        let out = recenter_scene(&scene, recenter);
+
+        let expected = recenter * scene.anchors[0].pose.unwrap();
+        assert_pose_close(pose_array(out.anchors[0].pose.unwrap()), pose_array(expected));
+        assert!(out.anchors[1].pose.is_none());
+        assert_pose_close(
+            pose_array(out.meshes[0].pose),
+            pose_array(recenter * scene.meshes[0].pose),
+        );
+
+        // Bounds and mesh vertices are anchor-local and must not change
+        assert_eq!(out.anchors[0].bbox3d, scene.anchors[0].bbox3d);
+        assert_eq!(out.anchors[0].boundary2d, scene.anchors[0].boundary2d);
+        assert_eq!(out.meshes[0].vertices, scene.meshes[0].vertices);
+        assert_eq!(out.rooms[0].walls, scene.rooms[0].walls);
+    }
+
+    #[test]
+    fn scene_json_matches_contract() {
+        let scene = sample_scene();
+        let json: serde_json::Value =
+            serde_json::from_str(&scene_snapshot_json(&scene)).unwrap();
+
+        let room = &json["rooms"][0];
+        assert_eq!(room["uuid"], scene_uuid_string(&uuid(1)));
+        assert_eq!(room["floor"], scene_uuid_string(&uuid(2)));
+        assert!(room["ceiling"].is_null());
+        assert_eq!(room["walls"].as_array().unwrap().len(), 2);
+        assert_eq!(room["walls"][1], scene_uuid_string(&uuid(4)));
+
+        let table = &json["anchors"][0];
+        assert_eq!(table["uuid"], "05000000-0000-0000-0000-0000000000ab");
+        assert_eq!(table["labels"], "TABLE");
+        let pose = table["pose"].as_array().unwrap();
+        assert_eq!(pose.len(), 7);
+        // [px, py, pz, qx, qy, qz, qw]
+        assert!((pose[0].as_f64().unwrap() - 1.0).abs() < 1e-6);
+        assert!((pose[2].as_f64().unwrap() + 2.0).abs() < 1e-6);
+        assert!((pose[6].as_f64().unwrap() - 0.25f64.cos()).abs() < 1e-6);
+        assert_eq!(table["bbox2d"].as_array().unwrap().len(), 4);
+        assert_eq!(table["boundary2d"].as_array().unwrap().len(), 3);
+        assert_eq!(table["boundary2d"][1].as_array().unwrap().len(), 2);
+        assert_eq!(table["bbox3d"].as_array().unwrap().len(), 6);
+
+        let mesh_anchor = &json["anchors"][1];
+        assert_eq!(mesh_anchor["labels"], "GLOBAL_MESH");
+        for key in ["pose", "bbox2d", "boundary2d", "bbox3d"] {
+            assert!(mesh_anchor[key].is_null(), "{key}");
+        }
+    }
+
+    #[test]
+    fn room_snapshot_layout_matches_contract() {
+        let scene = sample_scene();
+        let recenter = sample_recenter();
+        let buf = encode_room_snapshot(7, recenter, &scene);
+
+        assert_eq!(u32_at(&buf, 0), ROOM_SNAPSHOT_HEADER_SIZE);
+        assert_eq!(ROOM_SNAPSHOT_HEADER_SIZE, 40);
+        assert_eq!(u32_at(&buf, 4), 1); // version
+        assert_eq!(u32_at(&buf, 8), 7); // snapshot_id
+        assert_pose_close(pose_at(&buf, 12), pose_array(recenter));
+
+        let json_len = u32_at(&buf, 40) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&buf[44..44 + json_len]).unwrap();
+        // Poses in the JSON are already recentered
+        let table_pose: Vec<f32> = json["anchors"][0]["pose"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        assert_pose_close(
+            table_pose.try_into().unwrap(),
+            pose_array(recenter * scene.anchors[0].pose.unwrap()),
+        );
+
+        let mut off = 44 + json_len;
+        assert_eq!(u32_at(&buf, off), 1); // mesh_count
+        off += 4;
+        assert_eq!(&buf[off..off + 16], &uuid(6));
+        off += 16;
+        assert_pose_close(pose_at(&buf, off), pose_array(recenter * scene.meshes[0].pose));
+        off += 28;
+        assert_eq!(u32_at(&buf, off), 3); // vcount
+        assert_eq!(u32_at(&buf, off + 4), 3); // icount
+        off += 8;
+        assert_eq!(f32_at(&buf, off + 12), 1.0); // vertex 1 x
+        assert_eq!(f32_at(&buf, off + 28), 1.0); // vertex 2 y
+        off += 36;
+        assert_eq!(u32_at(&buf, off + 8), 2); // index 2
+        off += 12;
+        assert_eq!(buf.len(), off);
+    }
+
+    #[test]
+    fn empty_room_snapshot_has_empty_lists_and_no_meshes() {
+        let buf = encode_room_snapshot(1, Pose::IDENTITY, &SceneSnapshot::default());
+        let json_len = u32_at(&buf, 40) as usize;
+        let json: serde_json::Value = serde_json::from_slice(&buf[44..44 + json_len]).unwrap();
+        assert_eq!(json["rooms"].as_array().unwrap().len(), 0);
+        assert_eq!(json["anchors"].as_array().unwrap().len(), 0);
+        assert_eq!(u32_at(&buf, 44 + json_len), 0);
+        assert_eq!(buf.len(), 48 + json_len);
+    }
+
+    #[test]
+    fn playspace_changed_layout_matches_contract() {
+        let recenter = sample_recenter();
+        let buf = encode_playspace_changed(recenter);
+        assert_eq!(buf.len(), 32);
+        assert_eq!(u32_at(&buf, 0), 1); // version
+        assert_pose_close(pose_at(&buf, 4), pose_array(recenter));
+    }
+
+    #[test]
+    fn room_request_payload_parses_recapture_flag() {
+        assert_eq!(parse_room_request(&[0]), Some(false));
+        assert_eq!(parse_room_request(&[1]), Some(true));
+        assert_eq!(parse_room_request(&[]), None);
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn stale_reader_cannot_clear_newer_connection() {
+        let slot = ConnectionSlot::default();
+        let (old, mut old_peer) = tcp_pair();
+        let old_gen = slot.replace(old);
+        let (new, _new_peer) = tcp_pair();
+        let new_gen = slot.replace(new);
+
+        assert!(!slot.clear_if(old_gen));
+        assert!(slot.is_current(new_gen));
+        assert!(slot.clear_if(new_gen));
+        assert!(!slot.is_current(new_gen));
+
+        // The replaced socket was shut down, so its viewer sees EOF
+        old_peer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(old_peer.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_write_shuts_the_socket_down() {
+        let slot = ConnectionSlot::default();
+        let (stream, mut peer) = tcp_pair();
+        let generation = slot.replace(stream);
+        slot.drop_connection();
+        assert!(!slot.is_current(generation));
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+    }
+
+    fn read_msg(stream: &mut TcpStream) -> (u32, Vec<u8>) {
+        let mut header = [0u8; 8];
+        stream.read_exact(&mut header).unwrap();
+        let len = u32_at(&header, 4) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).unwrap();
+        (u32_at(&header, 0), payload)
+    }
+
+    #[test]
+    fn relay_resends_scene_on_connect_and_recenter_and_forwards_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let relay = XrDataRelay::new(port);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        relay.set_scene_request_callback(Box::new({
+            let requests = Arc::clone(&requests);
+            move |recapture| requests.lock().unwrap().push(recapture)
+        }));
+        // The snapshot may arrive before or while the viewer connects; it must be delivered
+        relay.set_scene_snapshot(sample_scene());
+
+        let (mut viewer, _) = listener.accept().unwrap();
+        viewer
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (ty, payload) = read_msg(&mut viewer);
+        assert_eq!(ty, MSG_ROOM_SNAPSHOT);
+        let first_id = u32_at(&payload, 8);
+        assert_pose_close(pose_at(&payload, 12), pose_array(Pose::IDENTITY));
+
+        relay.set_recenter_pose(sample_recenter());
+        // Skip a possible duplicate of the first snapshot (sent by both connect and set)
+        let mut msg = read_msg(&mut viewer);
+        while msg.0 == MSG_ROOM_SNAPSHOT && pose_at(&msg.1, 12) == pose_array(Pose::IDENTITY) {
+            msg = read_msg(&mut viewer);
+        }
+        assert_eq!(msg.0, MSG_PLAYSPACE_CHANGED);
+        assert_pose_close(pose_at(&msg.1, 4), pose_array(sample_recenter()));
+        let (ty, payload) = read_msg(&mut viewer);
+        assert_eq!(ty, MSG_ROOM_SNAPSHOT);
+        assert_eq!(u32_at(&payload, 8), first_id);
+        assert_pose_close(pose_at(&payload, 12), pose_array(sample_recenter()));
+
+        // Viewer asks for a Space Setup recapture
+        let mut request = Vec::new();
+        request.extend_from_slice(&MSG_ROOM_REQUEST.to_le_bytes());
+        request.extend_from_slice(&1u32.to_le_bytes());
+        request.push(1);
+        viewer.write_all(&request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while requests.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*requests.lock().unwrap(), vec![true]);
     }
 
     #[test]
