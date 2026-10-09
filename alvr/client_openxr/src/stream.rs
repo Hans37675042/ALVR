@@ -4,7 +4,9 @@ use crate::{
 };
 use alvr_client_core::{
     ClientCoreContext,
-    depth_pipeline::{SlotEvent, SlotRing, StageSet, copy_flipped_rows},
+    depth_pipeline::{
+        SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows, send_link,
+    },
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
@@ -405,6 +407,8 @@ pub struct StreamContext {
     system: xr::SystemId,
     last_depth_capture: Instant,
     depth_readback: Option<DepthReadback>,
+    // Compression and sending run on a worker; the render thread only hands frames over
+    depth_link: Option<SendLink<DepthFrameMeta>>,
     depth_skipped_frames: u64,
     depth_perf: StageSet,
     depth_perf_captures: u64,
@@ -575,6 +579,28 @@ impl StreamContext {
             None
         };
 
+        // Exits when `depth_link` is dropped with the StreamContext
+        let depth_link = depth_wants_init.then(|| {
+            let (link, worker) = send_link::<DepthFrameMeta>(1);
+            let core_context = Arc::clone(&core_ctx);
+            let xr_instance = xr_session.instance().clone();
+            thread::spawn(move || {
+                let mut perf = StageSet::default();
+                let mut sent = 0u64;
+                worker.run(|depth_bytes, meta| {
+                    send_depth_frame(&core_context, &xr_instance, &mut perf, &meta, depth_bytes);
+                    sent += 1;
+                    if sent % DEPTH_PERF_REPORT_INTERVAL == 0 {
+                        alvr_common::info!(
+                            "[XR_PERF] depth worker {sent} frames: {}",
+                            perf.format_and_reset()
+                        );
+                    }
+                });
+            });
+            link
+        });
+
         let mut this = StreamContext {
             use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
@@ -598,6 +624,7 @@ impl StreamContext {
             system,
             last_depth_capture: Instant::now(),
             depth_readback,
+            depth_link,
             depth_skipped_frames: 0,
             depth_perf: StageSet::default(),
             depth_perf_captures: 0,
@@ -1043,27 +1070,28 @@ impl StreamContext {
                     self.depth_perf.record("fence_frames", latency_frames as f32);
                     self.depth_perf
                         .record("fence_ms", elapsed_ms(meta.enqueued_at));
+                    let Some(link) = &mut self.depth_link else {
+                        continue;
+                    };
                     let map_start = Instant::now();
                     let mut depth_bytes =
-                        vec![0u8; meta.width as usize * meta.height as usize * 2 * 2];
+                        link.take_buffer(meta.width as usize * meta.height as usize * 2 * 2);
                     let result = unsafe { readback.read_slot(gl, slot, &meta, &mut depth_bytes) };
                     self.depth_perf.record("map_ms", elapsed_ms(map_start));
                     match result {
                         Ok(()) => {
-                            Self::send_depth_frame(
-                                &self.core_context,
-                                self.xr_session.instance(),
-                                &mut self.depth_perf,
-                                &meta,
-                                depth_bytes,
-                            );
+                            if let SubmitOutcome::Disconnected = link.submit(depth_bytes, meta) {
+                                alvr_common::warn!("[XR_DATA] depth send worker is gone");
+                            }
                             self.depth_perf_captures += 1;
                             if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
                                 alvr_common::info!(
-                                    "[XR_PERF] depth {} frames sent, {} skipped, {} ring full: {}",
+                                    "[XR_PERF] depth {} frames read back, {} skipped, {} ring full,                                      {} dropped at the worker, {} buffers: {}",
                                     self.depth_perf_captures,
                                     self.depth_skipped_frames,
                                     self.depth_ring_full,
+                                    link.dropped(),
+                                    link.allocations(),
                                     self.depth_perf.format_and_reset()
                                 );
                             }
@@ -1215,42 +1243,6 @@ impl StreamContext {
                 failure.map(|f| format!(": {f}")).unwrap_or_default()
             );
         }
-    }
-
-    fn send_depth_frame(
-        core_context: &ClientCoreContext,
-        xr_instance: &xr::Instance,
-        perf: &mut StageSet,
-        meta: &DepthFrameMeta,
-        depth_bytes: Vec<u8>,
-    ) {
-        // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
-        let lz4_start = Instant::now();
-        let compressed = lz4_flex::compress_prepend_size(&depth_bytes);
-        perf.record("lz4_ms", elapsed_ms(lz4_start));
-        let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
-
-        // Sampled after readback and compression, as close to the send as possible, so that the
-        // server-side offset estimate (receive time - send time) only contains network latency.
-        let client_send_time = crate::xr_runtime_now(xr_instance)
-            .map(crate::from_xr_time)
-            .unwrap_or_else(|| crate::from_xr_time(meta.display_time));
-
-        let header = DepthFrameHeader {
-            timestamp: crate::from_xr_time(meta.display_time),
-            client_send_time,
-            view_poses: meta.view_poses,
-            width: meta.width,
-            height: meta.height * 2,
-            near_z: meta.near_z,
-            far_z: meta.far_z,
-            format: send_format,
-            fov_angles: meta.fov_angles,
-        };
-
-        let send_start = Instant::now();
-        core_context.send_depth_frame(&header, &send_data);
-        perf.record("send_ms", elapsed_ms(send_start));
     }
 
     fn maybe_capture_camera(&mut self) {
@@ -1442,6 +1434,43 @@ impl Drop for StreamContext {
             unsafe { readback.destroy(&self.gfx_ctx.gl_context) };
         }
     }
+}
+
+/// Runs on the depth send worker: compresses one frame and sends it with its header.
+fn send_depth_frame(
+    core_context: &ClientCoreContext,
+    xr_instance: &xr::Instance,
+    perf: &mut StageSet,
+    meta: &DepthFrameMeta,
+    depth_bytes: &[u8],
+) {
+    // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
+    let lz4_start = Instant::now();
+    let compressed = lz4_flex::compress_prepend_size(depth_bytes);
+    perf.record("lz4_ms", elapsed_ms(lz4_start));
+    let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
+
+    // Sampled after readback and compression, as close to the send as possible, so that the
+    // server-side offset estimate (receive time - send time) only contains network latency.
+    let client_send_time = crate::xr_runtime_now(xr_instance)
+        .map(crate::from_xr_time)
+        .unwrap_or_else(|| crate::from_xr_time(meta.display_time));
+
+    let header = DepthFrameHeader {
+        timestamp: crate::from_xr_time(meta.display_time),
+        client_send_time,
+        view_poses: meta.view_poses,
+        width: meta.width,
+        height: meta.height * 2,
+        near_z: meta.near_z,
+        far_z: meta.far_z,
+        format: send_format,
+        fov_angles: meta.fov_angles,
+    };
+
+    let send_start = Instant::now();
+    core_context.send_depth_frame(&header, &send_data);
+    perf.record("send_ms", elapsed_ms(send_start));
 }
 
 fn stream_input_loop(

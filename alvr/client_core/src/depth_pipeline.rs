@@ -2,7 +2,10 @@
 //! readback slot ring, row flipping, send worker link). Nothing here touches GL or OpenXR, so it
 //! can be unit tested on the host; `alvr_client_openxr` drives it from the render thread.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+    time::{Duration, Instant},
+};
 
 /// Percentile summary of one stage's samples since the last report.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -232,6 +235,106 @@ impl<F, M> SlotRing<F, M> {
     }
 }
 
+pub enum SubmitOutcome {
+    Queued,
+    /// The worker is still busy with the previous frame; this one was dropped.
+    DroppedFull,
+    /// The worker is gone; this one was dropped.
+    Disconnected,
+}
+
+/// Render thread side of the depth send worker: hands frames over without blocking and reuses
+/// the buffers the worker returns, so steady state allocates nothing.
+pub struct SendLink<M> {
+    jobs: SyncSender<(Vec<u8>, M)>,
+    recycled: Receiver<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
+    allocations: u64,
+    dropped: u64,
+}
+
+/// Worker thread side: receives frames and returns each buffer once processed.
+pub struct SendWorker<M> {
+    jobs: Receiver<(Vec<u8>, M)>,
+    recycle: Sender<Vec<u8>>,
+}
+
+/// `capacity` frames may wait for the worker; more are dropped instead of queued.
+pub fn send_link<M>(capacity: usize) -> (SendLink<M>, SendWorker<M>) {
+    let (jobs_tx, jobs_rx) = mpsc::sync_channel(capacity);
+    let (recycle_tx, recycle_rx) = mpsc::channel();
+    (
+        SendLink {
+            jobs: jobs_tx,
+            recycled: recycle_rx,
+            spare: vec![],
+            allocations: 0,
+            dropped: 0,
+        },
+        SendWorker {
+            jobs: jobs_rx,
+            recycle: recycle_tx,
+        },
+    )
+}
+
+impl<M> SendLink<M> {
+    /// A buffer of `len` bytes, recycled when possible. Its content is unspecified.
+    pub fn take_buffer(&mut self, len: usize) -> Vec<u8> {
+        self.spare.extend(self.recycled.try_iter());
+        let mut buf = self.spare.pop().unwrap_or_else(|| {
+            self.allocations += 1;
+            Vec::with_capacity(len)
+        });
+        buf.resize(len, 0);
+        buf
+    }
+
+    pub fn submit(&mut self, buf: Vec<u8>, meta: M) -> SubmitOutcome {
+        match self.jobs.try_send((buf, meta)) {
+            Ok(()) => SubmitOutcome::Queued,
+            Err(TrySendError::Full((buf, _))) => {
+                self.dropped += 1;
+                self.spare.push(buf);
+                SubmitOutcome::DroppedFull
+            }
+            Err(TrySendError::Disconnected((buf, _))) => {
+                self.dropped += 1;
+                self.spare.push(buf);
+                SubmitOutcome::Disconnected
+            }
+        }
+    }
+
+    /// Buffers allocated so far (bounded by the frames in flight)
+    pub fn allocations(&self) -> u64 {
+        self.allocations
+    }
+
+    /// Frames dropped because the worker was busy or gone
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+impl<M> SendWorker<M> {
+    /// Waits for one frame and processes it. Returns false once the link was dropped.
+    pub fn run_one(&self, process: impl FnOnce(&[u8], M)) -> bool {
+        let Ok((buf, meta)) = self.jobs.recv() else {
+            return false;
+        };
+        process(&buf, meta);
+        // The link may already be gone; the buffer is then simply freed
+        self.recycle.send(buf).ok();
+        true
+    }
+
+    /// Processes frames until the link is dropped.
+    pub fn run(self, mut process: impl FnMut(&[u8], M)) {
+        while self.run_one(&mut process) {}
+    }
+}
+
 /// Copies `views` stacked images of `rows_per_view` rows each from `src` (bottom-up rows, as
 /// glReadPixels returns them, `src_row_stride` bytes apart) into `dst` with top-down rows of
 /// `row_bytes` bytes, flipping each view vertically.
@@ -298,7 +401,6 @@ mod tests {
         assert_eq!(set.format_and_reset(), "map_ms p50 2.00 p95 2.00 max 2.00 (n=1)");
     }
 
-    use std::time::{Duration, Instant};
 
     /// Runs the pacer against a fixed display clock; returns the capture times (seconds).
     fn simulate_pacer(
