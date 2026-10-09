@@ -791,6 +791,7 @@ impl StreamContext {
 
         let swapchain_idx = depth_image.swapchain_index as usize;
         let pixel_count = (width * height) as usize;
+        let mut readback_failure = None::<String>;
         let depth_bytes = if swapchain_idx < depth_provider.swapchain_images.len()
             && let Some(ref mut readback) = self.depth_readback
         {
@@ -892,11 +893,21 @@ impl StreamContext {
                         );
                         let read_err = gl.get_error();
 
-                        let _ = (read_status, attach_err, blit_err, copy_err, read_err);
+                        let errors = [attach_err, blit_err, copy_err, read_err];
+                        if read_status != glow::FRAMEBUFFER_COMPLETE
+                            || errors.iter().any(|&e| e != glow::NO_ERROR)
+                        {
+                            readback_failure.get_or_insert(format!(
+                                "eye {eye}: fbo status {read_status:#x}, GL errors attach/blit/\
+                                 copy/read {attach_err:#x}/{blit_err:#x}/{copy_err:#x}/\
+                                 {read_err:#x}"
+                            ));
+                        }
                     }
 
                     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                     readback.frame_count += 1;
+
 
                     // Flip rows: glReadPixels returns bottom-up, send top-down
                     let row_bytes = width as usize * 2;
@@ -912,7 +923,8 @@ impl StreamContext {
                         }
                     }
 
-                    Some(depth_bytes)
+                    // A failed GL step leaves zeros or stale data in the buffer
+                    readback_failure.is_none().then_some(depth_bytes)
                 }
             }
         } else {
@@ -926,8 +938,11 @@ impl StreamContext {
             self.depth_skipped_frames += 1;
             if self.depth_skipped_frames <= 3 || self.depth_skipped_frames % 100 == 0 {
                 alvr_common::warn!(
-                    "[XR_DATA] depth readback unavailable, frame skipped ({} so far)",
-                    self.depth_skipped_frames
+                    "[XR_DATA] depth readback unavailable, frame skipped ({} so far){}",
+                    self.depth_skipped_frames,
+                    readback_failure
+                        .map(|f| format!(": {f}"))
+                        .unwrap_or_default()
                 );
             }
             self.last_depth_capture = Instant::now();
