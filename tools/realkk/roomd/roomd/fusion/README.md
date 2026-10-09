@@ -24,6 +24,23 @@ uv run --no-project --with warp-lang==1.18.0 --with numpy --with lz4 --with pyte
   y 從 `floor_y − floor_margin` 到 `floor_y + height_above_floor`，各軸向外取整到 chunk。
   預設 8×4×8 個 1 m chunk，2 cm 體素，3200 萬體素，約 0.4 GB VRAM。
 
+## 接到 roomd（FusionSink）
+
+```powershell
+uv run python -m roomd --fusion roomd.fusion:create_sink
+```
+
+`roomd/fusion/sink.py` 的 `TsdfFusionSink` 實作 roomd-io 的 `roomd.sink.FusionSink`：
+
+| 方法 | 行為 |
+|---|---|
+| `integrate(protocol.DepthFrame)` | 用 `frame.header`＋`frame.d16()` 解碼後整合（同步，單幀約 3–4 ms） |
+| `snapshot_outputs()` | `map_revision`、`floor_y`／`floor_rms`（地板擬合）、`nav_heightmap`（最新一份，f16）、有新圖才 `nav_revision += 1`、`mesh_chunks`（這次要送的）；`objects`／`seats`／`walls` 回 None，由語意層負責 |
+| `set_scene_prior(ScenePrior)` | 體積還沒建立時用 `floor_y` 當地板；有 GLOBAL_MESH 就以先驗權重寫入 |
+| `on_playspace_changed(pose)` | pose 和上次不同（>1 mm 或 >0.1°）就清掉體積：已送過的 chunk 下次以 `vcount=0`、更高 revision 送出移除，高度圖改送全未知並遞增 `nav_revision` |
+
+`tests/fusion/roomd_io_stubs.py` 在 roomd-io 模組不存在時補上同欄位的替身；模組存在時用真的。
+
 ## 對外 API
 
 ```python
