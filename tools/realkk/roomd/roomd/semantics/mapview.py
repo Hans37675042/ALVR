@@ -34,7 +34,7 @@ class MapView(Protocol):
         """(floor y, plane-fit rms) in metres."""
 
     def heightmap(self) -> HeightMap:
-        """Current height map (a plain 6-tuple in the same order is accepted)."""
+        """Current height map or None (a 6-tuple or same-named attributes are accepted)."""
 
     def surface_points(self, min_y: float, max_y: float,
                        region: Optional[Obb] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -51,8 +51,15 @@ class MapView(Protocol):
         """Fraction of the box volume that is observed at all (free + occupied)."""
 
 
-def as_heightmap(hm) -> HeightMap:
-    return hm if isinstance(hm, HeightMap) else HeightMap(*hm)
+def as_heightmap(hm) -> Optional[HeightMap]:
+    """HeightMap from a HeightMap, a 6-tuple, or any object with the same attributes
+    (e.g. roomd.fusion Heightmap); None stays None (no map yet)."""
+    if hm is None or isinstance(hm, HeightMap):
+        return hm
+    if hasattr(hm, "top_y"):
+        return HeightMap(hm.cell, hm.origin_x, hm.origin_z, np.asarray(hm.floor_y),
+                         np.asarray(hm.top_y), np.asarray(hm.flags))
+    return HeightMap(*hm)
 
 
 def heightmap_cells(hm: HeightMap, obb: Obb):

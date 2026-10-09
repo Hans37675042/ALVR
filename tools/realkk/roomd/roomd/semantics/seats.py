@@ -75,7 +75,7 @@ def seat_areas(cx, cz, yaw, size, p: SemanticsParams) -> List[Obb]:
     return out
 
 
-def seat_occupancy(areas: Sequence[Obb], seat_h: float, hm: HeightMap,
+def seat_occupancy(areas: Sequence[Obb], seat_h: float, hm: Optional[HeightMap],
                    user_head: Optional[Sequence[float]], floor_y: float,
                    p: SemanticsParams) -> List[str]:
     """Available / Blocked (something > blocked_rise above the seat over enough of its
@@ -88,6 +88,9 @@ def seat_occupancy(areas: Sequence[Obb], seat_h: float, hm: HeightMap,
                     and math.hypot(hx - a.cx, hz - a.cz) <= p.head_seat_radius):
                 states.append(SeatState.OCCUPIED_BY_USER)
                 continue
+        if hm is None:
+            states.append(SeatState.AVAILABLE)
+            continue
         rel, known = heightmap_cells(hm, a)
         if known.sum() == 0:
             states.append(SeatState.AVAILABLE)
