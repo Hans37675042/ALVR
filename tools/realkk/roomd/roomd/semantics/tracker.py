@@ -132,9 +132,13 @@ class RoomSemantics:
         self._publish_floor_walls(det)
         hm = as_heightmap(view.heightmap())
 
-        # seat states first: a seat occupied by the user freezes its object's pose
+        # seat states first: a seat occupied by the user freezes its object's pose, and an
+        # object someone sits on is not moving (the body only distorts its geometry)
         for tr in self.tracks.values():
             self._update_seats(tr, hm, user_head, floor_y)
+            if tr.seat_frozen() and tr.state == ObjectState.MOVING:
+                tr.pending.clear()
+                self._bump(tr, ObjectState.PRESENT, t)
 
         cands = list(det.candidates)
         matched_tracks = set()
