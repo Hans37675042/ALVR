@@ -38,12 +38,21 @@ def scene_labels_from_objects(objects):
     return out
 
 
+CAP_MARGIN = 0.05  # m below the fusion heightmap cap that counts as "at the cap"
+
+
 class SemanticsSink(FusionSink):
     name = "semantics"
 
     def __init__(self, inner, params: Optional[SemanticsParams] = None, clock=time.time,
                  obb_cls=None, publish_scene_objects: bool = True):
         self.inner = inner
+        if params is None:
+            params = SemanticsParams()
+            cap = getattr(getattr(inner.fusion, "config", None), "obstacle_max_height", None)
+            if cap is not None:
+                # the heightmap stops at the cap: walls and tall cabinets both read as cap
+                params.structure_min_h = float(cap) - CAP_MARGIN
         self.params = params
         self.clock = clock
         self.publish_scene_objects = publish_scene_objects
