@@ -36,6 +36,7 @@ ROOM_MODEL = 1
 NAV_HEIGHTMAP = 2
 MESH_CHUNK = 3
 STATUS = 4
+SCENE_MESH = 5  # Quest GLOBAL_MESH, in parts
 PLUGIN_HELLO = 101  # plugin -> roomd
 
 NAV_FLAG_KNOWN = 1
@@ -372,3 +373,59 @@ def decode_mesh_chunk(payload):
     v = np.frombuffer(payload, "<f4", vc * 3, off).reshape(vc, 3)
     i = np.frombuffer(payload, "<u4", ic, off + vc * 12)
     return MeshChunk(ix, iy, iz, rev, size, v, i)
+
+
+# --- SCENE_MESH (type 5) ---
+
+SCENE_MESH_MAX_TRIANGLES = 10000  # per part: <= 30000 vertices, ~15000 unique edges
+SCENE_MESH_CELL = 1.0  # metres; triangles are grouped by centroid cell before splitting
+_SCENE_HEAD = struct.Struct("<7I")
+
+
+@dataclass
+class SceneMeshPart:
+    """One part of the Quest GLOBAL_MESH (Unity stage, Unity winding). A mesh revision is
+    complete once all part_count parts of it arrived; part_count = 0 means no scene mesh."""
+
+    revision: int  # roomd counter, bumped whenever the published mesh changes
+    snapshot_id: int  # MSG_ROOM_SNAPSHOT the mesh came from
+    part: int
+    part_count: int
+    vertices: np.ndarray  # (n, 3) float32, only the vertices this part uses
+    indices: np.ndarray  # (3m,) uint32 into vertices
+
+
+def encode_scene_mesh_part(p):
+    v = np.ascontiguousarray(p.vertices, "<f4").reshape(-1, 3)
+    i = np.ascontiguousarray(p.indices, "<u4").reshape(-1)
+    return (_SCENE_HEAD.pack(1, p.revision, p.snapshot_id, p.part, p.part_count, len(v), len(i))
+            + v.tobytes() + i.tobytes())
+
+
+def decode_scene_mesh_part(payload):
+    _, rev, sid, part, count, vc, ic = _SCENE_HEAD.unpack_from(payload, 0)
+    off = _SCENE_HEAD.size
+    v = np.frombuffer(payload, "<f4", vc * 3, off).reshape(vc, 3)
+    i = np.frombuffer(payload, "<u4", ic, off + vc * 12)
+    return SceneMeshPart(rev, sid, part, count, v, i)
+
+
+def split_scene_mesh(vertices, triangles, revision, snapshot_id, max_triangles=SCENE_MESH_MAX_TRIANGLES,
+                     cell=SCENE_MESH_CELL):
+    """SCENE_MESH parts of a triangle mesh ((N,3) vertices, (M,3) triangles): triangles are
+    sorted by the (x, z, y) cell of their centroid so each part is spatially compact, then cut
+    into runs of at most max_triangles, each re-indexed to the vertices it uses. No mesh (or
+    no triangles) gives a single clear part (part_count 0)."""
+    if vertices is None or triangles is None or len(triangles) == 0:
+        return [SceneMeshPart(revision, snapshot_id, 0, 0, np.zeros((0, 3), np.float32), np.zeros(0, np.uint32))]
+    v = np.asarray(vertices, np.float32).reshape(-1, 3)
+    t = np.asarray(triangles, np.uint32).reshape(-1, 3)
+    cells = np.floor(v[t].mean(axis=1) / cell).astype(np.int64)
+    t = t[np.lexsort((cells[:, 1], cells[:, 2], cells[:, 0]))]
+    runs = [t[k:k + max_triangles] for k in range(0, len(t), max_triangles)]
+    parts = []
+    for n, run in enumerate(runs):
+        used, inverse = np.unique(run.reshape(-1), return_inverse=True)
+        parts.append(SceneMeshPart(revision, snapshot_id, n, len(runs), v[used],
+                                   inverse.astype(np.uint32)))
+    return parts

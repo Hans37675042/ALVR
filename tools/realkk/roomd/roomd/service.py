@@ -6,9 +6,11 @@ and publishes on the 9945 server:
 - ROOM_MODEL when its content changes, plus a 1 Hz heartbeat (only once something produced
   a room: a snapshot or fused geometry);
 - STATUS at 1 Hz;
-- NAV_HEIGHTMAP / MESH_CHUNK whenever the sink's outputs (polled at 1 Hz) carry new ones.
+- NAV_HEIGHTMAP / MESH_CHUNK whenever the sink's outputs (polled at 1 Hz) carry new ones;
+- SCENE_MESH (the snapshot's GLOBAL_MESH in parts) when a snapshot brings a different mesh.
 """
 
+import hashlib
 import json
 import time
 from collections import deque
@@ -76,6 +78,9 @@ class RoomService:
         self._last_heartbeat = None
         self._nav_revision = 0
         self._unknown_types = set()
+        self.scene_mesh_revision = 0
+        self._scene_mesh_key = None
+        self._scene_mesh_parts = 0
 
     # --- input ---
 
@@ -90,7 +95,9 @@ class RoomService:
             self.scene_model = room
             self.stats.last_snapshot_id = snap.snapshot_id
             self.stats.snapshots += 1
-            self.sink.set_scene_prior(scene.prior_from_snapshot(snap, room))
+            prior = scene.prior_from_snapshot(snap, room)
+            self.sink.set_scene_prior(prior)
+            self.publish_scene_mesh(snap.snapshot_id, prior.mesh_vertices, prior.mesh_triangles)
             self.log("roomd: scene snapshot #%d: %d objects, %d seats, %d walls"
                      % (snap.snapshot_id, len(room.Objects), len(room.Seats), len(room.Walls)))
             self.update_model()
@@ -138,6 +145,29 @@ class RoomService:
             else:
                 self.plugin.publish(P.MESH_CHUNK, P.encode_mesh_chunk(chunk), remember=key)
         self.update_model()
+
+    def publish_scene_mesh(self, snapshot_id, vertices, triangles):
+        """SCENE_MESH parts of the GLOBAL_MESH (Unity stage); skipped when the mesh equals the
+        one already published (ALVR re-sends the snapshot on recenter and viewer connect).
+        The parts replace the previous revision's in the plugin server's replay state."""
+        h = hashlib.sha1()
+        if vertices is not None and triangles is not None:
+            h.update(np.ascontiguousarray(vertices, np.float32).tobytes())
+            h.update(np.ascontiguousarray(triangles, np.uint32).tobytes())
+        key = h.hexdigest()
+        if key == self._scene_mesh_key:
+            return
+        self._scene_mesh_key = key
+        self.scene_mesh_revision += 1
+        parts = P.split_scene_mesh(vertices, triangles, self.scene_mesh_revision, snapshot_id)
+        for n in range(self._scene_mesh_parts):
+            self.plugin.forget(("scene_mesh", n))
+        self._scene_mesh_parts = len(parts)
+        for part in parts:
+            self.plugin.publish(P.SCENE_MESH, P.encode_scene_mesh_part(part), remember=("scene_mesh", part.part))
+        tris = sum(len(p.indices) // 3 for p in parts)
+        self.log("roomd: scene mesh r%d: %d triangles in %d part(s)"
+                 % (self.scene_mesh_revision, tris, parts[0].part_count))
 
     def compose(self):
         """Scene API model + fused objects; None while nothing has produced a room yet."""

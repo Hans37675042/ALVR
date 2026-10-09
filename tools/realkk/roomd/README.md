@@ -7,7 +7,7 @@ ALVR server ──TCP 127.0.0.1:9944──> roomd ──TCP 127.0.0.1:9945──
   (client)        relay viewer       │        plugin server          (client, reconnects every 2 s)
                                      ├─ scene.py   MSG_ROOM_SNAPSHOT → RoomModel v2 (SceneApi)
                                      ├─ FusionSink depth frames → fused geometry (fusion / semantics slices)
-                                     └─ service.py ROOM_MODEL, STATUS, NAV_HEIGHTMAP, MESH_CHUNK
+                                     └─ service.py ROOM_MODEL, STATUS, NAV_HEIGHTMAP, MESH_CHUNK, SCENE_MESH
 ```
 
 The interface is defined by `realkk/docs/CONTRACT-roomd.md`; this package implements it.
@@ -52,7 +52,7 @@ uv run python ..\tap_inspect.py room.rktap
 | `io/relay.py` | 9944 viewer: accept ALVR, send STREAM_CONTROL (depth on, camera off) + ROOM_REQUEST(0), reader thread → `RelayInbox` (newest depth only, camera dropped, others queued), optional `.rktap` recording |
 | `io/plugin_server.py` | 9945 server: many clients, per-client writer thread and queue (a stalled client is dropped at 64 MB), latest state replayed to new clients, PLUGIN_HELLO logged |
 | `io/tapsource.py` | `--tap-in`: plays a tap into the same `RelayInbox` |
-| `service.py` | main loop: fake-frame drop, `integrate`, snapshot conversion, model revisioning, 1 Hz output poll / heartbeat |
+| `service.py` | main loop: fake-frame drop, `integrate`, snapshot conversion, SCENE_MESH publishing, model revisioning, 1 Hz output poll / heartbeat |
 | `synth/` | synthetic room (Unity frame), Scene snapshot builder, Open3D renderer, noise, scripted session → tap + ground truth |
 | `fusion/`, `semantics/` | owned by the fusion and semantics slices |
 
@@ -69,6 +69,7 @@ uv run python ..\tap_inspect.py room.rktap
 | 9945 2 NAV_HEIGHTMAP | `NavHeightmap` (grids `[iz, ix]`), forwarded when `FusionOutputs.nav_revision` changes |
 | 9945 3 MESH_CHUNK | `MeshChunk` (`vcount = 0` ⇒ removed), forwarded as the sink reports them |
 | 9945 4 STATUS | `RoomService.status()`, exactly the CONTRACT keys, 1 Hz |
+| 9945 5 SCENE_MESH | `SceneMeshPart`, `encode/decode_scene_mesh_part`, `split_scene_mesh`; `RoomService.publish_scene_mesh` on each snapshot (see below) |
 | 9945 101 PLUGIN_HELLO | `PluginServer.hellos` |
 | RoomModel v2 | `model.py`; reading v1 gives `Source=Manual, Confidence=1, Locked=true, State=Present`, seats `Available` |
 
@@ -84,6 +85,20 @@ uv run python ..\tap_inspect.py room.rktap
 - TABLE → Table; STORAGE / SCREEN / LAMP / PLANT / OTHER / unknown labels with a volume → Other;
   CEILING, DOOR_FRAME, WINDOW_FRAME, WALL_ART, GLOBAL_MESH → no object.
 - Ids `scene:<anchor uuid>`, `Source=SceneApi`, `Locked=false`, `Confidence=1`.
+
+## Quest scene mesh to the plugin (SCENE_MESH)
+
+The snapshot's GLOBAL_MESH (`scene.scene_mesh_unity`: Unity stage, winding reversed) is the fusion prior and is
+also sent to the plugin for the room debug view:
+
+- `split_scene_mesh` sorts triangles by the 1 m (x, z, y) cell of their centroid and cuts runs of at most
+  `SCENE_MESH_MAX_TRIANGLES` (10 000); each part carries only the vertices it uses. No mesh = one clear part
+  (`part_count = 0`).
+- `revision` is roomd's own counter; a snapshot whose mesh hashes the same as the last one (ALVR re-sends on
+  recenter and viewer connect) publishes nothing.
+- Parts are remembered per index (`("scene_mesh", i)`) and the previous revision's extra parts are forgotten, so a
+  plugin that connects later receives exactly the current revision.
+- Plugins without type 5 ignore it (unknown types are skipped).
 
 ## FusionSink (for the fusion and semantics slices)
 
