@@ -32,6 +32,7 @@ class SemanticsParams:
     seat_h: Tuple[float, float] = (0.35, 0.60)
     back_min_rise: float = 0.25        # m above seat
     back_min_cover: float = 0.6        # backrest length / seat width
+    seat_min_side: float = 0.30        # m, chair/couch footprint narrower than this is a ledge
     couch_min_len: float = 1.2
     table_h: Tuple[float, float] = (0.65, 0.80)
     bed_min_area: float = 1.5          # m^2
