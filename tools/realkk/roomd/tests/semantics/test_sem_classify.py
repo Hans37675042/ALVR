@@ -236,6 +236,7 @@ def test_seat_under_a_loft_bed_is_not_sittable():
     from roomd.semantics import Obb
     room = make_room()
     room.place("c", chair(0.0, -1.6, 0.0))
-    room.place("loft", [Obb(0.0, -1.7, 0.0, 2.0, 0.9, 1.55, 1.65)])
+    # loft over the seat only; the backrest (z < -1.775) sticks out behind it, as in the room
+    room.place("loft", [Obb(0.0, -1.32, 0.0, 2.0, 0.9, 1.55, 1.65)])
     cands = detect(room).candidates
     assert not any(c.sittable for c in cands), [(c.kind, round(c.surface_h, 2)) for c in cands]
