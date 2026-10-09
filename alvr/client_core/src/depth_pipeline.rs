@@ -524,4 +524,79 @@ mod tests {
         copy_flipped_rows(&src, stride, &mut dst, w * 2, h, 2);
         assert_eq!(dst, expected);
     }
+
+    #[test]
+    fn worker_receives_the_frame_and_returns_its_buffer_for_reuse() {
+        let (mut link, worker) = send_link::<u32>(1);
+        let mut buf = link.take_buffer(4);
+        buf.copy_from_slice(&[1, 2, 3, 4]);
+        assert!(matches!(link.submit(buf, 42), SubmitOutcome::Queued));
+
+        let mut seen = vec![];
+        assert!(worker.run_one(|bytes, meta| seen.push((bytes.to_vec(), meta))));
+        assert_eq!(seen, [(vec![1, 2, 3, 4], 42)]);
+
+        // The same allocation comes back for the next frame
+        let again = link.take_buffer(4);
+        assert_eq!(again.len(), 4);
+        assert_eq!(link.allocations(), 1);
+    }
+
+    #[test]
+    fn full_queue_drops_the_frame_and_keeps_its_buffer() {
+        let (mut link, _worker) = send_link::<u32>(1);
+        let first = link.take_buffer(8);
+        assert!(matches!(link.submit(first, 1), SubmitOutcome::Queued));
+        let second = link.take_buffer(8);
+        assert!(matches!(link.submit(second, 2), SubmitOutcome::DroppedFull));
+        assert_eq!(link.dropped(), 1);
+        let _third = link.take_buffer(8);
+        assert_eq!(link.allocations(), 2, "the dropped frame's buffer is reused");
+    }
+
+    #[test]
+    fn buffer_pool_stays_bounded_with_a_slow_worker() {
+        let (mut link, worker) = send_link::<u64>(1);
+        for i in 0..1000u64 {
+            let buf = link.take_buffer(409_600);
+            link.submit(buf, i);
+            if i % 3 == 0 {
+                worker.run_one(|_, _| ());
+            }
+        }
+        // One being filled, one queued, one returned by the worker
+        assert!(link.allocations() <= 3, "{} allocations", link.allocations());
+        assert!(link.dropped() > 0);
+    }
+
+    #[test]
+    fn take_buffer_resizes_recycled_buffers() {
+        let (mut link, worker) = send_link::<()>(1);
+        let buf = link.take_buffer(16);
+        link.submit(buf, ());
+        worker.run_one(|_, _| ());
+        assert_eq!(link.take_buffer(32).len(), 32);
+    }
+
+    #[test]
+    fn submit_reports_a_stopped_worker() {
+        let (mut link, worker) = send_link::<()>(1);
+        drop(worker);
+        let buf = link.take_buffer(4);
+        assert!(matches!(link.submit(buf, ()), SubmitOutcome::Disconnected));
+    }
+
+    #[test]
+    fn worker_exits_when_the_link_is_dropped() {
+        let (mut link, worker) = send_link::<u8>(1);
+        let handle = std::thread::spawn(move || {
+            let mut count = 0;
+            worker.run(|_, _| count += 1);
+            count
+        });
+        let buf = link.take_buffer(1);
+        link.submit(buf, 0);
+        drop(link);
+        assert_eq!(handle.join().unwrap(), 1);
+    }
 }
