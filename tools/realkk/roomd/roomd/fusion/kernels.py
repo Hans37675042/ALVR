@@ -84,7 +84,8 @@ def integrate_depth(tsdf: wp.array3d(dtype=float), weight: wp.array3d(dtype=floa
                     depth: wp.array3d(dtype=float), intr: wp.array(dtype=wp.vec4),
                     rot_wc: wp.array(dtype=wp.mat33), cam_pos: wp.array(dtype=wp.vec3),
                     n_views: int, origin: wp.vec3, voxel: float, cv: int, trunc: float,
-                    max_w: float, frame: int, odo_eps: float):
+                    max_w: float, frame: int, odo_eps: float, conflict_t: float,
+                    conflict_decay: float):
     i, cj, k = wp.tid()
     h = depth.shape[1]
     w = depth.shape[2]
@@ -108,6 +109,10 @@ def integrate_depth(tsdf: wp.array3d(dtype=float), weight: wp.array3d(dtype=floa
                         sdf = (d - uvz[2]) * wp.length(pc) / uvz[2]
                         if sdf >= -trunc:
                             obs = wp.min(1.0, sdf / trunc)
+                            # the scene changed: a confident value contradicted by the opposite
+                            # sign loses weight, so moved furniture appears / clears in a few frames
+                            if (t > conflict_t and obs < 0.0) or (t < -conflict_t and obs > 0.0):
+                                wt = wt * conflict_decay
                             t = (t * wt + obs) / (wt + 1.0)
                             wt = wp.min(wt + 1.0, max_w)
                             seen = 1

@@ -184,7 +184,8 @@ class TsdfFusion:
             wp.launch(K.integrate_depth, dim=(nx, ny // self._cv, nz), device=self._device,
                       inputs=[self._tsdf, self._weight, self._last_seen, self._odo, masked, intr, rot_wc,
                               pos, len(frame.views), wp.vec3(*self._origin), cfg.voxel_size, self._cv,
-                              cfg.trunc, cfg.max_weight, self._frame, cfg.odometer_eps])
+                              cfg.trunc, cfg.max_weight, self._frame, cfg.odometer_eps, cfg.conflict_threshold,
+                              cfg.conflict_decay])
             wp.synchronize_device(self._device)
             self._frame += 1
             self._hm_dirty = True

@@ -18,6 +18,8 @@ class FusionConfig:
     # integration
     trunc: float = 0.08
     max_weight: float = 16.0          # running average 1/(n+1) until the cap, then a fixed-rate EMA
+    conflict_threshold: float = 0.5  # |tsdf| above which an opposite-sign sample counts as a change
+    conflict_decay: float = 0.25       # weight multiplier on such a sample (1 = plain running average)
     prior_weight: float = 2.0         # weight of a scene global-mesh prior (S7)
     min_depth: float = 0.5
     max_depth: float = 4.5
