@@ -254,3 +254,18 @@ def test_state_round_trip(scanned, tmp_path):
     np.testing.assert_array_equal(loaded.heightmap().flags, fusion.heightmap().flags)
     assert loaded.floor_plane().y == pytest.approx(fusion.floor_plane().y)
     assert loaded.stats()["frames"] == fusion.stats()["frames"]
+
+
+def test_surface_points_and_floor_are_deterministic(scanned):
+    # points are appended with a GPU atomic counter, so their order (and the floor fit's
+    # summation order) changed from call to call; test_state_round_trip failed on that
+    fusion, _ = scanned
+    runs = []
+    for _ in range(5):
+        p, n = fusion.surface_points(-0.15, 0.6)
+        fusion._floor_cache = None
+        runs.append((p, n, fusion.floor_plane().y))
+    for p, n, y in runs[1:]:
+        np.testing.assert_array_equal(p, runs[0][0])
+        np.testing.assert_array_equal(n, runs[0][1])
+        assert y == runs[0][2]
