@@ -300,6 +300,8 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 ServerCoreEvent::ProximityState(headset_is_worn) => unsafe {
                     SetProximityState(headset_is_worn)
                 },
+                ServerCoreEvent::DepthFrame { .. }
+                | ServerCoreEvent::CameraFrame { .. } => {}
             }
         }
 

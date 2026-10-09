@@ -778,6 +778,64 @@ If you want to reduce the amount of pixelation on the edges, increase the center
 
     #[schema(strings(help = "Snapdragon Game Super Resolution client-side upscaling"))]
     pub upscaling: Switch<UpscalingConfig>,
+
+    #[schema(strings(
+        display_name = "XR Data Streaming",
+        help = "Stream depth and camera data from headset to PC"
+    ))]
+    pub xr_data: Switch<XrDataConfig>,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[schema(collapsible)]
+pub struct XrDataConfig {
+    #[schema(strings(
+        display_name = "Environment Depth",
+        help = "Stream depth maps from the headset (Quest 3). Resolution is determined by the headset hardware and cannot be changed."
+    ))]
+    pub enable_depth: bool,
+
+    #[schema(strings(
+        display_name = "Camera Frames",
+        help = "Stream raw camera frames from the headset (requires developer mode). The closest resolution supported by the hardware will be used. Check ALVR logs for available resolutions."
+    ))]
+    pub enable_camera: bool,
+
+    #[schema(strings(display_name = "Depth FPS"))]
+    #[schema(gui(slider(min = 1.0, max = 30.0, step = 1.0)), suffix = " fps")]
+    pub depth_fps: f32,
+
+    #[schema(strings(display_name = "Camera FPS"))]
+    #[schema(gui(slider(min = 1.0, max = 30.0, step = 1.0)), suffix = " fps")]
+    pub camera_fps: f32,
+
+    #[schema(strings(
+        display_name = "Camera Width",
+        help = "Preferred width per camera eye in pixels. The closest resolution supported by the hardware will be used. Check ALVR logs for available resolutions."
+    ))]
+    #[schema(gui(slider(min = 320, max = 1920, step = 32)))]
+    pub camera_width: u32,
+
+    #[schema(strings(
+        display_name = "Camera Height",
+        help = "Preferred height per camera eye in pixels. The closest resolution supported by the hardware will be used. Check ALVR logs for available resolutions."
+    ))]
+    #[schema(gui(slider(min = 240, max = 1080, step = 32)))]
+    pub camera_height: u32,
+
+    #[schema(strings(
+        display_name = "Camera Bitrate",
+        help = "H264 encoding bitrate for camera frames in Mbps. Higher = better quality but more bandwidth. 15 Mbps is a good default for 1280x960 stereo."
+    ))]
+    #[schema(gui(slider(min = 1.0, max = 50.0, step = 1.0)), suffix = " Mbps")]
+    pub camera_bitrate_mbps: f32,
+
+    #[schema(strings(
+        display_name = "Viewer Port",
+        help = "TCP port for the XR Data Viewer relay. The ALVR server connects to this port to forward depth and camera frames to the viewer."
+    ))]
+    #[schema(gui(slider(min = 1024, max = 65535, step = 1)))]
+    pub viewer_port: u16,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1915,6 +1973,20 @@ pub fn session_settings_default() -> SettingsDefault {
                     saturation: 0.5,
                     gamma: 1.,
                     sharpening: 0.5,
+                },
+            },
+            xr_data: SwitchDefault {
+                enabled: false,
+                content: XrDataConfigDefault {
+                    gui_collapsed: false,
+                    enable_depth: true,
+                    enable_camera: true,
+                    depth_fps: 10.0,
+                    camera_fps: 15.0,
+                    camera_width: 640,
+                    camera_height: 480,
+                    camera_bitrate_mbps: 15.0,
+                    viewer_port: 9944,
                 },
             },
         },

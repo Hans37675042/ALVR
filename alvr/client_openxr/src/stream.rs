@@ -15,10 +15,13 @@ use alvr_common::{
     parking_lot::RwLock,
 };
 use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
-use alvr_packets::{RealTimeConfig, StreamConfig, TrackingData};
+use glow::HasContext;
+use alvr_packets::{
+    DepthFrameHeader, RealTimeConfig, StreamConfig, TrackingData,
+};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
+    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig, XrDataConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -47,6 +50,7 @@ pub struct ParsedStreamConfig {
     pub buffering_history_weight: f32,
     pub decoder_options: Vec<(String, MediacodecProperty)>,
     pub interaction_sources: InteractionSourcesConfig,
+    pub xr_data_config: Option<XrDataConfig>,
 }
 
 impl ParsedStreamConfig {
@@ -80,8 +84,25 @@ impl ParsedStreamConfig {
             buffering_history_weight: config.settings.video.buffering_history_weight,
             decoder_options: config.settings.video.mediacodec_extra_options.clone(),
             interaction_sources: InteractionSourcesConfig::new(config),
+            xr_data_config: config.settings.video.xr_data.as_option().cloned(),
         }
     }
+}
+
+struct DepthReadback {
+    // Blit-based readback pipeline (bypasses Adreno 740 depth sampling bug):
+    // 1. Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
+    // 2. BlitFramebuffer depth → local D16 on fbo_write
+    // 3. CopyImageSubData D16 → R16UI
+    // 4. ReadPixels(RED_INTEGER, UNSIGNED_SHORT) from fbo_r16ui
+    fbo_read: glow::NativeFramebuffer,   // runtime tex layer attached as depth
+    fbo_write: glow::NativeFramebuffer,  // local D16 attached as depth
+    fbo_r16ui: glow::NativeFramebuffer,  // R16UI attached as color (for integer readback)
+    depth_2d_tex: glow::NativeTexture,   // local D16 blit target
+    r16ui_tex: glow::NativeTexture,      // R16UI for integer readback
+    tex_width: u32,
+    tex_height: u32,
+    frame_count: u32,
 }
 
 pub struct StreamContext {
@@ -99,6 +120,21 @@ pub struct StreamContext {
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    gfx_ctx: Rc<GraphicsContext>,
+    depth_provider: Option<crate::extra_extensions::EnvironmentDepthMeta>,
+    depth_init_retries: u32,
+    depth_init_start: Instant,
+    depth_last_retry: Instant,
+    system: xr::SystemId,
+    last_depth_capture: Instant,
+    depth_readback: Option<DepthReadback>,
+    camera_capture: Option<crate::camera_capture::CameraCapture>,
+    camera_capture_right: Option<crate::camera_capture::CameraCapture>,
+    last_camera_capture: Instant,
+    xr_depth_enabled: bool,
+    xr_camera_enabled: bool,
+    #[cfg(target_os = "android")]
+    camera_encoder: Option<crate::hw_encoder::HwEncoder>,
 }
 
 impl StreamContext {
@@ -108,6 +144,7 @@ impl StreamContext {
         gfx_ctx: Rc<GraphicsContext>,
         interaction_ctx: Arc<RwLock<InteractionContext>>,
         config: ParsedStreamConfig,
+        system: xr::SystemId,
     ) -> StreamContext {
         interaction_ctx
             .write()
@@ -174,7 +211,7 @@ impl StreamContext {
         ];
 
         let renderer = StreamRenderer::new(
-            gfx_ctx,
+            Rc::clone(&gfx_ctx),
             config.view_resolution,
             target_view_resolution,
             [
@@ -228,6 +265,55 @@ impl StreamContext {
             xr::ReferenceSpaceType::VIEW,
         ));
 
+        // Request USE_SCENE permission at runtime — required by Meta Quest for both
+        // the Depth API (XR_META_environment_depth) and Scene API (XR_FB_scene).
+        // Always request because the viewer can toggle these features at runtime.
+        #[cfg(target_os = "android")]
+        alvr_system_info::try_get_permission("com.oculus.permission.USE_SCENE");
+
+        // Depth provider will be lazily initialized in maybe_capture_depth()
+        // because it requires passthrough to be fully running (at least one frame submitted)
+        let depth_provider: Option<crate::extra_extensions::EnvironmentDepthMeta> = None;
+        let depth_wants_init = config
+            .xr_data_config
+            .as_ref()
+            .is_some_and(|c| c.enable_depth)
+            && xr_exts.meta_environment_depth.is_some();
+        alvr_common::info!("[XR_DIAG] Depth provider deferred init: wants_init={depth_wants_init}");
+
+        // Create GL-based depth readback resources.
+        // Strategy: blit-based pipeline that bypasses Adreno 740 depth sampling bug.
+        // 1. Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
+        // 2. BlitFramebuffer depth → local D16 on fbo_write
+        // 3. CopyImageSubData D16 → R16UI (bitwise, both 16-bit)
+        // 4. ReadPixels(RED_INTEGER, UNSIGNED_SHORT) from fbo_r16ui → raw u16 depth
+        let depth_readback = if depth_wants_init {
+            gfx_ctx.make_current();
+            let gl = &gfx_ctx.gl_context;
+            unsafe {
+                let fbo_read = gl.create_framebuffer().unwrap();
+                let fbo_write = gl.create_framebuffer().unwrap();
+                let fbo_r16ui = gl.create_framebuffer().unwrap();
+                let depth_2d_tex = gl.create_texture().unwrap();
+                let r16ui_tex = gl.create_texture().unwrap();
+
+                alvr_common::info!("[XR_DIAG] GL depth readback pipeline created (blit-based, no shader)");
+
+                Some(DepthReadback {
+                    fbo_read,
+                    fbo_write,
+                    fbo_r16ui,
+                    depth_2d_tex,
+                    r16ui_tex,
+                    tex_width: 0,
+                    tex_height: 0,
+                    frame_count: 0,
+                })
+            }
+        } else {
+            None
+        };
+
         let mut this = StreamContext {
             use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
@@ -243,7 +329,30 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            gfx_ctx,
+            depth_provider,
+            depth_init_retries: if depth_wants_init { 0 } else { u32::MAX },
+            depth_init_start: Instant::now(),
+            depth_last_retry: Instant::now(),
+            system,
+            last_depth_capture: Instant::now(),
+            depth_readback,
+            camera_capture: None,
+            camera_capture_right: None,
+            last_camera_capture: Instant::now(),
+            xr_depth_enabled: false,
+            xr_camera_enabled: false,
+            #[cfg(target_os = "android")]
+            camera_encoder: None,
         };
+
+        // Request camera permissions early so the user has time to grant
+        // before the first capture attempt (the request is non-blocking)
+        #[cfg(target_os = "android")]
+        {
+            alvr_system_info::try_get_permission("android.permission.CAMERA");
+            alvr_system_info::try_get_permission("horizonos.permission.PASSTHROUGH_CAMERA_ACCESS");
+        }
 
         this.update_reference_space();
 
@@ -336,6 +445,86 @@ impl StreamContext {
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
+
+        // Hot-reload XR data config if it changed
+        if let Some(new_xr) = &config.xr_data_config {
+            let old_xr = self.config.xr_data_config.as_ref();
+            let changed = old_xr.map_or(true, |old| old != new_xr);
+            if changed {
+                // Detect what specifically changed to react appropriately
+                if let Some(old) = old_xr {
+                    // Camera bitrate changed → destroy encoder so it recreates with new bitrate
+                    #[cfg(target_os = "android")]
+                    if (old.camera_bitrate_mbps - new_xr.camera_bitrate_mbps).abs() > 0.1
+                        || old.camera_fps != new_xr.camera_fps
+                    {
+                        if self.camera_encoder.take().is_some() {
+                            alvr_common::info!(
+                                "[XR_DATA] Camera encoder destroyed (config changed: bitrate {:.0}→{:.0} Mbps, fps {:.0}→{:.0})",
+                                old.camera_bitrate_mbps, new_xr.camera_bitrate_mbps,
+                                old.camera_fps, new_xr.camera_fps,
+                            );
+                        }
+                    }
+
+                    // Camera resolution changed → destroy captures, re-init on next frame
+                    if old.camera_width != new_xr.camera_width || old.camera_height != new_xr.camera_height {
+                        alvr_common::info!(
+                            "[XR_DATA] Camera resolution changed: {}x{}→{}x{}, reinitializing...",
+                            old.camera_width, old.camera_height,
+                            new_xr.camera_width, new_xr.camera_height,
+                        );
+                        if let Some(cam) = self.camera_capture.take() {
+                            cam.destroy_async();
+                        }
+                        if let Some(cam) = self.camera_capture_right.take() {
+                            cam.destroy_async();
+                        }
+                        #[cfg(target_os = "android")]
+                        { self.camera_encoder.take(); }
+                    }
+                }
+
+                alvr_common::info!(
+                    "[XR_DATA] Config updated: depth_fps={:.0}, camera_fps={:.0}, cam={}x{}, bitrate={:.0}Mbps",
+                    new_xr.depth_fps, new_xr.camera_fps,
+                    new_xr.camera_width, new_xr.camera_height,
+                    new_xr.camera_bitrate_mbps,
+                );
+                self.config.xr_data_config = Some(new_xr.clone());
+            }
+        }
+    }
+
+    pub fn set_xr_stream_flags(&mut self, depth: bool, camera: bool) {
+        alvr_common::info!(
+            "[XR_DATA] Stream flags updated: depth={depth}, camera={camera}"
+        );
+        // Destroy camera encoder when camera stream is disabled to free HW resources
+        #[cfg(target_os = "android")]
+        {
+            if !camera && self.xr_camera_enabled {
+                if self.camera_encoder.take().is_some() {
+                    alvr_common::info!("[XR_DATA] Camera encoder destroyed (stream disabled)");
+                }
+            }
+        }
+        // Destroy camera capture when camera stream is disabled.
+        // Use destroy_async() to move NDK cleanup off the render thread —
+        // ACameraCaptureSession_close / ACameraDevice_close can block for a
+        // long time (or indefinitely) on some Android drivers.
+        if !camera && self.xr_camera_enabled {
+            if let Some(cam) = self.camera_capture.take() {
+                alvr_common::info!("[XR_DATA] Camera capture (left) destroying async...");
+                cam.destroy_async();
+            }
+            if let Some(cam) = self.camera_capture_right.take() {
+                alvr_common::info!("[XR_DATA] Camera capture (right) destroying async...");
+                cam.destroy_async();
+            }
+        }
+        self.xr_depth_enabled = depth;
+        self.xr_camera_enabled = camera;
     }
 
     pub fn render(
@@ -441,6 +630,10 @@ impl StreamContext {
         self.swapchains[0].release_image().unwrap();
         self.swapchains[1].release_image().unwrap();
 
+        // Capture depth and camera (must be between xrWaitFrame and xrEndFrame)
+        self.maybe_capture_depth(xr_vsync_time);
+        self.maybe_capture_camera();
+
         if !buffer_ptr.is_null()
             && let Some(xr_now) = crate::xr_runtime_now(self.xr_session.instance())
         {
@@ -505,12 +698,462 @@ impl StreamContext {
 
         (layer, openxr_display_time)
     }
+
+    fn maybe_capture_depth(&mut self, display_time: xr::Time) {
+        // Lazy init with retries: always runs based on config (not gated by viewer toggle).
+        // This ensures the provider is created early while passthrough is freshly started.
+        if self.depth_provider.is_none() && self.depth_init_retries < 10 {
+            let elapsed = self.depth_init_start.elapsed();
+            let since_last = self.depth_last_retry.elapsed();
+            if elapsed < Duration::from_secs(2) || since_last < Duration::from_secs(1) {
+                // Still waiting for initial delay or retry interval
+            } else {
+                self.depth_init_retries += 1;
+                self.depth_last_retry = Instant::now();
+                alvr_common::info!(
+                    "[XR_DATA] Deferred depth init attempt {}/10 ({:.1}s after stream start)...",
+                    self.depth_init_retries,
+                    elapsed.as_secs_f32(),
+                );
+                // Runtime needs GL context current to allocate GLES textures for depth swapchain
+                self.gfx_ctx.make_current();
+                match crate::extra_extensions::EnvironmentDepthMeta::new(
+                    self.xr_session.clone(),
+                    self.system,
+                ) {
+                    Ok(provider) => {
+                        alvr_common::info!("[XR_DATA] Deferred depth provider created successfully!");
+                        self.depth_provider = Some(provider);
+                    }
+                    Err(e) => {
+                        alvr_common::info!("[XR_DATA] Deferred depth provider attempt {} failed: {e:?}", self.depth_init_retries);
+                    }
+                }
+            }
+        }
+
+        // Only capture/send depth frames when the viewer has enabled depth streaming
+        if !self.xr_depth_enabled {
+            return;
+        }
+
+        let Some(depth_provider) = &mut self.depth_provider else {
+            return;
+        };
+
+        let depth_fps = self
+            .config
+            .xr_data_config
+            .as_ref()
+            .map(|c| c.depth_fps)
+            .unwrap_or(10.0);
+        let depth_interval = Duration::from_secs_f32(1.0 / depth_fps);
+
+        if self.last_depth_capture.elapsed() < depth_interval {
+            return;
+        }
+
+        // Start provider if not already started
+        if !depth_provider.is_started() {
+            alvr_common::info!("[XR_DATA] Starting depth provider...");
+            if let Err(e) = depth_provider.start() {
+                alvr_common::info!("[XR_DATA] Failed to start depth provider: {e:?}");
+                self.last_depth_capture = Instant::now();
+                return;
+            }
+            alvr_common::info!("[XR_DATA] Depth provider started");
+            // Runtime needs at least one frame after start before acquire works
+            self.last_depth_capture = Instant::now();
+            return;
+        }
+
+        // Acquire depth image
+        let depth_image = match depth_provider.acquire_depth_image(
+            self.stage_reference_space.as_raw(),
+            display_time,
+        ) {
+            Ok(Some(image)) => image,
+            Ok(None) => {
+                self.last_depth_capture = Instant::now();
+                return;
+            }
+            Err(e) => {
+                alvr_common::info!("[XR_DATA] Failed to acquire depth image: {e:?}");
+                self.last_depth_capture = Instant::now();
+                return;
+            }
+        };
+
+        let width = depth_provider.swapchain_width;
+        let height = depth_provider.swapchain_height;
+
+        let swapchain_idx = depth_image.swapchain_index as usize;
+        let pixel_count = (width * height) as usize;
+        let depth_bytes = if swapchain_idx < depth_provider.swapchain_images.len()
+            && let Some(ref mut readback) = self.depth_readback
+        {
+            let texture_id = depth_provider.swapchain_images[swapchain_idx];
+            if texture_id == 0 {
+                vec![0x80u8; pixel_count * 2 * 2]
+            } else {
+                self.gfx_ctx.make_current();
+                let gl = &self.gfx_ctx.gl_context;
+                unsafe {
+                    let w = width as i32;
+                    let h = height as i32;
+
+                    // Init/resize local D16 + R16UI textures on first use or size change
+                    if readback.tex_width != width || readback.tex_height != height {
+                        alvr_common::info!("[XR_DATA] Init blit targets: {}x{}", width, height);
+
+                        // Local D16 depth texture (blit target)
+                        gl.delete_texture(readback.depth_2d_tex);
+                        readback.depth_2d_tex = gl.create_texture().unwrap();
+                        gl.bind_texture(glow::TEXTURE_2D, Some(readback.depth_2d_tex));
+                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::DEPTH_COMPONENT16, w, h);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+
+                        // Attach local D16 to fbo_write
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_write));
+                        gl.framebuffer_texture_2d(
+                            glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT,
+                            glow::TEXTURE_2D, Some(readback.depth_2d_tex), 0,
+                        );
+                        let write_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+
+                        // R16UI texture (CopyImageSubData target for integer readback)
+                        gl.delete_texture(readback.r16ui_tex);
+                        readback.r16ui_tex = gl.create_texture().unwrap();
+                        gl.bind_texture(glow::TEXTURE_2D, Some(readback.r16ui_tex));
+                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::R16UI, w, h);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+
+                        // Attach R16UI to fbo_r16ui
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_r16ui));
+                        gl.framebuffer_texture_2d(
+                            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0,
+                            glow::TEXTURE_2D, Some(readback.r16ui_tex), 0,
+                        );
+                        let r16ui_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+
+                        readback.tex_width = width;
+                        readback.tex_height = height;
+                        let err = gl.get_error();
+                        alvr_common::info!(
+                            "[XR_DATA] Blit targets ready: write_fbo={:#x} r16ui_fbo={:#x} GL err={:#x}",
+                            write_status, r16ui_status, err,
+                        );
+                    }
+
+                    let runtime_tex = glow::NativeTexture(std::num::NonZeroU32::new(texture_id).unwrap());
+
+                    // Output buffer: 2 bytes per pixel (u16), 2 eyes
+                    let u16_byte_count = pixel_count * 2;
+                    let mut depth_bytes = vec![0u8; u16_byte_count * 2];
+
+                    for eye in 0..2u32 {
+                        // Step 1: Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_read));
+                        gl.framebuffer_texture_layer(
+                            glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT,
+                            Some(runtime_tex), 0, eye as i32,
+                        );
+                        let read_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                        let attach_err = gl.get_error();
+
+                        // Step 2: Blit depth from runtime FBO → local D16 FBO
+                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(readback.fbo_read));
+                        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(readback.fbo_write));
+                        gl.blit_framebuffer(
+                            0, 0, w, h,
+                            0, 0, w, h,
+                            glow::DEPTH_BUFFER_BIT, glow::NEAREST,
+                        );
+                        let blit_err = gl.get_error();
+
+                        // Step 3: CopyImageSubData from local D16 → R16UI (bitwise, both 16-bit)
+                        gl.copy_image_sub_data(
+                            readback.depth_2d_tex, glow::TEXTURE_2D, 0, 0, 0, 0,
+                            readback.r16ui_tex, glow::TEXTURE_2D, 0, 0, 0, 0,
+                            w, h, 1,
+                        );
+                        let copy_err = gl.get_error();
+
+                        // Step 4: Read raw u16 depth from R16UI via integer ReadPixels
+                        let offset = eye as usize * u16_byte_count;
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_r16ui));
+                        gl.read_pixels(
+                            0, 0, w, h,
+                            glow::RED_INTEGER, glow::UNSIGNED_SHORT,
+                            glow::PixelPackData::Slice(Some(&mut depth_bytes[offset..offset + u16_byte_count])),
+                        );
+                        let read_err = gl.get_error();
+
+                        let _ = (read_status, attach_err, blit_err, copy_err, read_err);
+                    }
+
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    readback.frame_count += 1;
+
+                    // Flip rows: glReadPixels returns bottom-up, send top-down
+                    let row_bytes = width as usize * 2;
+                    let h = height as usize;
+                    for eye in 0..2usize {
+                        let eye_offset = eye * u16_byte_count;
+                        for row in 0..h / 2 {
+                            let top = eye_offset + row * row_bytes;
+                            let bot = eye_offset + (h - 1 - row) * row_bytes;
+                            for col in 0..row_bytes {
+                                depth_bytes.swap(top + col, bot + col);
+                            }
+                        }
+                    }
+
+                    depth_bytes
+                }
+            }
+        } else {
+            // Fallback: dummy data
+            vec![0x80u8; pixel_count * 2 * 2]
+        };
+
+        // Build header with pose from first view (left eye)
+        let view = &depth_image.views[0];
+        let head_pose = crate::from_xr_pose(xr::Posef {
+            orientation: view.pose.orientation,
+            position: view.pose.position,
+        });
+
+        // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
+        // Depth data is only ~819 KB/frame at 320x640x2 eyes, so even raw is fine,
+        // but LZ4 reduces it to ~200-400 KB with <1ms latency.
+        let stacked_height = height * 2;
+        let compressed = lz4_flex::compress_prepend_size(&depth_bytes);
+        let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
+
+        let header = DepthFrameHeader {
+            timestamp: crate::from_xr_time(display_time),
+            head_pose,
+            width,
+            height: stacked_height,
+            near_z: depth_image.near_z,
+            far_z: depth_image.far_z,
+            format: send_format,
+            intrinsics: [
+                [
+                    depth_image.views[0].fov.angle_left,
+                    depth_image.views[0].fov.angle_right,
+                    depth_image.views[0].fov.angle_up,
+                    depth_image.views[0].fov.angle_down,
+                ],
+                [
+                    depth_image.views[1].fov.angle_left,
+                    depth_image.views[1].fov.angle_right,
+                    depth_image.views[1].fov.angle_up,
+                    depth_image.views[1].fov.angle_down,
+                ],
+            ],
+        };
+
+        self.core_context.send_depth_frame(&header, &send_data);
+        self.last_depth_capture = Instant::now();
+    }
+
+    fn maybe_capture_camera(&mut self) {
+        if !self.xr_camera_enabled {
+            return;
+        }
+        let camera_fps = self
+            .config
+            .xr_data_config
+            .as_ref()
+            .map(|c| c.camera_fps)
+            .unwrap_or(15.0);
+        let camera_interval = Duration::from_secs_f32(1.0 / camera_fps);
+
+        if self.last_camera_capture.elapsed() < camera_interval {
+            return;
+        }
+
+        // Lazy init: open left camera (ID 50), then try right camera (ID 51)
+        if self.camera_capture.is_none() {
+            let cam_w = self.config.xr_data_config.as_ref().map(|c| c.camera_width).unwrap_or(640) as i32;
+            let cam_h = self.config.xr_data_config.as_ref().map(|c| c.camera_height).unwrap_or(480) as i32;
+            alvr_common::info!("[XR_DATA] Initializing dual camera capture at {cam_w}x{cam_h}...");
+            match crate::camera_capture::CameraCapture::new_with_camera_id(cam_w, cam_h, Some("50")) {
+                Some(cam) => {
+                    alvr_common::info!("[XR_DATA] Left camera (50) opened: {}x{}", cam.width(), cam.height());
+                    self.camera_capture = Some(cam);
+                }
+                None => {
+                    // Fallback: auto-select any camera
+                    alvr_common::info!("[XR_DATA] Camera 50 unavailable, trying auto-select...");
+                    match crate::camera_capture::CameraCapture::new(cam_w, cam_h) {
+                        Some(cam) => {
+                            alvr_common::info!("[XR_DATA] Fallback camera opened: {}x{}", cam.width(), cam.height());
+                            self.camera_capture = Some(cam);
+                        }
+                        None => {
+                            alvr_common::info!("[XR_DATA] Camera capture unavailable");
+                            self.last_camera_capture = Instant::now() + Duration::from_secs(5);
+                            return;
+                        }
+                    }
+                }
+            }
+            // Try to open right camera (ID 51) for stereo
+            if self.camera_capture_right.is_none() {
+                match crate::camera_capture::CameraCapture::new_with_camera_id(cam_w, cam_h, Some("51")) {
+                    Some(cam) => {
+                        alvr_common::info!("[XR_DATA] Right camera (51) opened: {}x{}", cam.width(), cam.height());
+                        self.camera_capture_right = Some(cam);
+                    }
+                    None => {
+                        alvr_common::info!("[XR_DATA] Right camera (51) unavailable, single-eye mode");
+                    }
+                }
+            }
+        }
+
+        // Get frames from both cameras
+        let left_frame = self.camera_capture.as_ref().and_then(|c| c.get_latest_frame());
+        let right_frame = self.camera_capture_right.as_ref().and_then(|c| c.get_latest_frame());
+
+        let Some((l_w, l_h, l_data, l_nv12)) = left_frame else {
+            return;
+        };
+
+        // Build the frame data: side-by-side if both eyes available
+        let (width, height, data, is_nv12) = if let Some((r_w, r_h, r_data, r_nv12)) = right_frame {
+            if l_nv12 && r_nv12 && l_h == r_h {
+                // Tile side-by-side in NV12: combined_w = l_w + r_w
+                let combined_w = (l_w + r_w) as usize;
+                let h = l_h as usize;
+                let lw = l_w as usize;
+                let rw = r_w as usize;
+
+                let y_size = combined_w * h;
+                let uv_size = combined_w * (h / 2);
+                let mut combined = vec![0u8; y_size + uv_size];
+
+                // Tile Y planes side-by-side
+                for row in 0..h {
+                    let dst_off = row * combined_w;
+                    let l_off = row * lw;
+                    let r_off = row * rw;
+                    combined[dst_off..dst_off + lw]
+                        .copy_from_slice(&l_data[l_off..l_off + lw]);
+                    if r_off + rw <= r_data.len() {
+                        combined[dst_off + lw..dst_off + combined_w]
+                            .copy_from_slice(&r_data[r_off..r_off + rw]);
+                    }
+                }
+
+                // Tile UV planes side-by-side
+                let l_uv_off = lw * h;
+                let r_uv_off = rw * h;
+                let uv_h = h / 2;
+                for row in 0..uv_h {
+                    let dst_off = y_size + row * combined_w;
+                    let l_off = l_uv_off + row * lw;
+                    let r_off = r_uv_off + row * rw;
+                    if l_off + lw <= l_data.len() {
+                        combined[dst_off..dst_off + lw]
+                            .copy_from_slice(&l_data[l_off..l_off + lw]);
+                    }
+                    if r_off + rw <= r_data.len() {
+                        combined[dst_off + lw..dst_off + combined_w]
+                            .copy_from_slice(&r_data[r_off..r_off + rw]);
+                    }
+                }
+
+                (l_w + r_w, l_h, combined, true)
+            } else {
+                // Mismatched heights or not NV12, just send left
+                (l_w, l_h, l_data, l_nv12)
+            }
+        } else {
+            // Single camera only
+            (l_w, l_h, l_data, l_nv12)
+        };
+
+        use alvr_packets::{CameraFrameFormat, CameraFrameHeader};
+
+        // Try HW encoding on Android: NV12 → H264
+        #[cfg(target_os = "android")]
+        let (send_data, send_format) = if is_nv12 {
+            // Lazily create camera encoder (dimensions may change with stereo)
+            if self.camera_encoder.as_ref().map_or(true, |e| e.width() != width || e.height() != height) {
+                self.camera_encoder = None; // recreate with new dimensions
+                let fps = self.config.xr_data_config.as_ref()
+                    .map(|c| c.camera_fps as i32).unwrap_or(15);
+                let bitrate_bps = (self.config.xr_data_config.as_ref()
+                    .map(|c| c.camera_bitrate_mbps).unwrap_or(15.0) * 1_000_000.0) as i32;
+                self.camera_encoder = crate::hw_encoder::HwEncoder::new(
+                    width, height,
+                    bitrate_bps,
+                    fps,
+                    1,
+                );
+                if self.camera_encoder.is_some() {
+                    alvr_common::info!("[XR_DATA] HW encoder created: {}x{}", width, height);
+                } else {
+                    alvr_common::info!("[XR_DATA] HW encoder unavailable, falling back to raw NV12");
+                }
+            }
+
+            if let Some(ref mut encoder) = self.camera_encoder {
+                if let Some(nals) = encoder.encode(&data) {
+                    (nals.to_vec(), CameraFrameFormat::H264)
+                } else {
+                    self.last_camera_capture = Instant::now();
+                    return;
+                }
+            } else {
+                (data, CameraFrameFormat::Nv12)
+            }
+        } else {
+            (data, CameraFrameFormat::Rgb8)
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let (send_data, send_format) = if is_nv12 {
+            (data, CameraFrameFormat::Nv12)
+        } else {
+            (data, CameraFrameFormat::Rgb8)
+        };
+
+        let header = CameraFrameHeader {
+            timestamp: Duration::from_nanos(0),
+            head_pose: alvr_common::Pose::default(),
+            width,
+            height,
+            format: send_format,
+            intrinsics: [0.0; 4],
+        };
+        self.core_context.send_camera_frame(&header, &send_data);
+        self.last_camera_capture = Instant::now();
+    }
+
 }
 
 impl Drop for StreamContext {
     fn drop(&mut self) {
         self.input_thread_running.set(false);
         self.input_thread.take().unwrap().join().ok();
+
+        // Clean up depth readback GL resources
+        if let Some(readback) = self.depth_readback.take() {
+            self.gfx_ctx.make_current();
+            unsafe {
+                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_read);
+                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_write);
+                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_r16ui);
+                self.gfx_ctx.gl_context.delete_texture(readback.depth_2d_tex);
+                self.gfx_ctx.gl_context.delete_texture(readback.r16ui_tex);
+            }
+        }
     }
 }
 

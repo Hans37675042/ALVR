@@ -9,6 +9,7 @@ mod sockets;
 mod statistics;
 mod tracking;
 mod web_server;
+mod xr_data_relay;
 
 pub use c_api::*;
 pub use logging_backend::init_logging;
@@ -26,8 +27,8 @@ use alvr_common::{
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    VideoPacketHeader,
+    BatteryInfo, ButtonEntry, CameraFrameHeader, ClientConnectionsAction,
+    DecoderInitializationConfig, DepthFrameHeader, Haptics, VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, OpenvrProperty, Settings};
@@ -90,6 +91,14 @@ pub enum ServerCoreEvent {
     ShutdownPending,
     RestartPending,
     ProximityState(bool),
+    DepthFrame {
+        header: DepthFrameHeader,
+        data: Vec<u8>,
+    },
+    CameraFrame {
+        header: CameraFrameHeader,
+        data: Vec<u8>,
+    },
 }
 
 pub struct ConnectionContext {
@@ -104,6 +113,7 @@ pub struct ConnectionContext {
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
+    xr_data_relay: xr_data_relay::XrDataRelay,
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
@@ -215,6 +225,13 @@ impl ServerCoreContext {
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
+            xr_data_relay: xr_data_relay::XrDataRelay::new(
+                if let Switch::Enabled(ref xr) = initial_settings.video.xr_data {
+                    xr.viewer_port
+                } else {
+                    xr_data_relay::DEFAULT_VIEWER_PORT
+                },
+            ),
         });
 
         let webserver_runtime = Runtime::new().unwrap();

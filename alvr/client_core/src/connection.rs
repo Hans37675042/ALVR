@@ -14,9 +14,10 @@ use alvr_common::{
     wait_rwlock, warn,
 };
 use alvr_packets::{
-    AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
+    AUDIO, CAMERA, ClientConnectionResult, ClientControlPacket, ClientStatistics,
+    ConnectionAcceptedInfo, DEPTH, HAPTICS, Haptics, STATISTICS, ServerControlPacket,
+    StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
@@ -62,6 +63,8 @@ pub struct ConnectionContext {
     pub control_sender: Mutex<Option<ControlSocketSender<ClientControlPacket>>>,
     pub tracking_sender: Mutex<Option<StreamSender<TrackingData>>>,
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
+    pub depth_sender: Mutex<Option<StreamSender<alvr_packets::DepthFrameHeader>>>,
+    pub camera_sender: Mutex<Option<StreamSender<alvr_packets::CameraFrameHeader>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
     pub global_view_params_queue: Mutex<VecDeque<(Duration, [ViewParams; 2])>>,
@@ -270,6 +273,8 @@ fn connection_pipeline(
     let mut haptics_receiver =
         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
     let statistics_sender = stream_socket.request_stream(STATISTICS);
+    let depth_sender = stream_socket.request_stream(DEPTH);
+    let camera_sender = stream_socket.request_stream(CAMERA);
 
     let video_receive_thread = thread::spawn({
         let ctx = Arc::clone(&ctx);
@@ -496,6 +501,18 @@ fn connection_pipeline(
                     Ok(ServerControlPacket::StartStream) => {
                         error!("Unexpected StartStream paceket");
                     }
+                    Ok(ServerControlPacket::XrStreamControl {
+                        depth_enabled,
+                        camera_enabled,
+                    }) => {
+                        info!("XR stream control: depth={depth_enabled}, camera={camera_enabled}");
+                        event_queue.lock().push_back(
+                            ClientCoreEvent::XrStreamControl {
+                                depth_enabled,
+                                camera_enabled,
+                            },
+                        );
+                    }
                     Ok(ServerControlPacket::KeepAlive) => (),
                     Ok(
                         ServerControlPacket::Reserved(_) | ServerControlPacket::ReservedBuffer(_),
@@ -543,6 +560,8 @@ fn connection_pipeline(
     *ctx.control_sender.lock() = Some(control_sender);
     *ctx.tracking_sender.lock() = Some(tracking_sender);
     *ctx.statistics_sender.lock() = Some(statistics_sender);
+    *ctx.depth_sender.lock() = Some(depth_sender);
+    *ctx.camera_sender.lock() = Some(camera_sender);
     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
         *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
             sender: log_channel_sender,
@@ -564,6 +583,8 @@ fn connection_pipeline(
     *ctx.control_sender.lock() = None;
     *ctx.tracking_sender.lock() = None;
     *ctx.statistics_sender.lock() = None;
+    *ctx.depth_sender.lock() = None;
+    *ctx.camera_sender.lock() = None;
     *LOG_CHANNEL_SENDER.lock() = None;
 
     event_queue

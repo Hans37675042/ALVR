@@ -19,8 +19,9 @@ use alvr_common::{
 };
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
-    AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket, ClientStatistics,
-    HAPTICS, NegotiatedStreamingConfig, NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS,
+    AUDIO, CAMERA, CameraFrameHeader, ClientConnectionResult, ClientConnectionsAction,
+    ClientControlPacket, ClientStatistics, DEPTH, DepthFrameHeader, HAPTICS,
+    NegotiatedStreamingConfig, NegotiatedStreamingConfigExt, RealTimeConfig, STATISTICS,
     ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
@@ -853,6 +854,10 @@ fn connection_pipeline(
     let haptics_sender = stream_socket.request_stream(HAPTICS);
     let mut statics_receiver =
         stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
+    let mut depth_receiver =
+        stream_socket.subscribe_to_stream::<DepthFrameHeader>(DEPTH, MAX_UNREAD_PACKETS);
+    let mut camera_receiver =
+        stream_socket.subscribe_to_stream::<CameraFrameHeader>(CAMERA, MAX_UNREAD_PACKETS);
 
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
@@ -1093,7 +1098,89 @@ fn connection_pipeline(
         }
     });
 
+    let depth_receive_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        let client_hostname = client_hostname.clone();
+        move || {
+            let mut depth_frame_count: u64 = 0;
+            while is_streaming(&client_hostname) {
+                let data = match depth_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                    Ok(data) => data,
+                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Err(ConnectionError::Other(_)) => return,
+                };
+                let Ok((header, payload)) = data.get() else {
+                    return;
+                };
+
+                depth_frame_count += 1;
+                if depth_frame_count <= 3 || depth_frame_count % 100 == 0 {
+                    info!("XR Data: depth frame #{} {}x{} ({} bytes)", depth_frame_count, header.width, header.height, payload.len());
+                }
+
+                // Forward to test viewer via TCP relay
+                ctx.xr_data_relay.send_depth_frame(&header, payload);
+
+                ctx.events_sender
+                    .send(ServerCoreEvent::DepthFrame {
+                        header: header.clone(),
+                        data: payload.to_vec(),
+                    })
+                    .ok();
+            }
+        }
+    });
+
+    let camera_receive_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        let client_hostname = client_hostname.clone();
+        move || {
+            let mut camera_frame_count: u64 = 0;
+            while is_streaming(&client_hostname) {
+                let data = match camera_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                    Ok(data) => data,
+                    Err(ConnectionError::TryAgain(_)) => continue,
+                    Err(ConnectionError::Other(_)) => return,
+                };
+                let Ok((header, payload)) = data.get() else {
+                    return;
+                };
+
+                camera_frame_count += 1;
+                if camera_frame_count <= 3 || camera_frame_count % 100 == 0 {
+                    info!("XR Data: camera frame #{} {}x{} ({} bytes)", camera_frame_count, header.width, header.height, payload.len());
+                }
+
+                // Forward to test viewer via TCP relay
+                ctx.xr_data_relay.send_camera_frame(&header, payload);
+
+                ctx.events_sender
+                    .send(ServerCoreEvent::CameraFrame {
+                        header: header.clone(),
+                        data: payload.to_vec(),
+                    })
+                    .ok();
+            }
+        }
+    });
+
     let control_sender = Arc::new(Mutex::new(control_sender));
+
+    // Wire up relay stream control callback to forward to client
+    {
+        let control_sender = Arc::clone(&control_sender);
+        ctx.xr_data_relay.set_control_callback(Box::new(
+            move |depth_enabled, camera_enabled| {
+                control_sender
+                    .lock()
+                    .send(&ServerControlPacket::XrStreamControl {
+                        depth_enabled,
+                        camera_enabled,
+                    })
+                    .ok();
+            },
+        ));
+    }
 
     let real_time_update_thread = thread::spawn({
         let control_sender = Arc::clone(&control_sender);
@@ -1430,6 +1517,8 @@ fn connection_pipeline(
     microphone_thread.join().ok();
     tracking_receive_thread.join().ok();
     statistics_thread.join().ok();
+    depth_receive_thread.join().ok();
+    camera_receive_thread.join().ok();
     real_time_update_thread.join().ok();
     control_receive_thread.join().ok();
     stream_receive_thread.join().ok();

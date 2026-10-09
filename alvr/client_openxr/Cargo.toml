@@ -17,7 +17,10 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_system_info.workspace = true
 
+glow = "0.16"
+lz4_flex = "0.11"
 openxr = { git = "https://github.com/zmerp/openxrs", rev = "e7c1b155e79ff8b58c2f6558d28e1398ebe08d2d" }
+wgpu = "25"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
@@ -125,7 +128,15 @@ name = "com.oculus.permission.FACE_TRACKING"
 [[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.HAND_TRACKING"
 [[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_SCENE"
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_ANCHOR_API"
+[[package.metadata.android.uses_permission]]
 name = "com.oculus.permission.WIFI_LOCK"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
+[[package.metadata.android.uses_permission]]
+name = "horizonos.permission.PASSTHROUGH_CAMERA_ACCESS"
 [[package.metadata.android.application.meta_data]]
 name = "com.oculus.intent.category.VR"
 value = "vr_only"

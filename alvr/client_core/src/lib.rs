@@ -24,7 +24,8 @@ use alvr_common::{
     warn,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, RealTimeConfig, StreamConfig, TrackingData,
+    BatteryInfo, ButtonEntry, CameraFrameHeader, ClientControlPacket, DepthFrameHeader,
+    RealTimeConfig, StreamConfig, TrackingData,
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
@@ -55,6 +56,10 @@ pub enum ClientCoreEvent {
         config_nal: Vec<u8>,
     },
     RealTimeConfig(RealTimeConfig),
+    XrStreamControl {
+        depth_enabled: bool,
+        camera_enabled: bool,
+    },
 }
 
 // Note: this struct may change without breaking network protocol changes
@@ -233,6 +238,18 @@ impl ClientCoreContext {
             sender
                 .send(&ClientControlPacket::ProximityState(headset_is_worn))
                 .ok();
+        }
+    }
+
+    pub fn send_depth_frame(&self, header: &DepthFrameHeader, payload: &[u8]) {
+        if let Some(sender) = &mut *self.connection_context.depth_sender.lock() {
+            sender.send_header_with_payload(header, payload).ok();
+        }
+    }
+
+    pub fn send_camera_frame(&self, header: &CameraFrameHeader, payload: &[u8]) {
+        if let Some(sender) = &mut *self.connection_context.camera_sender.lock() {
+            sender.send_header_with_payload(header, payload).ok();
         }
     }
 

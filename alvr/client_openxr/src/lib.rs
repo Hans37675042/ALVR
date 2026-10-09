@@ -1,6 +1,12 @@
 mod c_api;
+#[allow(unsafe_op_in_unsafe_fn)]
+#[allow(dead_code)]
+mod camera_capture;
 mod extra_extensions;
 mod graphics;
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+mod hw_encoder;
 mod interaction;
 mod lobby;
 mod passthrough;
@@ -186,19 +192,22 @@ pub fn entry_point() {
     xr_entry.initialize_android_loader().unwrap();
 
     let available_extensions = xr_entry.enumerate_extensions().unwrap();
-    info!("OpenXR available extensions: {available_extensions:#?}");
-    info!(
-        "Extra available extensions: {:#?}",
-        available_extensions
-            .other
-            .iter()
-            .map(|vec| CStr::from_bytes_with_nul(vec)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned())
-            .collect::<Vec<_>>()
+    // Diagnostic: log XR data extension availability
+    info!("[XR_DIAG] Available extensions check: meta_environment_depth={}",
+        available_extensions.meta_environment_depth,
     );
+    // Also log the "other" extensions to see what extra extensions the runtime has
+    let other_ext_names: Vec<_> = available_extensions
+        .other
+        .iter()
+        .map(|vec| CStr::from_bytes_with_nul(vec)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned())
+        .collect();
+    info!("[XR_DIAG] Other extensions ({} total): {:?}", other_ext_names.len(), other_ext_names);
+    info!("OpenXR available extensions: {available_extensions:#?}");
 
     // todo: switch to vulkan
     assert!(available_extensions.khr_opengl_es_enable);
@@ -230,6 +239,8 @@ pub fn entry_point() {
     }
     exts.khr_convert_timespec_time = true;
     exts.khr_opengl_es_enable = true;
+    // XR data extensions (depth)
+    exts.meta_environment_depth = available_extensions.meta_environment_depth;
     exts.other = available_extensions
         .other
         .into_iter()
@@ -262,6 +273,8 @@ pub fn entry_point() {
         })
         .collect::<Vec<_>>();
 
+    info!("[XR_DIAG] Extensions enabled in 'other' for create_instance: {:?}", other_exts);
+
     let xr_instance = xr_entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -290,6 +303,10 @@ pub fn entry_point() {
     let graphics_context = Rc::new(GraphicsContext::new_gl());
 
     let mut last_lobby_message = String::new();
+
+    // Persist XR stream flags across session restarts
+    let mut persist_xr_depth_enabled = false;
+    let mut persist_xr_camera_enabled = false;
 
     'session_loop: loop {
         let xr_system = xr_instance
@@ -459,11 +476,7 @@ pub fn entry_point() {
 
                         core_context.send_proximity_state(event.is_user_present());
                     }
-                    xr::Event::Unknown => {
-                        // use event_storage.as_raw(), reinterpret as sys::BaseInStructure, get type
-                        // and then reinterpret as the event struct
-                    }
-                    _ => (),
+                    xr::Event::Unknown | _ => (),
                 }
             }
 
@@ -487,6 +500,7 @@ pub fn entry_point() {
                             Rc::clone(&graphics_context),
                             Arc::clone(&interaction_context),
                             config,
+                            xr_system,
                         );
 
                         if !context.uses_passthrough() {
@@ -494,6 +508,20 @@ pub fn entry_point() {
                         }
 
                         stream_context = Some(context);
+
+                        // Restore XR stream flags from before session restart
+                        if persist_xr_depth_enabled || persist_xr_camera_enabled {
+                            alvr_common::error!(
+                                "[XR_DIAG] Restoring persisted XR flags: depth={}, camera={}",
+                                persist_xr_depth_enabled, persist_xr_camera_enabled,
+                            );
+                            if let Some(stream) = &mut stream_context {
+                                stream.set_xr_stream_flags(
+                                    persist_xr_depth_enabled,
+                                    persist_xr_camera_enabled,
+                                );
+                            }
+                        }
 
                         core_context.send_proximity_state(headset_is_worn);
                     }
@@ -537,7 +565,9 @@ pub fn entry_point() {
                     ClientCoreEvent::RealTimeConfig(config) => {
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
-                        } else if config.passthrough.is_none() && passthrough_layer.is_some() {
+                        } else if config.passthrough.is_none()
+                            && passthrough_layer.is_some()
+                        {
                             passthrough_layer = None;
                         }
 
@@ -561,6 +591,27 @@ pub fn entry_point() {
 
                         if let Some(stream) = &mut stream_context {
                             stream.update_real_time_config(&config);
+                        }
+                    }
+                    ClientCoreEvent::XrStreamControl {
+                        depth_enabled,
+                        camera_enabled,
+                    } => {
+                        alvr_common::error!(
+                            "[XR_DIAG] XrStreamControl received: depth={depth_enabled}, camera={camera_enabled}, \
+                             passthrough_layer={}",
+                            passthrough_layer.is_some(),
+                        );
+
+                        // Persist flags so they survive session restarts
+                        persist_xr_depth_enabled = depth_enabled;
+                        persist_xr_camera_enabled = camera_enabled;
+
+                        if let Some(stream) = &mut stream_context {
+                            stream.set_xr_stream_flags(
+                                depth_enabled,
+                                camera_enabled,
+                            );
                         }
                     }
                 }
@@ -627,6 +678,8 @@ pub fn entry_point() {
                         .unwrap();
                 }
             }
+
+            // Depth and camera capture happen inside render(), between xrWaitFrame and xrEndFrame
         }
     }
 

@@ -187,6 +187,64 @@ fn create_texture_from_gles(_: &Device, _: u32, _: UVec2, _: TextureFormat) -> T
     unimplemented!()
 }
 
+/// Create a wgpu Texture from a raw GLES depth texture ID (2D array with layers).
+/// Used for reading OpenXR environment depth swapchain textures via wgpu.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+pub fn create_depth_texture_from_gl(
+    device: &Device,
+    gl_texture: u32,
+    width: u32,
+    height: u32,
+    layers: u32,
+    format: TextureFormat,
+) -> Texture {
+    use std::num::NonZeroU32;
+    use wgpu::{
+        TextureUses,
+        hal::{self, MemoryFlags, api},
+    };
+
+    let size = Extent3d {
+        width,
+        height,
+        depth_or_array_layers: layers,
+    };
+
+    unsafe {
+        let hal_texture = device.as_hal::<api::Gles, _, _>(|device| {
+            device.unwrap().texture_from_raw(
+                NonZeroU32::new(gl_texture).unwrap(),
+                &hal::TextureDescriptor {
+                    label: None,
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format,
+                    usage: TextureUses::RESOURCE,
+                    memory_flags: MemoryFlags::empty(),
+                    view_formats: vec![],
+                },
+                Some(Box::new(|| ())),
+            )
+        });
+
+        device.create_texture_from_hal::<api::Gles>(
+            hal_texture,
+            &TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        )
+    }
+}
+
 // This is used to convert OpenXR swapchains to wgpu
 pub fn create_gl_swapchain(
     device: &Device,
@@ -209,8 +267,8 @@ pub struct GraphicsContext {
     #[cfg(not(any(windows, target_os = "macos", target_os = "ios")))]
     adapter: wgpu::Adapter,
 
-    device: Device,
-    queue: Queue,
+    pub device: Device,
+    pub queue: Queue,
     pub egl_display: egl::Display,
     pub egl_config: egl::Config,
     pub egl_context: egl::Context,

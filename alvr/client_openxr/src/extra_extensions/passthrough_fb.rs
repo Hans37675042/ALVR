@@ -34,6 +34,10 @@ impl PassthroughFB {
             ))?
         };
 
+        if platform.is_yvr() {
+            unsafe { super::xr_res((ext_fns.passthrough_start)(handle))? };
+        }
+
         let mut layer_handle = sys::PassthroughLayerFB::NULL;
         let info = sys::PassthroughLayerCreateInfoFB {
             ty: sys::PassthroughLayerCreateInfoFB::TYPE,
@@ -57,11 +61,6 @@ impl PassthroughFB {
             space: sys::Space::NULL,
             layer_handle,
         };
-
-        // HACK: YVR runtime seems to ignore IS_RUNNING_AT_CREATION on versions <= 3.0.1
-        if platform.is_yvr() {
-            unsafe { super::xr_res((ext_fns.passthrough_start)(handle))? };
-        }
 
         Ok(Self {
             handle,

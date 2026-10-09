@@ -6,7 +6,7 @@ use alvr_common::{
 };
 use alvr_session::{
     ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
-    Settings,
+    Settings, XrDataConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json as json;
@@ -22,6 +22,8 @@ pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
 pub const STATISTICS: u16 = 4;
+pub const DEPTH: u16 = 5;
+pub const CAMERA: u16 = 6;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoStreamingCapabilitiesExt {
@@ -157,6 +159,10 @@ pub enum ServerControlPacket {
     Restarting,
     KeepAlive,
     RealTimeConfig(RealTimeConfig),
+    XrStreamControl {
+        depth_enabled: bool,
+        camera_enabled: bool,
+    },
     Reserved(String),
     ReservedBuffer(Vec<u8>),
 }
@@ -247,6 +253,45 @@ pub struct Haptics {
     pub amplitude: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub enum DepthFrameFormat {
+    RawD16,
+    H264,
+    Lz4D16,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DepthFrameHeader {
+    pub timestamp: Duration,
+    pub head_pose: Pose,
+    pub width: u32,
+    pub height: u32,
+    pub near_z: f32,
+    pub far_z: f32,
+    pub format: DepthFrameFormat,
+    // Camera intrinsics per eye (fx, fy, cx, cy)
+    pub intrinsics: [[f32; 4]; 2],
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CameraFrameHeader {
+    pub timestamp: Duration,
+    pub head_pose: Pose,
+    pub width: u32,
+    pub height: u32,
+    pub format: CameraFrameFormat,
+    // Camera intrinsics (fx, fy, cx, cy)
+    pub intrinsics: [f32; 4],
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub enum CameraFrameFormat {
+    Jpeg,
+    Nv12,
+    Rgb8,
+    H264,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub enum PathSegment {
     Name(String),
@@ -330,6 +375,7 @@ pub struct RealTimeConfig {
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub cpu_performance_level: Option<PerformanceLevel>,
     pub gpu_performance_level: Option<PerformanceLevel>,
+    pub xr_data_config: Option<XrDataConfig>,
     pub ext_str: String,
 }
 
@@ -344,6 +390,7 @@ impl RealTimeConfig {
                 .into_option(),
             cpu_performance_level: settings.headset.performance_level.clone().cpu.into_option(),
             gpu_performance_level: settings.headset.performance_level.clone().gpu.into_option(),
+            xr_data_config: settings.video.xr_data.clone().into_option(),
             ext_str: String::new(), // No extensions for now
         }
     }
