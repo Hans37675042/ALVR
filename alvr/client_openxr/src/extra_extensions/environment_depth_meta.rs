@@ -427,7 +427,6 @@ impl EnvironmentDepthMeta {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn stop(&mut self) -> xr::Result<()> {
         if self.started {
             unsafe {

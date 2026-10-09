@@ -837,6 +837,18 @@ impl StreamContext {
                 cam.destroy_async();
             }
         }
+        // A started provider keeps the runtime computing depth even when nothing reads it.
+        // maybe_enqueue_depth() starts it again (and re-enumerates its images) when re-enabled.
+        if !depth
+            && self.xr_depth_enabled
+            && let Some(provider) = &mut self.depth_provider
+            && provider.is_started()
+        {
+            match provider.stop() {
+                Ok(()) => alvr_common::info!("[XR_DATA] Depth provider stopped (stream disabled)"),
+                Err(e) => alvr_common::warn!("[XR_DATA] Failed to stop depth provider: {e:?}"),
+            }
+        }
         self.xr_depth_enabled = depth;
         self.xr_camera_enabled = camera;
     }
