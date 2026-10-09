@@ -335,6 +335,13 @@ impl<M> SendWorker<M> {
     }
 }
 
+/// Whether the capture with this index runs the per-step GL diagnostics (framebuffer status and
+/// glGetError after every step). Other captures only read the sticky GL error flag once at the
+/// end, which still catches a failed step but cannot say which one.
+pub fn detailed_gl_check_due(capture_index: u64) -> bool {
+    capture_index < 20 || capture_index % 100 == 0
+}
+
 /// Copies `views` stacked images of `rows_per_view` rows each from `src` (bottom-up rows, as
 /// glReadPixels returns them, `src_row_stride` bytes apart) into `dst` with top-down rows of
 /// `row_bytes` bytes, flipping each view vertically.

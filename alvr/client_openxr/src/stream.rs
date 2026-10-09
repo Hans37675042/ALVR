@@ -5,7 +5,8 @@ use crate::{
 use alvr_client_core::{
     ClientCoreContext,
     depth_pipeline::{
-        CapturePacer, SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows, send_link,
+        CapturePacer, SendLink, SlotEvent, SlotRing, StageSet, SubmitOutcome, copy_flipped_rows,
+        detailed_gl_check_due, send_link,
     },
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
@@ -248,6 +249,16 @@ impl DepthReadback {
     ) -> Result<glow::NativeFence, String> {
         let (w, h) = (self.tex_width as i32, self.tex_height as i32);
         let view_bytes = Self::pack_row_stride(self.tex_width) * self.tex_height as usize;
+        // glGetError and framebuffer status queries can be costly on some drivers; most captures
+        // only check the sticky error flag once at the end
+        let detailed = detailed_gl_check_due(self.frame_count as u64);
+        let step_error = |gl: &glow::Context| {
+            if detailed {
+                unsafe { gl.get_error() }
+            } else {
+                glow::NO_ERROR
+            }
+        };
         let mut failure = None;
         unsafe {
             gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbos[slot]));
@@ -261,14 +272,18 @@ impl DepthReadback {
                     0,
                     eye as i32,
                 );
-                let read_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-                let attach_err = gl.get_error();
+                let read_status = if detailed {
+                    gl.check_framebuffer_status(glow::FRAMEBUFFER)
+                } else {
+                    glow::FRAMEBUFFER_COMPLETE
+                };
+                let attach_err = step_error(gl);
 
                 // Step 2: Blit depth from runtime FBO → local D16 FBO
                 gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_read));
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_write));
                 gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::DEPTH_BUFFER_BIT, glow::NEAREST);
-                let blit_err = gl.get_error();
+                let blit_err = step_error(gl);
 
                 // Step 3: CopyImageSubData from local D16 → R16UI (bitwise, both 16-bit)
                 gl.copy_image_sub_data(
@@ -288,7 +303,7 @@ impl DepthReadback {
                     h,
                     1,
                 );
-                let copy_err = gl.get_error();
+                let copy_err = step_error(gl);
 
                 // Step 4: Integer ReadPixels from R16UI into this view's part of the pack buffer
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo_r16ui));
@@ -301,7 +316,7 @@ impl DepthReadback {
                     glow::UNSIGNED_SHORT,
                     glow::PixelPackData::BufferOffset((eye as usize * view_bytes) as u32),
                 );
-                let read_err = gl.get_error();
+                let read_err = step_error(gl);
 
                 let errors = [attach_err, blit_err, copy_err, read_err];
                 if read_status != glow::FRAMEBUFFER_COMPLETE
@@ -317,6 +332,12 @@ impl DepthReadback {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.frame_count += 1;
 
+            if !detailed {
+                let err = gl.get_error();
+                if err != glow::NO_ERROR {
+                    failure = Some(format!("GL error {err:#x} (step unknown)"));
+                }
+            }
             if let Some(failure) = failure {
                 return Err(failure);
             }
