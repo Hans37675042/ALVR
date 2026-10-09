@@ -18,7 +18,8 @@ static TYPE_ENVIRONMENT_DEPTH_IMAGE_VIEW_META: LazyLock<xr::StructureType> =
     LazyLock::new(|| xr::StructureType::from_raw(1000291004));
 static TYPE_ENVIRONMENT_DEPTH_IMAGE_META: LazyLock<xr::StructureType> =
     LazyLock::new(|| xr::StructureType::from_raw(1000291005));
-// 1000291006 = HAND_REMOVAL_SET_INFO_META (skipped)
+static TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META: LazyLock<xr::StructureType> =
+    LazyLock::new(|| xr::StructureType::from_raw(1000291006));
 static TYPE_SYSTEM_ENVIRONMENT_DEPTH_PROPERTIES_META: LazyLock<xr::StructureType> =
     LazyLock::new(|| xr::StructureType::from_raw(1000291007));
 
@@ -42,6 +43,13 @@ struct XrEnvironmentDepthProviderCreateInfoMETA {
     ty: xr::StructureType,
     next: *const c_void,
     create_flags: u64,
+}
+
+#[repr(C)]
+struct XrEnvironmentDepthHandRemovalSetInfoMETA {
+    ty: xr::StructureType,
+    next: *const c_void,
+    enabled: sys::Bool32,
 }
 
 #[repr(C)]
@@ -101,6 +109,11 @@ type StartEnvironmentDepthProviderMETA =
 
 type StopEnvironmentDepthProviderMETA =
     unsafe extern "system" fn(XrEnvironmentDepthProviderMETA) -> sys::Result;
+
+type SetEnvironmentDepthHandRemovalMETA = unsafe extern "system" fn(
+    XrEnvironmentDepthProviderMETA,
+    *const XrEnvironmentDepthHandRemovalSetInfoMETA,
+) -> sys::Result;
 
 type CreateEnvironmentDepthSwapchainMETA = unsafe extern "system" fn(
     XrEnvironmentDepthProviderMETA,
@@ -185,6 +198,9 @@ impl EnvironmentDepthMeta {
         }
 
         // Try to create provider even if props say unsupported (diagnostic)
+        let supports_hand_removal = props_result
+            .as_ref()
+            .is_ok_and(|p| bool::from(p.supports_hand_removal));
         let depth_supported = props_result
             .map(|p| bool::from(p.supports_environment_depth))
             .unwrap_or(false);
@@ -230,6 +246,29 @@ impl EnvironmentDepthMeta {
             )).map_err(|e| { alvr_common::error!("[XR_DIAG] Depth init step 2 FAILED: xrCreateEnvironmentDepthProviderMETA returned {e:?}"); e })?;
         }
         alvr_common::error!("[XR_DIAG] Depth init step 2: provider created OK (handle={provider})");
+
+        // Hands in front of the headset would otherwise show up as room geometry
+        if supports_hand_removal {
+            match get_instance_proc::<_, SetEnvironmentDepthHandRemovalMETA>(
+                &session,
+                "xrSetEnvironmentDepthHandRemovalMETA",
+            ) {
+                Ok(set_hand_removal) => {
+                    let info = XrEnvironmentDepthHandRemovalSetInfoMETA {
+                        ty: *TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META,
+                        next: ptr::null(),
+                        enabled: sys::TRUE,
+                    };
+                    let result = unsafe { set_hand_removal(provider, &info) };
+                    alvr_common::info!("[XR_DIAG] Depth hand removal enabled: {result:?}");
+                }
+                Err(e) => alvr_common::error!(
+                    "[XR_DIAG] Failed to load xrSetEnvironmentDepthHandRemovalMETA: {e:?}"
+                ),
+            }
+        } else {
+            alvr_common::info!("[XR_DIAG] Depth hand removal not supported");
+        }
 
         // Create swapchain
         alvr_common::error!("[XR_DIAG] Depth init step 3: creating swapchain...");
