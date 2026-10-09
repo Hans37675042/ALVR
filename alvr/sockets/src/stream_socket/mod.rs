@@ -376,3 +376,107 @@ impl StreamSocket {
         self.receive_socket.recv(&self.queues)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Log = Arc<std::sync::Mutex<Vec<(u16, u32, usize, Vec<u8>)>>>;
+
+    /// Records what reaches the socket: (stream id, packet index, piece, packet bytes).
+    struct RecordingWriter {
+        pieces: usize,
+        log: Log,
+    }
+
+    impl MultiplexedSocketWriter for RecordingWriter {
+        fn payload_offset(&self) -> usize {
+            0
+        }
+
+        fn send(&mut self, stream_id: u16, packet_index: u32, buffer: &mut Vec<u8>) -> Result<()> {
+            for piece in 0..self.piece_count(buffer.len()) {
+                self.send_piece(stream_id, packet_index, buffer, piece)?;
+            }
+            Ok(())
+        }
+
+        fn piece_count(&self, _buffer_len: usize) -> usize {
+            self.pieces
+        }
+
+        fn send_piece(
+            &mut self,
+            stream_id: u16,
+            packet_index: u32,
+            buffer: &mut Vec<u8>,
+            piece: usize,
+        ) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap()
+                .push((stream_id, packet_index, piece, buffer.clone()));
+            Ok(())
+        }
+    }
+
+    fn recording_sender(pieces: usize) -> (StreamSender<u8>, Log) {
+        let log = Log::default();
+        let writer: Box<dyn MultiplexedSocketWriter + Send> = Box::new(RecordingWriter {
+            pieces,
+            log: Arc::clone(&log),
+        });
+        let sender = StreamSender {
+            inner: Arc::new(Mutex::new(writer)),
+            stream_id: 5,
+            payload_offset: 0,
+            next_packet_index: 0,
+            used_buffers: vec![],
+            _phantom: PhantomData,
+        };
+        (sender, log)
+    }
+
+    #[test]
+    fn try_send_skips_the_packet_while_another_sender_holds_the_socket() {
+        let (mut sender, log) = recording_sender(1);
+        let socket = Arc::clone(&sender.inner);
+
+        let busy = socket.lock();
+        assert!(!sender.try_send_header(&7).unwrap());
+        drop(busy);
+        assert!(log.lock().unwrap().is_empty());
+
+        // The skipped packet did not use up a packet index
+        assert!(sender.try_send_header(&7).unwrap());
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].0, log[0].1), (5, 0));
+    }
+
+    #[test]
+    fn interleaved_send_sends_every_piece_of_a_packet_in_order() {
+        let (mut sender, log) = recording_sender(3);
+        sender
+            .send_header_with_payload_interleaved(&1, &[10, 11, 12])
+            .unwrap();
+        sender.send_header(&2).unwrap();
+
+        let log = log.lock().unwrap();
+        let sent: Vec<_> = log.iter().map(|(s, i, p, _)| (*s, *i, *p)).collect();
+        assert_eq!(
+            sent,
+            [(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 1, 0), (5, 1, 1), (5, 1, 2)]
+        );
+        assert!(log[..3].iter().all(|(.., bytes)| bytes.ends_with(&[10, 11, 12])));
+    }
+
+    #[test]
+    fn interleaved_send_releases_the_socket_when_done() {
+        let (mut sender, _log) = recording_sender(4);
+        sender
+            .send_header_with_payload_interleaved(&1, &[0; 64])
+            .unwrap();
+        assert!(!sender.inner.is_locked());
+    }
+}
