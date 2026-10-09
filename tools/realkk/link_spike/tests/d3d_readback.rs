@@ -75,12 +75,15 @@ fn reads_both_slices_stacked_top_down() {
         }
     };
 
-    let bytes = d3d.read_depth_slices(tex.as_raw()).expect("readback");
+    let bytes = d3d.read_depth_slices(tex.as_raw(), W, H).expect("readback");
     let got: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     let mut expected = slice_values(0);
     expected.extend(slice_values(1));
     assert_eq!(got, expected);
 
     // Second read reuses the cached staging texture.
-    assert_eq!(d3d.read_depth_slices(tex.as_raw()).unwrap(), bytes);
+    assert_eq!(d3d.read_depth_slices(tex.as_raw(), W, H).unwrap(), bytes);
+
+    // A size that disagrees with the swapchain state is an error, not a mis-shaped frame.
+    assert!(d3d.read_depth_slices(tex.as_raw(), W, H + 1).is_err());
 }
