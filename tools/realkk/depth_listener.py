@@ -6,18 +6,32 @@ The ALVR streamer connects *to* this listener (default 127.0.0.1:9944) when
 prints resolution / near / far / per-view FOV and the measured fps, and can
 optionally dump decoded frames as .npy files.
 
+--tap records every relay message verbatim (with host receive time) into a .rktap file
+that tap_replay.py can play back and tap_inspect.py can summarise; see rktap.py for the
+format. Socket reads run on their own thread and only hand messages to a queue, so a slow
+disk or --dump never stalls the relay (it drops the viewer after a 500 ms write timeout).
+
 Standard library only; --dump additionally needs numpy and lz4 (pip install numpy lz4).
 
 Usage:
     python depth_listener.py [--port 9944] [--seconds 30] [--dump OUT_DIR]
+                             [--tap FILE.rktap [--mark-key]] [--camera]
 """
 
 import argparse
 import math
+import queue
 import socket
 import struct
+import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import rktap
+
+LISTENER_VERSION = "0.2.0"
 
 MSG_CAMERA_FRAME = 2
 MSG_DEPTH_FRAME_V2 = 3
@@ -76,12 +90,49 @@ def decode_d16(header, data):
     return np.frombuffer(raw, dtype="<u2").reshape(header["height"], header["width"])
 
 
+def read_messages(sock, out, recorder):
+    """Socket reader thread: drain the relay as fast as possible, never touching the disk."""
+    try:
+        while True:
+            msg_type, length = struct.unpack("<II", recv_exact(sock, 8))
+            payload = recv_exact(sock, length)
+            recv_ns = time.time_ns()
+            if recorder is not None:
+                recorder.put(recv_ns, msg_type, payload)
+            out.put((recv_ns, msg_type, payload))
+    except (ConnectionError, OSError) as e:
+        out.put(e)
+
+
+def read_marks(recorder):
+    """Each Enter on the terminal writes a marker record; typed text becomes its label."""
+    n = 0
+    for line in sys.stdin:
+        n += 1
+        label = line.strip() or "mark %d" % n
+        now = time.time_ns()
+        recorder.put(now, rktap.MSG_MARKER, rktap.marker_payload(label, now))
+        print("marker #%d '%s' at %s" % (n, label, rktap.utc_iso(now)), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=9944)
-    ap.add_argument("--seconds", type=float, default=30.0)
+    ap.add_argument("--seconds", type=float, default=30.0, help="0 = until Ctrl+C or disconnect")
     ap.add_argument("--dump", type=Path, default=None, help="directory for .npy frames")
+    ap.add_argument("--tap", type=Path, default=None, help="record every relay message to this .rktap file")
+    ap.add_argument("--mark-key", action="store_true",
+                    help="with --tap: press Enter (optionally after typing a label) to write a marker")
+    ap.add_argument("--camera", action="store_true", help="also enable the camera feed")
     args = ap.parse_args()
+    if args.mark_key and not args.tap:
+        ap.error("--mark-key needs --tap")
+    if args.dump:
+        try:
+            import lz4.block  # noqa: F401
+            import numpy  # noqa: F401
+        except ImportError as e:
+            sys.exit("--dump needs numpy and lz4 (pip install numpy lz4): %s" % e)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -90,20 +141,46 @@ def main():
     print("waiting for ALVR streamer on 127.0.0.1:%d (it retries every 5 s)..." % args.port)
     sock, addr = srv.accept()
     print("streamer connected from", addr)
-    send_control(sock, STREAM_DEPTH, True)
-    send_control(sock, STREAM_CAMERA, False)
+    feeds = {"depth": True, "camera": args.camera}
+    send_control(sock, STREAM_DEPTH, feeds["depth"])
+    send_control(sock, STREAM_CAMERA, feeds["camera"])
 
     if args.dump:
         args.dump.mkdir(parents=True, exist_ok=True)
+
+    recorder = None
+    if args.tap:
+        args.tap.parent.mkdir(parents=True, exist_ok=True)
+        recorder = rktap.TapRecorder(args.tap, {
+            "recording_start_utc": datetime.now(timezone.utc).isoformat(),
+            "listener_version": LISTENER_VERSION,
+            "feeds": feeds,
+            "port": args.port,
+            "marker_msg_type": rktap.MSG_MARKER,
+        })
+        print("recording relay messages to", args.tap)
+        if args.mark_key:
+            threading.Thread(target=read_marks, args=(recorder,), daemon=True).start()
+            print("press Enter (optionally type a label first) to write a marker")
+
+    messages = queue.Queue()
+    reader = threading.Thread(target=read_messages, args=(sock, messages, recorder), daemon=True)
+    reader.start()
 
     start = time.monotonic()
     first = None
     count = 0
     nbytes = 0
     try:
-        while time.monotonic() - start < args.seconds:
-            msg_type, length = struct.unpack("<II", recv_exact(sock, 8))
-            payload = recv_exact(sock, length)
+        while args.seconds <= 0 or time.monotonic() - start < args.seconds:
+            try:
+                item = messages.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if isinstance(item, Exception):
+                print("streamer disconnected:", item)
+                break
+            _, msg_type, payload = item
             if msg_type != MSG_DEPTH_FRAME_V2:
                 continue
             header, data = parse_depth_v2(payload)
@@ -133,10 +210,23 @@ def main():
                 elapsed = time.monotonic() - first
                 print("%d frames, %.2f fps, %.2f Mbps"
                       % (count, (count - 1) / elapsed if elapsed else 0, nbytes * 8 / elapsed / 1e6 if elapsed else 0))
+    except KeyboardInterrupt:
+        print("stopped")
     finally:
-        send_control(sock, STREAM_DEPTH, False)
+        try:
+            send_control(sock, STREAM_DEPTH, False)
+            send_control(sock, STREAM_CAMERA, False)
+        except OSError:
+            pass
         sock.close()
         srv.close()
+        reader.join(2)
+        if recorder is not None:
+            print("flushing %d queued messages to %s ..." % (recorder.pending(), args.tap))
+            recorder.close()
+            if recorder.error is not None:
+                print("tap write error:", recorder.error)
+            print("tap: %d messages written" % recorder.written)
 
     if first is None:
         print("no depth frames received")
