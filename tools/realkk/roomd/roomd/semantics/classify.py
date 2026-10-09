@@ -135,6 +135,12 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
             patch_ok[k] = hi - lo <= p.patch_max_range
         patch_mean = np.bincount(pl, weights=pr, minlength=npatch) / np.maximum(counts, 1)
         big = patch_ok & (counts * cell_area >= p.min_object_area)
+        for k in np.nonzero(big)[0]:
+            # only solid patches (a table top, not the ring of a clothes pile) split blobs
+            iz, ix = np.nonzero(patches == k)
+            _, _, _, eu, ev = min_area_rect(raster.centres(iz, ix))
+            rect = (eu + raster.cell) * (ev + raster.cell)
+            big[k] = counts[k] * cell_area >= p.split_patch_fill * rect
         pieces, n = _split_by_patches(pieces, n, patches, big, patch_mean, p)
 
     iz_all, ix_all = np.nonzero(pieces >= 0)
@@ -153,7 +159,7 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
         short[k] = min(eu, ev) + raster.cell
 
     # thin, higher pieces (backrests, arms, headboards) attach to their lower neighbour
-    adj = adjacency_counts(pieces)
+    adj = adjacency_counts(pieces, p.attach_reach)
     nbrs = {}
     for (a, b), cnt in adj.items():
         nbrs.setdefault(a, []).append((b, cnt))

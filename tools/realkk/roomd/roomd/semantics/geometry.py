@@ -51,8 +51,10 @@ def rasterize_max(points, cell) -> Raster:
     pts = np.asarray(points, dtype=float)
     if len(pts) == 0:
         return Raster(cell, 0.0, 0.0, np.full((0, 0), np.nan))
-    ox = math.floor(pts[:, 0].min() / cell) * cell - cell
-    oz = math.floor(pts[:, 2].min() / cell) * cell - cell
+    # Points on a lattice (TSDF voxel columns, sampled grids) must sit mid-cell: on a
+    # cell edge, float rounding splits neighbours and leaves empty rows.
+    ox = _aligned_origin(pts[:, 0], cell)
+    oz = _aligned_origin(pts[:, 2], cell)
     ix = np.floor((pts[:, 0] - ox) / cell).astype(int)
     iz = np.floor((pts[:, 2] - oz) / cell).astype(int)
     w, h = ix.max() + 2, iz.max() + 2
@@ -60,7 +62,27 @@ def rasterize_max(points, cell) -> Raster:
     np.maximum.at(flat, iz * w + ix, pts[:, 1])
     top = flat.reshape(h, w)
     top[np.isneginf(top)] = np.nan
-    return Raster(cell, ox, oz, top)
+    return Raster(cell, ox, oz, _fill_dropouts(top))
+
+
+def _aligned_origin(v, cell):
+    """Grid origin below min(v) whose cell centres match the dominant lattice phase of v."""
+    a = 2 * math.pi * (v / cell)
+    phase = math.atan2(np.sin(a).mean(), np.cos(a).mean()) / (2 * math.pi)
+    return (math.floor(v.min() / cell) - 2 + (phase - 0.5) % 1.0) * cell
+
+
+def _fill_dropouts(top):
+    """Fill empty cells that have at least 3 of their 4 edge neighbours (sampling
+    dropouts) with the neighbours' max."""
+    pad = np.pad(top, 1, constant_values=np.nan)
+    nb = np.stack([pad[:-2, 1:-1], pad[2:, 1:-1], pad[1:-1, :-2], pad[1:-1, 2:]])
+    count = np.isfinite(nb).sum(axis=0)
+    hole = np.isnan(top) & (count >= 3)
+    if hole.any():
+        top = top.copy()
+        top[hole] = np.nanmax(nb[:, hole], axis=0)
+    return top
 
 
 def _shift_pairs(shape, dy, dx):
@@ -167,10 +189,13 @@ def linear_assignment(cost):
     return rows[order], cols[order]
 
 
-def adjacency_counts(labels):
-    """{(a, b): shared 8-neighbour pairs} for distinct labels a < b (both >= 0)."""
+def adjacency_counts(labels, reach=1):
+    """{(a, b): cell pairs within ``reach`` cells (Chebyshev)} for distinct labels
+    a < b (both >= 0); reach 1 = shared 8-neighbour pairs."""
     counts = {}
-    for dy, dx in _NEIGHBOUR_SHIFTS:
+    shifts = [(dy, dx) for dy in range(reach + 1) for dx in range(-reach, reach + 1)
+              if dy > 0 or dx > 0]
+    for dy, dx in shifts:
         a, b = _shift_pairs(labels.shape, dy, dx)
         la, lb = labels[a], labels[b]
         ok = (la >= 0) & (lb >= 0) & (la != lb)

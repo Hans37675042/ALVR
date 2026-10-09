@@ -14,6 +14,7 @@ class SemanticsParams:
     blob_max_h: float = 2.0            # m above floor; higher = structure, ignored
     split_dh: float = 0.10             # m, neighbour step that cuts a blob in two
     split_patch_dh: float = 0.03       # m, two large flat patches this far apart split a blob
+    split_patch_fill: float = 0.6      # ... if each fills this much of its min-area rectangle
     patch_tol: float = 0.02            # m, neighbour step inside one horizontal patch
     patch_max_range: float = 0.05      # m, 5-95 percentile height range a patch may span
     patch_min_area: float = 0.03       # m^2
@@ -21,6 +22,7 @@ class SemanticsParams:
     min_object_area: float = 0.04      # m^2
     thin_max: float = 0.30             # m, short side of a piece that may be a backrest/arm
     attach_min_rise: float = 0.05      # m, thin piece must be this much higher to attach
+    attach_reach: int = 2              # cells; TSDF leaves a gap at seat/backrest edges
 
     # --- classification (R15 table)
     flat_min_ratio: float = 0.5        # main patch area / base area
