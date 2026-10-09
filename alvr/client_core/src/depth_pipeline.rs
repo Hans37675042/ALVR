@@ -188,4 +188,159 @@ mod tests {
         assert!(!pacer.is_due(t0 + Duration::from_millis(99)));
         assert!(pacer.is_due(t0 + Duration::from_millis(100)));
     }
+
+    // Mock fence: an id; the test decides which ids the "GPU" has signaled
+    type Ring = SlotRing<u32, &'static str>;
+
+    fn poll(ring: &mut Ring, frame: u64, signaled: &[u32]) -> Option<SlotEvent<u32, &'static str>> {
+        ring.poll_one(frame, 30, |fence| signaled.contains(fence))
+    }
+
+    #[test]
+    fn ring_hands_out_free_slots_round_robin() {
+        let mut ring = Ring::new(3);
+        let a = ring.free_slot().unwrap();
+        ring.submit(a, 1, "a", 0);
+        let b = ring.free_slot().unwrap();
+        ring.submit(b, 2, "b", 1);
+        assert_ne!(a, b);
+        assert_eq!(ring.pending(), 2);
+    }
+
+    #[test]
+    fn ring_keeps_unsignaled_slots_pending() {
+        let mut ring = Ring::new(3);
+        ring.submit(ring.free_slot().unwrap(), 1, "a", 0);
+        assert!(poll(&mut ring, 1, &[]).is_none());
+        assert!(poll(&mut ring, 2, &[]).is_none());
+        assert_eq!(ring.pending(), 1);
+    }
+
+    #[test]
+    fn ring_returns_signaled_slot_with_its_metadata_and_frees_it() {
+        let mut ring = Ring::new(3);
+        let slot = ring.free_slot().unwrap();
+        ring.submit(slot, 7, "header of frame 10", 10);
+        match poll(&mut ring, 12, &[7]) {
+            Some(SlotEvent::Ready {
+                slot: s,
+                fence,
+                meta,
+                latency_frames,
+            }) => {
+                assert_eq!((s, fence, meta, latency_frames), (slot, 7, "header of frame 10", 2));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(ring.pending(), 0);
+        assert!(poll(&mut ring, 13, &[7]).is_none());
+    }
+
+    #[test]
+    fn ring_completes_oldest_first_and_metadata_follows_its_slot() {
+        let mut ring = Ring::new(3);
+        // Submit in an order that does not match slot indices once slots get reused
+        let s0 = ring.free_slot().unwrap();
+        ring.submit(s0, 1, "first", 0);
+        let s1 = ring.free_slot().unwrap();
+        ring.submit(s1, 2, "second", 1);
+        assert!(matches!(poll(&mut ring, 2, &[1]), Some(SlotEvent::Ready { meta: "first", .. })));
+        let s2 = ring.free_slot().unwrap();
+        ring.submit(s2, 3, "third", 2);
+        let s3 = ring.free_slot().unwrap();
+        ring.submit(s3, 4, "fourth", 3);
+        assert_eq!(s3, s0, "the freed slot is reused");
+        let signaled = [2, 3, 4];
+        let order: Vec<_> = std::iter::from_fn(|| poll(&mut ring, 4, &signaled))
+            .map(|e| match e {
+                SlotEvent::Ready { meta, .. } => meta,
+                SlotEvent::Expired { meta, .. } => panic!("expired {meta}"),
+            })
+            .collect();
+        assert_eq!(order, ["second", "third", "fourth"]);
+    }
+
+    #[test]
+    fn full_ring_has_no_free_slot() {
+        let mut ring = Ring::new(3);
+        for i in 0..3 {
+            ring.submit(ring.free_slot().unwrap(), i, "x", i as u64);
+        }
+        assert!(ring.free_slot().is_none());
+    }
+
+    #[test]
+    fn ring_expires_slots_stuck_past_the_timeout() {
+        let mut ring = Ring::new(3);
+        ring.submit(ring.free_slot().unwrap(), 9, "stuck", 100);
+        assert!(poll(&mut ring, 130, &[]).is_none());
+        match poll(&mut ring, 131, &[]) {
+            Some(SlotEvent::Expired { fence, meta, .. }) => assert_eq!((fence, meta), (9, "stuck")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(ring.pending(), 0);
+        assert!(ring.free_slot().is_some());
+    }
+
+    #[test]
+    fn ring_drain_returns_every_pending_fence() {
+        let mut ring = Ring::new(3);
+        ring.submit(ring.free_slot().unwrap(), 1, "a", 0);
+        ring.submit(ring.free_slot().unwrap(), 2, "b", 1);
+        let mut fences = ring.drain();
+        fences.sort();
+        assert_eq!(fences, [1, 2]);
+        assert_eq!(ring.pending(), 0);
+    }
+
+    /// The flip the depth uplink used before the PBO path (in-place row swap), kept as oracle.
+    fn legacy_flip(depth_bytes: &mut [u8], width: usize, height: usize) {
+        let u16_byte_count = width * height * 2;
+        let row_bytes = width * 2;
+        let h = height;
+        for eye in 0..2usize {
+            let eye_offset = eye * u16_byte_count;
+            for row in 0..h / 2 {
+                let top = eye_offset + row * row_bytes;
+                let bot = eye_offset + (h - 1 - row) * row_bytes;
+                for col in 0..row_bytes {
+                    depth_bytes.swap(top + col, bot + col);
+                }
+            }
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn flipped_copy_matches_the_legacy_in_place_flip() {
+        for (w, h) in [(320, 320), (5, 3), (4, 4), (1, 1)] {
+            let src = pattern(w * h * 2 * 2);
+            let mut expected = src.clone();
+            legacy_flip(&mut expected, w, h);
+            let mut dst = vec![0u8; src.len()];
+            copy_flipped_rows(&src, w * 2, &mut dst, w * 2, h, 2);
+            assert_eq!(dst, expected, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn flipped_copy_skips_source_row_padding() {
+        // 3 px wide rows (6 bytes) stored with an 8-byte stride, 2 rows, 2 views
+        let (w, h, stride) = (3, 2, 8);
+        let mut src = vec![0xEEu8; stride * h * 2];
+        let mut packed = vec![];
+        for view_row in 0..h * 2 {
+            let row: Vec<u8> = (0..w * 2).map(|c| (view_row * 16 + c) as u8).collect();
+            src[view_row * stride..view_row * stride + w * 2].copy_from_slice(&row);
+            packed.extend(row);
+        }
+        let mut expected = packed.clone();
+        legacy_flip(&mut expected, w, h);
+        let mut dst = vec![0u8; packed.len()];
+        copy_flipped_rows(&src, stride, &mut dst, w * 2, h, 2);
+        assert_eq!(dst, expected);
+    }
 }
