@@ -716,4 +716,36 @@ mod tests {
         expected.extend([100, 200, 300, 400]);
         assert_eq!(checked, expected);
     }
+
+    #[test]
+    fn release_guard_without_fence_allows_acquire() {
+        let mut guard = ReleaseGuard::<u32>::default();
+        let mut deleted = vec![];
+        assert!(guard.try_release(|_| false, |f| deleted.push(f)));
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn release_guard_blocks_acquire_until_the_reads_finished() {
+        let mut guard = ReleaseGuard::default();
+        assert_eq!(guard.arm(7u32), None);
+        let mut deleted = vec![];
+        // GPU still reading the previous runtime image: no acquire, fence kept
+        assert!(!guard.try_release(|_| false, |f| deleted.push(f)));
+        assert!(!guard.try_release(|_| false, |f| deleted.push(f)));
+        assert!(deleted.is_empty());
+        // Reads done: acquire allowed, the fence is handed back exactly once
+        assert!(guard.try_release(|&f| f == 7, |f| deleted.push(f)));
+        assert!(guard.try_release(|_| false, |f| deleted.push(f)));
+        assert_eq!(deleted, [7]);
+    }
+
+    #[test]
+    fn release_guard_returns_a_replaced_fence() {
+        let mut guard = ReleaseGuard::default();
+        assert_eq!(guard.arm(1u32), None);
+        assert_eq!(guard.arm(2), Some(1));
+        assert_eq!(guard.take(), Some(2));
+        assert_eq!(guard.take(), None);
+    }
 }
