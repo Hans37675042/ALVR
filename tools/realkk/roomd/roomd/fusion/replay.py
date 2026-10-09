@@ -128,6 +128,8 @@ def main(argv=None):
     ap.add_argument("tap", type=Path, nargs="?")
     ap.add_argument("--out", type=Path, default=None, help="output directory (default: <tap>.fusion)")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--until", type=float, default=0.0, metavar="S",
+                    help="stop at this many seconds after the first tap record (host receive time)")
     ap.add_argument("--voxel", type=float, default=None, help="voxel size in metres")
     ap.add_argument("--flip-rows", action="store_true", help="depth rows are bottom-up")
     ap.add_argument("--make-synthetic", type=Path, default=None, metavar="FILE",
@@ -152,8 +154,10 @@ def main(argv=None):
     first_ns = last_ns = None
     t_start = time.perf_counter()
     for recv_ns, msg_type, payload in read_tap(args.tap):
-        counts["messages"] += 1
         first_ns = recv_ns if first_ns is None else first_ns
+        if args.until and (recv_ns - first_ns) / 1e9 > args.until:
+            break
+        counts["messages"] += 1
         last_ns = recv_ns
         if msg_type == MSG_MARKER:
             try:
