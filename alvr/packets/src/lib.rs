@@ -165,6 +165,11 @@ pub enum ServerControlPacket {
     },
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    /// Ask the client to send a fresh `ClientControlPacket::SceneSnapshot`. With `recapture`
+    /// the client may launch Space Setup (only honoured outside of streaming).
+    SceneRequest {
+        recapture: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -207,6 +212,66 @@ pub enum ClientControlPacket {
     ProximityState(bool),
     Reserved(String),
     ReservedBuffer(Vec<u8>),
+    SceneSnapshot(SceneSnapshot),
+}
+
+/// Raw 16-byte XrUuidEXT of a Quest scene anchor.
+pub type SceneUuid = [u8; 16];
+
+/// Canonical lowercase 8-4-4-4-12 form of a scene UUID, bytes in XrUuidEXT order
+/// (same as Python's `str(uuid.UUID(bytes=raw))`).
+pub fn scene_uuid_string(uuid: &SceneUuid) -> String {
+    let hex = uuid.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneRoom {
+    pub uuid: SceneUuid,
+    pub floor: Option<SceneUuid>,
+    pub ceiling: Option<SceneUuid>,
+    pub walls: Vec<SceneUuid>,
+}
+
+/// One scene anchor. Bounds are in the anchor's local space (XR_FB_scene conventions).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneAnchor {
+    pub uuid: SceneUuid,
+    /// Comma separated semantic labels as returned by xrGetSpaceSemanticLabelsFB.
+    pub labels: String,
+    /// Client STAGE space pose; None when the anchor could not be located.
+    pub pose: Option<Pose>,
+    /// x, y, width, height
+    pub bbox2d: Option<[f32; 4]>,
+    pub boundary2d: Option<Vec<[f32; 2]>>,
+    /// offset x, y, z, width, height, depth
+    pub bbox3d: Option<[f32; 6]>,
+}
+
+/// Triangle mesh of an anchor (e.g. GLOBAL_MESH); vertices are in the anchor's local space.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneMesh {
+    pub anchor_uuid: SceneUuid,
+    /// Client STAGE space pose of the mesh anchor.
+    pub pose: Pose,
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
+/// Quest Space Setup scene model, located in the client's STAGE reference space.
+/// An empty snapshot means the headset has no captured room.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SceneSnapshot {
+    pub rooms: Vec<SceneRoom>,
+    pub anchors: Vec<SceneAnchor>,
+    pub meshes: Vec<SceneMesh>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

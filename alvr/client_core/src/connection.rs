@@ -515,7 +515,9 @@ fn connection_pipeline(
                     }
                     Ok(ServerControlPacket::KeepAlive) => (),
                     Ok(
-                        ServerControlPacket::Reserved(_) | ServerControlPacket::ReservedBuffer(_),
+                        ServerControlPacket::Reserved(_)
+                        | ServerControlPacket::ReservedBuffer(_)
+                        | ServerControlPacket::SceneRequest { .. },
                     ) => {}
                     Err(ConnectionError::TryAgain(_)) => {
                         if Instant::now() > disconnection_deadline {
