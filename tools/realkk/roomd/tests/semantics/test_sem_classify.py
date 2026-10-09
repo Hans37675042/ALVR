@@ -240,3 +240,10 @@ def test_seat_under_a_loft_bed_is_not_sittable():
     room.place("loft", [Obb(0.0, -1.32, 0.0, 2.0, 0.9, 1.55, 1.65)])
     cands = detect(room).candidates
     assert not any(c.sittable for c in cands), [(c.kind, round(c.surface_h, 2)) for c in cands]
+
+
+@pytest.mark.parametrize("w,d", [(0.35, 0.29), (0.58, 0.36), (0.8, 0.3)])
+def test_small_surface_at_table_height_is_not_a_table(w, d):
+    # real tap: cabinet shelves and ledges at 0.7-0.8 m read as tables
+    c = _one(storage(0.0, 0.0, 20.0, w=w, d=d, h=0.75))
+    assert c.kind == "Other" and not c.sittable
