@@ -18,10 +18,10 @@ the nav heightmap pass through unchanged; `snapshot_outputs()` adds `objects` / 
 `walls` as `roomd.model` records. `FusionMapView` adapts TsdfFusion's queries
 (`Obb(center, half_extents, yaw_rad)`, `FloorPlane`, `Heightmap`).
 
-- Scene API objects from `set_scene_prior` become labels (kind priority, pose correction);
-  by default only `Source=Fused` objects are published because roomd already adds the
-  scene model's objects (`publish_scene_objects=True` publishes the tracked
-  `scene:<uuid>` objects too; roomd would then have to prefer them over its own copy).
+- Scene API objects from `set_scene_prior` become labels (kind priority, pose correction)
+  and are published as tracked `scene:<uuid>` objects that follow the fused geometry;
+  roomd's service replaces its own scene copy (and that object's seats) with the sink's
+  version. `publish_scene_objects=False` publishes only `Source=Fused` objects.
 - Walls: TsdfFusion's surface points are upward-only, so walls come from the scene prior.
 - User head = midpoint of the two depth view poses of the latest frame.
 - `on_playspace_changed` restarts tracking (the map is rebuilt in the new frame).
