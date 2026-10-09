@@ -7,6 +7,26 @@ RoomModel v2 (`docs/CONTRACT-roomd.md`); `roomd` I/O wraps it into ROOM_MODEL.
 Coordinates: Unity left-handed stage space, +Y up, metres. Yaw in degrees,
 clockwise from above; local +Z of an object is its front (seats face it).
 
+## Plugging into roomd
+
+```powershell
+uv run python -m roomd --fusion roomd.semantics:create_sink
+```
+
+`SemanticsSink` wraps the fusion sink (`roomd.fusion:create_sink`): depth, mesh chunks and
+the nav heightmap pass through unchanged; `snapshot_outputs()` adds `objects` / `seats` /
+`walls` as `roomd.model` records. `FusionMapView` adapts TsdfFusion's queries
+(`Obb(center, half_extents, yaw_rad)`, `FloorPlane`, `Heightmap`).
+
+- Scene API objects from `set_scene_prior` become labels (kind priority, pose correction);
+  by default only `Source=Fused` objects are published because roomd already adds the
+  scene model's objects (`publish_scene_objects=True` publishes the tracked
+  `scene:<uuid>` objects too; roomd would then have to prefer them over its own copy).
+- Walls: TsdfFusion's surface points are upward-only, so walls come from the scene prior.
+- User head = midpoint of the two depth view poses of the latest frame.
+- `on_playspace_changed` restarts tracking (the map is rebuilt in the new frame).
+- Needs only numpy (assignment and connected components are implemented here).
+
 ## API
 
 ```python
@@ -46,11 +66,12 @@ Meta anchor already converted to Unity stage space.
 
 ## Pipeline
 
-1. Upward surface points 5 cm–2 m above the floor -> 2 cm max-height raster.
+1. Upward surface points 5 cm–2 m above the floor -> 2 cm max-height raster, aligned to
+   the points' lattice phase (TSDF voxel columns) with single-cell dropouts filled.
 2. Blobs = 8-connected cells, cut where neighbours step > `split_dh`; a blob holding
-   two large flat patches more than `split_patch_dh` apart is split between them.
-3. Thin pieces (short side <= `thin_max`) higher than a neighbour attach to it
-   (backrests, arms, headboards).
+   two large solid flat patches more than `split_patch_dh` apart is split between them.
+3. Thin pieces (short side <= `thin_max`) higher than a neighbour within
+   `attach_reach` cells attach to it (backrests, arms, headboards).
 4. Main surface = largest horizontal patch (neighbour step <= 2 cm, 5–95 % range <= 5 cm).
 5. Classification (R15): Bed (>= 1.5 m², not couch-like) -> Chair/Couch (seat
    0.35–0.60, backrest >= 0.25 m above covering >= 60 % of the seat width; front =
@@ -76,6 +97,9 @@ All thresholds live in `SemanticsParams` (`params.py`) for on-device tuning.
 
 ## Known limits
 
+- Checked end to end on roomd.fusion's TsdfFusion with its SynthScene (72 rendered
+  frames): chair + table detected, a 1 m chair move kept its id via Moving, removal went
+  Missing -> Removed from carving evidence; no real Quest capture yet.
 - Synthetic tests pass up to 6 mm point noise; at 8 mm two touching objects of
   similar height (bed + nightstand) can merge.
 - Yaw-only boxes; no ICP refinement (R15 mentions ICP): pose comes from the
