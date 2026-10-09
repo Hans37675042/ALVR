@@ -122,3 +122,32 @@ def test_backrest_across_one_cell_gap_still_attaches():
     c = _one([seat, back])
     assert c.kind == "Chair" and c.has_back
     assert yaw_diff(c.yaw, 0.0) < 8.0
+
+
+class _SparsePoints:
+    """Real TSDF output: dense heightmap but only a fraction of upward surface points."""
+
+    def __init__(self, room, keep=0.12, seed=0):
+        self.room, self.keep = room, keep
+        self.rng = __import__("numpy").random.default_rng(seed)
+
+    def __getattr__(self, name):
+        return getattr(self.room, name)
+
+    def surface_points(self, min_y, max_y, region=None):
+        p, n = self.room.surface_points(min_y, max_y, region)
+        m = self.rng.uniform(size=len(p)) < self.keep
+        return p[m], n[m]
+
+
+@pytest.mark.parametrize("yaw", [0.0, 60.0])
+def test_sparse_points_still_find_chair_and_table_from_heightmap(yaw):
+    room = make_room()
+    room.place("c", chair(0.6, -0.6, yaw))
+    room.place("t", table(-0.8, 0.6, 0.0))
+    cands = detect(_SparsePoints(room)).candidates
+    kinds = sorted(c.kind for c in cands)
+    assert kinds == ["Chair", "Table"], [(c.kind, c.surface_h) for c in cands]
+    ch = next(c for c in cands if c.kind == "Chair")
+    assert abs(ch.surface_h - 0.45) < 0.03
+    assert yaw_diff(ch.yaw, yaw) < 12.0
