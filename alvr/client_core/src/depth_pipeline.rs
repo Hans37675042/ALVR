@@ -2,6 +2,8 @@
 //! readback slot ring, row flipping, send worker link). Nothing here touches GL or OpenXR, so it
 //! can be unit tested on the host; `alvr_client_openxr` drives it from the render thread.
 
+use std::time::{Duration, Instant};
+
 /// Percentile summary of one stage's samples since the last report.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StageSummary {
@@ -71,6 +73,35 @@ impl StageSet {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// Decides on which rendered frames a depth capture is due.
+///
+/// Captures follow a fixed schedule (`next_due += interval`) instead of "one interval after the
+/// last capture", so frame quantization does not stretch the period (at 72 Hz the latter turns
+/// 100 ms into 111 ms, i.e. 9 fps). After a stall the schedule restarts from the capture instead
+/// of catching up with a burst. Frames where nothing was captured do not touch the schedule, so
+/// the next frame retries.
+#[derive(Default)]
+pub struct CapturePacer {
+    next_due: Option<Instant>,
+}
+
+impl CapturePacer {
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.next_due.is_none_or(|due| now >= due)
+    }
+
+    /// A capture was taken (or attempted with GPU work) on this frame.
+    pub fn on_captured(&mut self, now: Instant, interval: Duration) {
+        let next = self.next_due.map_or(now + interval, |due| due + interval);
+        self.next_due = Some(if next <= now { now + interval } else { next });
+    }
+
+    /// Wait a full interval from now, e.g. after an error that should not be retried every frame.
+    pub fn defer(&mut self, now: Instant, interval: Duration) {
+        self.next_due = Some(now + interval);
     }
 }
 
