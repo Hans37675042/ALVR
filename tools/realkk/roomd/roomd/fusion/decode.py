@@ -159,25 +159,36 @@ def frame_from_header(header, raw, flip_rows=False) -> Optional[DepthFrame]:
     if np.all(raw == FAKE_SAMPLE):
         return None
     near, far = header["near_z"], header["far_z"]
-    if not (near > 0) or math.isnan(far) or far <= near:
-        raise ValueError("bad near/far %r/%r" % (near, far))
     half = raw.shape[0] // 2
-    views = []
+    depths = []
     for i in range(2):
         img = raw[i * half:(i + 1) * half]
-        if flip_rows:
-            img = img[::-1]
-        pose = header["view_poses"][i]
-        q = pose[:4]
-        p = pose[4:]
-        fx, fy, cx, cy = header["intrinsics"][i]
+        depths.append(d16_to_metric(img[::-1] if flip_rows else img, near, far))
+    poses = [tuple(p[4:]) + tuple(p[:4]) for p in header["view_poses"]]
+    return make_frame(depths, poses, header["intrinsics"], near, far, header["client_timestamp_ns"],
+                      header.get("server_timestamp_unix_ns"))
+
+
+def make_frame(depths, poses_xr, intrinsics, near, far, client_ts_ns=0, server_ts_ns=None) -> DepthFrame:
+    """Build a DepthFrame from per-view metric depth images.
+
+    depths: two (H, W) view-depth images in metres; 0, inf and NaN mean "no measurement".
+    poses_xr: two (px, py, pz, qx, qy, qz, qw) OpenXR stage poses (roomd.protocol order).
+    intrinsics: two (fx, fy, cx, cy).
+    """
+    if not (near > 0) or math.isnan(far) or far <= near:
+        raise ValueError("bad near/far %r/%r" % (near, far))
+    views = []
+    for depth, pose, (fx, fy, cx, cy) in zip(depths, poses_xr, intrinsics):
+        d = np.array(depth, dtype=np.float32)
+        d[~np.isfinite(d) | (d < 0)] = 0.0
+        p = pose[:3]
+        q = pose[3:]
         views.append(DepthView(
-            depth=np.ascontiguousarray(d16_to_metric(img, near, far)),
-            fx=fx, fy=fy, cx=cx, cy=cy,
+            depth=np.ascontiguousarray(d), fx=fx, fy=fy, cx=cx, cy=cy,
             position_xr=np.array(p, dtype=np.float64), rotation_xr=np.array(q, dtype=np.float64),
             position_unity=xr_to_unity_position(p), rotation_unity=xr_to_unity_quat(q)))
-    return DepthFrame(views=views, client_ts_ns=header["client_timestamp_ns"],
-                      server_ts_ns=header.get("server_timestamp_unix_ns"), near=near, far=far)
+    return DepthFrame(views=views, client_ts_ns=client_ts_ns, server_ts_ns=server_ts_ns, near=near, far=far)
 
 
 def decode_depth_frame(payload, flip_rows=False) -> Optional[DepthFrame]:

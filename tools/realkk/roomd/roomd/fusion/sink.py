@@ -13,7 +13,8 @@ from roomd import protocol
 from roomd.sink import FusionOutputs, FusionSink
 
 from .config import FusionConfig
-from .decode import frame_from_header
+from .decode import make_frame
+from .outputs import to_protocol_heightmap, to_protocol_mesh_chunk
 from .tsdf import TsdfFusion
 
 RECENTER_EPS_M = 1e-3
@@ -38,21 +39,20 @@ class TsdfFusionSink(FusionSink):
         self._nav_revision = 0
 
     def integrate(self, frame):
-        """protocol.DepthFrame (OpenXR) -> TSDF. Fake frames are ignored."""
-        decoded = frame_from_header(frame.header, frame.d16(), flip_rows=self.fusion.config.flip_rows)
-        if decoded is not None:
-            self.fusion.integrate(decoded)
+        """protocol.DepthFrame (OpenXR; roomd already dropped fake frames) -> TSDF."""
+        flip = self.fusion.config.flip_rows
+        depths = [frame.view_z(i)[::-1] if flip else frame.view_z(i) for i in range(2)]
+        views = frame.views
+        self.fusion.integrate(make_frame(depths, [v.pose_xr for v in views], [v.intrinsics for v in views],
+                                         frame.near, frame.far, frame.header.get("client_timestamp_ns", 0)))
 
     def snapshot_outputs(self):
         snap = self.fusion.snapshot_outputs()
         if snap.heightmap is not None:
             hm = snap.heightmap
-            self._nav = protocol.NavHeightmap(hm.cell, hm.origin_x, hm.origin_z,
-                                              hm.floor_y.astype(np.float16), hm.top_y.astype(np.float16),
-                                              hm.flags.astype(np.uint8))
+            self._nav = to_protocol_heightmap(hm)
             self._nav_revision += 1
-        chunks = [protocol.MeshChunk(c.ix, c.iy, c.iz, c.revision, c.chunk_size, c.vertices, c.indices)
-                  for c in snap.mesh_chunks]
+        chunks = [to_protocol_mesh_chunk(c) for c in snap.mesh_chunks]
         return FusionOutputs(map_revision=snap.stats["mapRevision"],
                              floor_y=None if snap.floor is None else snap.floor.y,
                              floor_rms=None if snap.floor is None else snap.floor.rms,

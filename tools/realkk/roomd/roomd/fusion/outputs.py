@@ -1,9 +1,8 @@
-"""Fusion output records and their 9945 payload encoders (CONTRACT-roomd.md).
+"""Fusion output records (internal) and their mapping onto roomd.protocol / 9945 payloads.
 
-Payloads exclude the `u32 type, u32 len` frame; the I/O layer adds it.
+Payloads exclude the `u32 type, u32 len` frame; roomd.protocol owns the wire format.
 """
 
-import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -76,42 +75,42 @@ class FusionOutputs:
     stats: dict = field(default_factory=dict)
 
 
-_MESH_HEAD = struct.Struct("<IiiiIfII")
-_HM_HEAD = struct.Struct("<IfffII")
-
-
 def encode_mesh_chunk(chunk: MeshChunk) -> bytes:
-    v = np.ascontiguousarray(chunk.vertices, dtype="<f4").reshape(-1, 3)
-    i = np.ascontiguousarray(chunk.indices, dtype="<u4").reshape(-1)
-    return (_MESH_HEAD.pack(1, chunk.ix, chunk.iy, chunk.iz, chunk.revision, chunk.chunk_size, len(v), len(i))
-            + v.tobytes() + i.tobytes())
+    """Contract payload; thin wrapper over roomd.protocol (owns the wire format)."""
+    from roomd import protocol
+
+    return protocol.encode_mesh_chunk(chunk)
 
 
 def decode_mesh_chunk(payload: bytes) -> MeshChunk:
-    version, ix, iy, iz, rev, size, vc, ic = _MESH_HEAD.unpack_from(payload, 0)
-    if version != 1:
-        raise ValueError("MESH_CHUNK version %d" % version)
-    off = _MESH_HEAD.size
-    v = np.frombuffer(payload, "<f4", vc * 3, off).reshape(-1, 3)
-    i = np.frombuffer(payload, "<u4", ic, off + vc * 12)
-    return MeshChunk(ix, iy, iz, rev, size, v, i)
+    from roomd import protocol
+
+    c = protocol.decode_mesh_chunk(payload)
+    return MeshChunk(c.ix, c.iy, c.iz, c.revision, c.chunk_size, c.vertices, c.indices)
 
 
 def encode_nav_heightmap(hm: Heightmap) -> bytes:
-    n = hm.width * hm.height
-    return (_HM_HEAD.pack(1, hm.cell, hm.origin_x, hm.origin_z, hm.width, hm.height)
-            + np.asarray(hm.floor_y, "<f2").reshape(n).tobytes()
-            + np.asarray(hm.top_y, "<f2").reshape(n).tobytes()
-            + np.asarray(hm.flags, np.uint8).reshape(n).tobytes())
+    from roomd import protocol
+
+    return protocol.encode_nav_heightmap(to_protocol_heightmap(hm))
 
 
 def decode_nav_heightmap(payload: bytes) -> Heightmap:
-    version, cell, ox, oz, w, h = _HM_HEAD.unpack_from(payload, 0)
-    if version != 1:
-        raise ValueError("NAV_HEIGHTMAP version %d" % version)
-    n = w * h
-    off = _HM_HEAD.size
-    floor = np.frombuffer(payload, "<f2", n, off).astype(np.float32).reshape(h, w)
-    top = np.frombuffer(payload, "<f2", n, off + 2 * n).astype(np.float32).reshape(h, w)
-    flags = np.frombuffer(payload, np.uint8, n, off + 4 * n).reshape(h, w)
-    return Heightmap(cell, ox, oz, w, h, floor, top, flags)
+    from roomd import protocol
+
+    p = protocol.decode_nav_heightmap(payload)
+    return Heightmap(p.cell, p.origin_x, p.origin_z, p.width, p.height, p.floor_y.astype(np.float32),
+                     p.top_y.astype(np.float32), p.flags)
+
+
+def to_protocol_heightmap(hm: Heightmap):
+    from roomd import protocol
+
+    return protocol.NavHeightmap(hm.cell, hm.origin_x, hm.origin_z, np.asarray(hm.floor_y, np.float16),
+                                 np.asarray(hm.top_y, np.float16), np.asarray(hm.flags, np.uint8))
+
+
+def to_protocol_mesh_chunk(c: MeshChunk):
+    from roomd import protocol
+
+    return protocol.MeshChunk(c.ix, c.iy, c.iz, c.revision, c.chunk_size, c.vertices, c.indices)
