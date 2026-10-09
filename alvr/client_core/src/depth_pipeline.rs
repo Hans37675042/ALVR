@@ -105,6 +105,156 @@ impl CapturePacer {
     }
 }
 
+enum Slot<F, M> {
+    Free,
+    Pending {
+        fence: F,
+        meta: M,
+        enqueued_frame: u64,
+    },
+}
+
+/// A finished readback slot, handed out oldest first. The slot is free again once returned, so
+/// the caller must consume its buffer before submitting new GPU work into it.
+#[derive(Debug)]
+pub enum SlotEvent<F, M> {
+    /// The fence signaled: the slot's buffer holds the image described by `meta`.
+    Ready {
+        slot: usize,
+        fence: F,
+        meta: M,
+        latency_frames: u64,
+    },
+    /// The fence did not signal within the timeout; the buffer content must not be used.
+    Expired { slot: usize, fence: F, meta: M },
+}
+
+/// Ring of asynchronous GPU readback slots (one pixel pack buffer each). `F` is the GPU fence,
+/// `M` whatever describes the image in flight (pose, FOV, size), so late frames keep the header
+/// of the moment they were captured.
+pub struct SlotRing<F, M> {
+    slots: Vec<Slot<F, M>>,
+    next: usize,
+}
+
+impl<F, M> SlotRing<F, M> {
+    pub fn new(count: usize) -> Self {
+        Self {
+            slots: (0..count).map(|_| Slot::Free).collect(),
+            next: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// The next free slot in round-robin order; None if every slot is still in flight.
+    pub fn free_slot(&self) -> Option<usize> {
+        let n = self.slots.len();
+        (0..n)
+            .map(|i| (self.next + i) % n)
+            .find(|&i| matches!(self.slots[i], Slot::Free))
+    }
+
+    pub fn submit(&mut self, slot: usize, fence: F, meta: M, frame: u64) {
+        assert!(matches!(self.slots[slot], Slot::Free), "slot {slot} is in flight");
+        self.slots[slot] = Slot::Pending {
+            fence,
+            meta,
+            enqueued_frame: frame,
+        };
+        self.next = (slot + 1) % self.slots.len();
+    }
+
+    pub fn pending(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| matches!(s, Slot::Pending { .. }))
+            .count()
+    }
+
+    /// Checks the oldest in-flight slot without waiting. Returns it when its fence signaled or
+    /// when it has been pending for more than `timeout_frames`; call again until None.
+    pub fn poll_one(
+        &mut self,
+        frame: u64,
+        timeout_frames: u64,
+        mut is_signaled: impl FnMut(&F) -> bool,
+    ) -> Option<SlotEvent<F, M>> {
+        let oldest = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                Slot::Pending { enqueued_frame, .. } => Some((i, *enqueued_frame)),
+                Slot::Free => None,
+            })
+            .min_by_key(|&(_, f)| f)?;
+        let (slot, enqueued_frame) = oldest;
+        let Slot::Pending { fence, .. } = &self.slots[slot] else {
+            unreachable!()
+        };
+        let latency_frames = frame.saturating_sub(enqueued_frame);
+        let signaled = is_signaled(fence);
+        if !signaled && latency_frames <= timeout_frames {
+            return None;
+        }
+        let Slot::Pending { fence, meta, .. } = std::mem::replace(&mut self.slots[slot], Slot::Free)
+        else {
+            unreachable!()
+        };
+        Some(if signaled {
+            SlotEvent::Ready {
+                slot,
+                fence,
+                meta,
+                latency_frames,
+            }
+        } else {
+            SlotEvent::Expired { slot, fence, meta }
+        })
+    }
+
+    /// Frees every slot and returns the fences still in flight, e.g. to delete them on teardown.
+    pub fn drain(&mut self) -> Vec<F> {
+        self.slots
+            .iter_mut()
+            .filter_map(|s| match std::mem::replace(s, Slot::Free) {
+                Slot::Pending { fence, .. } => Some(fence),
+                Slot::Free => None,
+            })
+            .collect()
+    }
+}
+
+/// Copies `views` stacked images of `rows_per_view` rows each from `src` (bottom-up rows, as
+/// glReadPixels returns them, `src_row_stride` bytes apart) into `dst` with top-down rows of
+/// `row_bytes` bytes, flipping each view vertically.
+pub fn copy_flipped_rows(
+    src: &[u8],
+    src_row_stride: usize,
+    dst: &mut [u8],
+    row_bytes: usize,
+    rows_per_view: usize,
+    views: usize,
+) {
+    assert!(src_row_stride >= row_bytes);
+    assert!(dst.len() >= row_bytes * rows_per_view * views);
+    for view in 0..views {
+        for row in 0..rows_per_view {
+            let src_start = (view * rows_per_view + rows_per_view - 1 - row) * src_row_stride;
+            let dst_start = (view * rows_per_view + row) * row_bytes;
+            dst[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&src[src_start..src_start + row_bytes]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

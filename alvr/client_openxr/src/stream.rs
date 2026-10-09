@@ -4,7 +4,7 @@ use crate::{
 };
 use alvr_client_core::{
     ClientCoreContext,
-    depth_pipeline::StageSet,
+    depth_pipeline::{SlotEvent, SlotRing, StageSet, copy_flipped_rows},
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
@@ -97,20 +97,289 @@ impl ParsedStreamConfig {
     }
 }
 
+// Readback slots in flight; a capture is skipped (never waited for) when all are pending
+const DEPTH_READBACK_SLOTS: usize = 3;
+// A slot whose fence has not signaled after this many frames is given up
+const DEPTH_READBACK_TIMEOUT_FRAMES: u64 = 30;
+
+/// Everything the depth header needs, taken when the image is acquired so that a frame read
+/// back a few frames later still carries the pose and FOV it was captured with.
+struct DepthFrameMeta {
+    display_time: xr::Time,
+    view_poses: [Pose; 2],
+    fov_angles: [[f32; 4]; 2],
+    near_z: f32,
+    far_z: f32,
+    // Single view size; views are stacked vertically
+    width: u32,
+    height: u32,
+    enqueued_at: Instant,
+}
+
+/// Asynchronous depth readback. Per capture, in front of xrEndFrame and without waiting:
+/// 1. Attach the runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
+/// 2. BlitFramebuffer depth → local D16 on fbo_write (bypasses the Adreno 740 depth sampling bug)
+/// 3. CopyImageSubData D16 → R16UI
+/// 4. ReadPixels(RED_INTEGER, UNSIGNED_SHORT) from fbo_r16ui into a pixel pack buffer, then a
+///    fence. One to a few frames later, once the fence signaled, the buffer is mapped and copied
+///    out with the rows flipped. ReadPixels into client memory would stall the render thread
+///    until the GPU caught up.
 struct DepthReadback {
-    // Blit-based readback pipeline (bypasses Adreno 740 depth sampling bug):
-    // 1. Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
-    // 2. BlitFramebuffer depth → local D16 on fbo_write
-    // 3. CopyImageSubData D16 → R16UI
-    // 4. ReadPixels(RED_INTEGER, UNSIGNED_SHORT) from fbo_r16ui
-    fbo_read: glow::NativeFramebuffer,   // runtime tex layer attached as depth
-    fbo_write: glow::NativeFramebuffer,  // local D16 attached as depth
-    fbo_r16ui: glow::NativeFramebuffer,  // R16UI attached as color (for integer readback)
-    depth_2d_tex: glow::NativeTexture,   // local D16 blit target
-    r16ui_tex: glow::NativeTexture,      // R16UI for integer readback
+    fbo_read: glow::NativeFramebuffer,  // runtime tex layer attached as depth
+    fbo_write: glow::NativeFramebuffer, // local D16 attached as depth
+    fbo_r16ui: glow::NativeFramebuffer, // R16UI attached as color (for integer readback)
+    depth_2d_tex: glow::NativeTexture,  // local D16 blit target
+    r16ui_tex: glow::NativeTexture,     // R16UI for integer readback
+    pbos: [glow::NativeBuffer; DEPTH_READBACK_SLOTS],
+    ring: SlotRing<glow::NativeFence, DepthFrameMeta>,
     tex_width: u32,
     tex_height: u32,
     frame_count: u32,
+}
+
+impl DepthReadback {
+    unsafe fn new(gl: &glow::Context) -> Self {
+        unsafe {
+            Self {
+                fbo_read: gl.create_framebuffer().unwrap(),
+                fbo_write: gl.create_framebuffer().unwrap(),
+                fbo_r16ui: gl.create_framebuffer().unwrap(),
+                depth_2d_tex: gl.create_texture().unwrap(),
+                r16ui_tex: gl.create_texture().unwrap(),
+                pbos: [(); DEPTH_READBACK_SLOTS].map(|_| gl.create_buffer().unwrap()),
+                ring: SlotRing::new(DEPTH_READBACK_SLOTS),
+                tex_width: 0,
+                tex_height: 0,
+                frame_count: 0,
+            }
+        }
+    }
+
+    /// Bytes between rows in a pack buffer (GL_PACK_ALIGNMENT defaults to 4)
+    fn pack_row_stride(width: u32) -> usize {
+        (width as usize * 2 + 3) & !3
+    }
+
+    /// Bytes of one slot: both views of R16UI
+    fn slot_bytes(width: u32, height: u32) -> usize {
+        Self::pack_row_stride(width) * height as usize * 2
+    }
+
+    /// (Re)creates the blit targets and pack buffers for this image size. Frames still in flight
+    /// were read back at the old size and are dropped.
+    unsafe fn ensure_size(&mut self, gl: &glow::Context, width: u32, height: u32) {
+        if self.tex_width == width && self.tex_height == height {
+            return;
+        }
+        alvr_common::info!("[XR_DATA] Init blit targets: {}x{}", width, height);
+        let (w, h) = (width as i32, height as i32);
+        unsafe {
+            for fence in self.ring.drain() {
+                gl.delete_sync(fence);
+            }
+
+            // Local D16 depth texture (blit target)
+            gl.delete_texture(self.depth_2d_tex);
+            self.depth_2d_tex = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.depth_2d_tex));
+            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::DEPTH_COMPONENT16, w, h);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            // Attach local D16 to fbo_write
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo_write));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_ATTACHMENT,
+                glow::TEXTURE_2D,
+                Some(self.depth_2d_tex),
+                0,
+            );
+            let write_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+
+            // R16UI texture (CopyImageSubData target for integer readback)
+            gl.delete_texture(self.r16ui_tex);
+            self.r16ui_tex = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.r16ui_tex));
+            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::R16UI, w, h);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+
+            // Attach R16UI to fbo_r16ui
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo_r16ui));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(self.r16ui_tex),
+                0,
+            );
+            let r16ui_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+
+            // Pack buffers, read by the CPU once per fill
+            let slot_bytes = Self::slot_bytes(width, height) as i32;
+            for &pbo in &self.pbos {
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, slot_bytes, glow::STREAM_READ);
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+
+            self.tex_width = width;
+            self.tex_height = height;
+            let err = gl.get_error();
+            alvr_common::info!(
+                "[XR_DATA] Blit targets ready: write_fbo={:#x} r16ui_fbo={:#x} \
+                 {DEPTH_READBACK_SLOTS} pack buffers x {slot_bytes} B, GL err={:#x}",
+                write_status,
+                r16ui_status,
+                err,
+            );
+        }
+    }
+
+    /// Queues the copy of both views of `runtime_tex` into the pack buffer of `slot` and returns
+    /// the fence that signals when it is filled. Does not wait for the GPU.
+    unsafe fn enqueue(
+        &mut self,
+        gl: &glow::Context,
+        runtime_tex: glow::NativeTexture,
+        slot: usize,
+    ) -> Result<glow::NativeFence, String> {
+        let (w, h) = (self.tex_width as i32, self.tex_height as i32);
+        let view_bytes = Self::pack_row_stride(self.tex_width) * self.tex_height as usize;
+        let mut failure = None;
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbos[slot]));
+            for eye in 0..2u32 {
+                // Step 1: Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo_read));
+                gl.framebuffer_texture_layer(
+                    glow::FRAMEBUFFER,
+                    glow::DEPTH_ATTACHMENT,
+                    Some(runtime_tex),
+                    0,
+                    eye as i32,
+                );
+                let read_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+                let attach_err = gl.get_error();
+
+                // Step 2: Blit depth from runtime FBO → local D16 FBO
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo_read));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.fbo_write));
+                gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::DEPTH_BUFFER_BIT, glow::NEAREST);
+                let blit_err = gl.get_error();
+
+                // Step 3: CopyImageSubData from local D16 → R16UI (bitwise, both 16-bit)
+                gl.copy_image_sub_data(
+                    self.depth_2d_tex,
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.r16ui_tex,
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    0,
+                    w,
+                    h,
+                    1,
+                );
+                let copy_err = gl.get_error();
+
+                // Step 4: Integer ReadPixels from R16UI into this view's part of the pack buffer
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo_r16ui));
+                gl.read_pixels(
+                    0,
+                    0,
+                    w,
+                    h,
+                    glow::RED_INTEGER,
+                    glow::UNSIGNED_SHORT,
+                    glow::PixelPackData::BufferOffset((eye as usize * view_bytes) as u32),
+                );
+                let read_err = gl.get_error();
+
+                let errors = [attach_err, blit_err, copy_err, read_err];
+                if read_status != glow::FRAMEBUFFER_COMPLETE
+                    || errors.iter().any(|&e| e != glow::NO_ERROR)
+                {
+                    failure.get_or_insert(format!(
+                        "eye {eye}: fbo status {read_status:#x}, GL errors attach/blit/\
+                         copy/read {attach_err:#x}/{blit_err:#x}/{copy_err:#x}/{read_err:#x}"
+                    ));
+                }
+            }
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.frame_count += 1;
+
+            if let Some(failure) = failure {
+                return Err(failure);
+            }
+            let fence = gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            // Make sure the fence reaches the GPU even if nothing else flushes soon
+            gl.flush();
+            Ok(fence)
+        }
+    }
+
+    unsafe fn is_signaled(gl: &glow::Context, fence: &glow::NativeFence) -> bool {
+        unsafe { gl.get_sync_status(*fence) == glow::SIGNALED }
+    }
+
+    /// Copies a filled slot (whose fence signaled) into `out`, top-down rows, views stacked.
+    unsafe fn read_slot(
+        &self,
+        gl: &glow::Context,
+        slot: usize,
+        meta: &DepthFrameMeta,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        if meta.width != self.tex_width || meta.height != self.tex_height {
+            return Err("pack buffer was resized".into());
+        }
+        let stride = Self::pack_row_stride(meta.width);
+        let len = Self::slot_bytes(meta.width, meta.height);
+        unsafe {
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.pbos[slot]));
+            let ptr = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, len as i32, glow::MAP_READ_BIT);
+            let result = if ptr.is_null() {
+                Err(format!("map failed, GL err {:#x}", gl.get_error()))
+            } else {
+                let mapped = std::slice::from_raw_parts(ptr as *const u8, len);
+                copy_flipped_rows(
+                    mapped,
+                    stride,
+                    out,
+                    meta.width as usize * 2,
+                    meta.height as usize,
+                    2,
+                );
+                gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                Ok(())
+            };
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            result
+        }
+    }
+
+    unsafe fn destroy(mut self, gl: &glow::Context) {
+        unsafe {
+            for fence in self.ring.drain() {
+                gl.delete_sync(fence);
+            }
+            for pbo in self.pbos {
+                gl.delete_buffer(pbo);
+            }
+            gl.delete_framebuffer(self.fbo_read);
+            gl.delete_framebuffer(self.fbo_write);
+            gl.delete_framebuffer(self.fbo_r16ui);
+            gl.delete_texture(self.depth_2d_tex);
+            gl.delete_texture(self.r16ui_tex);
+        }
+    }
 }
 
 pub struct StreamContext {
@@ -139,6 +408,8 @@ pub struct StreamContext {
     depth_skipped_frames: u64,
     depth_perf: StageSet,
     depth_perf_captures: u64,
+    depth_frame_index: u64,
+    depth_ring_full: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -292,35 +563,14 @@ impl StreamContext {
             && xr_exts.meta_environment_depth.is_some();
         alvr_common::info!("[XR_DIAG] Depth provider deferred init: wants_init={depth_wants_init}");
 
-        // Create GL-based depth readback resources.
-        // Strategy: blit-based pipeline that bypasses Adreno 740 depth sampling bug.
-        // 1. Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
-        // 2. BlitFramebuffer depth → local D16 on fbo_write
-        // 3. CopyImageSubData D16 → R16UI (bitwise, both 16-bit)
-        // 4. ReadPixels(RED_INTEGER, UNSIGNED_SHORT) from fbo_r16ui → raw u16 depth
+        // GL depth readback resources (blit-based, see DepthReadback)
         let depth_readback = if depth_wants_init {
             gfx_ctx.make_current();
-            let gl = &gfx_ctx.gl_context;
-            unsafe {
-                let fbo_read = gl.create_framebuffer().unwrap();
-                let fbo_write = gl.create_framebuffer().unwrap();
-                let fbo_r16ui = gl.create_framebuffer().unwrap();
-                let depth_2d_tex = gl.create_texture().unwrap();
-                let r16ui_tex = gl.create_texture().unwrap();
-
-                alvr_common::info!("[XR_DIAG] GL depth readback pipeline created (blit-based, no shader)");
-
-                Some(DepthReadback {
-                    fbo_read,
-                    fbo_write,
-                    fbo_r16ui,
-                    depth_2d_tex,
-                    r16ui_tex,
-                    tex_width: 0,
-                    tex_height: 0,
-                    frame_count: 0,
-                })
-            }
+            let readback = unsafe { DepthReadback::new(&gfx_ctx.gl_context) };
+            alvr_common::info!(
+                "[XR_DIAG] GL depth readback pipeline created (blit-based, {DEPTH_READBACK_SLOTS} async pack buffers)"
+            );
+            Some(readback)
         } else {
             None
         };
@@ -351,6 +601,8 @@ impl StreamContext {
             depth_skipped_frames: 0,
             depth_perf: StageSet::default(),
             depth_perf_captures: 0,
+            depth_frame_index: 0,
+            depth_ring_full: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -746,13 +998,105 @@ impl StreamContext {
             }
         }
 
+        self.depth_frame_index += 1;
+        let frame_start = Instant::now();
+        let mut did_work = false;
+
+        // Collect readbacks queued on earlier frames whose GPU work has finished
+        if self.depth_readback.as_ref().is_some_and(|r| r.ring.pending() > 0) {
+            did_work |= self.collect_depth_readbacks();
+        }
+
+        did_work |= self.maybe_enqueue_depth(display_time);
+
+        if did_work {
+            self.depth_perf.record("render_thread_ms", elapsed_ms(frame_start));
+        }
+    }
+
+    /// Maps every finished readback slot and sends its frame. Returns whether any slot finished.
+    fn collect_depth_readbacks(&mut self) -> bool {
+        let Some(readback) = &mut self.depth_readback else {
+            return false;
+        };
+        self.gfx_ctx.make_current();
+        let gl = &self.gfx_ctx.gl_context;
+        let mut finished = false;
+        loop {
+            let event = readback.ring.poll_one(
+                self.depth_frame_index,
+                DEPTH_READBACK_TIMEOUT_FRAMES,
+                |fence| unsafe { DepthReadback::is_signaled(gl, fence) },
+            );
+            let Some(event) = event else {
+                break;
+            };
+            finished = true;
+            match event {
+                SlotEvent::Ready {
+                    slot,
+                    fence,
+                    meta,
+                    latency_frames,
+                } => {
+                    unsafe { gl.delete_sync(fence) };
+                    self.depth_perf.record("fence_frames", latency_frames as f32);
+                    self.depth_perf
+                        .record("fence_ms", elapsed_ms(meta.enqueued_at));
+                    let map_start = Instant::now();
+                    let mut depth_bytes =
+                        vec![0u8; meta.width as usize * meta.height as usize * 2 * 2];
+                    let result = unsafe { readback.read_slot(gl, slot, &meta, &mut depth_bytes) };
+                    self.depth_perf.record("map_ms", elapsed_ms(map_start));
+                    match result {
+                        Ok(()) => {
+                            Self::send_depth_frame(
+                                &self.core_context,
+                                self.xr_session.instance(),
+                                &mut self.depth_perf,
+                                &meta,
+                                depth_bytes,
+                            );
+                            self.depth_perf_captures += 1;
+                            if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
+                                alvr_common::info!(
+                                    "[XR_PERF] depth {} frames sent, {} skipped, {} ring full: {}",
+                                    self.depth_perf_captures,
+                                    self.depth_skipped_frames,
+                                    self.depth_ring_full,
+                                    self.depth_perf.format_and_reset()
+                                );
+                            }
+                        }
+                        Err(failure) => {
+                            Self::note_depth_skip(&mut self.depth_skipped_frames, Some(failure))
+                        }
+                    }
+                }
+                SlotEvent::Expired { fence, .. } => {
+                    unsafe { gl.delete_sync(fence) };
+                    Self::note_depth_skip(
+                        &mut self.depth_skipped_frames,
+                        Some(format!(
+                            "GPU readback not done after {DEPTH_READBACK_TIMEOUT_FRAMES} frames"
+                        )),
+                    );
+                }
+            }
+        }
+        finished
+    }
+
+    /// Acquires a depth image if a capture is due and queues its GPU readback. Returns whether
+    /// GPU work was queued.
+    fn maybe_enqueue_depth(&mut self, display_time: xr::Time) -> bool {
         // Only capture/send depth frames when the viewer has enabled depth streaming
         if !self.xr_depth_enabled {
-            return;
+            return false;
         }
 
         let Some(depth_provider) = &mut self.depth_provider else {
-            return;
+            return false;
         };
 
         let depth_fps = self
@@ -764,7 +1108,7 @@ impl StreamContext {
         let depth_interval = Duration::from_secs_f32(1.0 / depth_fps);
 
         if self.last_depth_capture.elapsed() < depth_interval {
-            return;
+            return false;
         }
 
         // Start provider if not already started
@@ -773,16 +1117,31 @@ impl StreamContext {
             if let Err(e) = depth_provider.start() {
                 alvr_common::info!("[XR_DATA] Failed to start depth provider: {e:?}");
                 self.last_depth_capture = Instant::now();
-                return;
+                return false;
             }
             alvr_common::info!("[XR_DATA] Depth provider started");
             // Runtime needs at least one frame after start before acquire works
             self.last_depth_capture = Instant::now();
-            return;
+            return false;
         }
 
+        // Without a readback there is no depth: skip the frame instead of sending a constant
+        // 0x8080 image that viewers would take for real depth.
+        let Some(readback) = &mut self.depth_readback else {
+            Self::note_depth_skip(&mut self.depth_skipped_frames, None);
+            self.last_depth_capture = Instant::now();
+            return false;
+        };
+
+        // Never wait for the GPU: with every slot still in flight this capture is dropped
+        let Some(slot) = readback.ring.free_slot() else {
+            self.depth_ring_full += 1;
+            self.last_depth_capture = Instant::now();
+            return false;
+        };
+
         // Acquire depth image
-        let capture_start = Instant::now();
+        let acquire_start = Instant::now();
         let depth_image = match depth_provider.acquire_depth_image(
             self.stage_reference_space.as_raw(),
             display_time,
@@ -790,236 +1149,108 @@ impl StreamContext {
             Ok(Some(image)) => image,
             Ok(None) => {
                 self.last_depth_capture = Instant::now();
-                return;
+                return false;
             }
             Err(e) => {
                 alvr_common::info!("[XR_DATA] Failed to acquire depth image: {e:?}");
                 self.last_depth_capture = Instant::now();
-                return;
+                return false;
             }
         };
+        self.depth_perf.record("acquire_ms", elapsed_ms(acquire_start));
 
-        self.depth_perf.record("acquire_ms", elapsed_ms(capture_start));
         let width = depth_provider.swapchain_width;
         let height = depth_provider.swapchain_height;
-
         let swapchain_idx = depth_image.swapchain_index as usize;
-        let pixel_count = (width * height) as usize;
-        let mut readback_failure = None::<String>;
-        let depth_bytes = if swapchain_idx < depth_provider.swapchain_images.len()
-            && let Some(ref mut readback) = self.depth_readback
-        {
-            let texture_id = depth_provider.swapchain_images[swapchain_idx];
-            if texture_id == 0 {
-                None
-            } else {
-                self.gfx_ctx.make_current();
-                let gl = &self.gfx_ctx.gl_context;
-                unsafe {
-                    let w = width as i32;
-                    let h = height as i32;
-
-                    // Init/resize local D16 + R16UI textures on first use or size change
-                    if readback.tex_width != width || readback.tex_height != height {
-                        alvr_common::info!("[XR_DATA] Init blit targets: {}x{}", width, height);
-
-                        // Local D16 depth texture (blit target)
-                        gl.delete_texture(readback.depth_2d_tex);
-                        readback.depth_2d_tex = gl.create_texture().unwrap();
-                        gl.bind_texture(glow::TEXTURE_2D, Some(readback.depth_2d_tex));
-                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::DEPTH_COMPONENT16, w, h);
-                        gl.bind_texture(glow::TEXTURE_2D, None);
-
-                        // Attach local D16 to fbo_write
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_write));
-                        gl.framebuffer_texture_2d(
-                            glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT,
-                            glow::TEXTURE_2D, Some(readback.depth_2d_tex), 0,
-                        );
-                        let write_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-
-                        // R16UI texture (CopyImageSubData target for integer readback)
-                        gl.delete_texture(readback.r16ui_tex);
-                        readback.r16ui_tex = gl.create_texture().unwrap();
-                        gl.bind_texture(glow::TEXTURE_2D, Some(readback.r16ui_tex));
-                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::R16UI, w, h);
-                        gl.bind_texture(glow::TEXTURE_2D, None);
-
-                        // Attach R16UI to fbo_r16ui
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_r16ui));
-                        gl.framebuffer_texture_2d(
-                            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0,
-                            glow::TEXTURE_2D, Some(readback.r16ui_tex), 0,
-                        );
-                        let r16ui_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-
-                        readback.tex_width = width;
-                        readback.tex_height = height;
-                        let err = gl.get_error();
-                        alvr_common::info!(
-                            "[XR_DATA] Blit targets ready: write_fbo={:#x} r16ui_fbo={:#x} GL err={:#x}",
-                            write_status, r16ui_status, err,
-                        );
-                    }
-
-                    let runtime_tex = glow::NativeTexture(std::num::NonZeroU32::new(texture_id).unwrap());
-
-                    // Output buffer: 2 bytes per pixel (u16), 2 eyes
-                    let u16_byte_count = pixel_count * 2;
-                    let mut depth_bytes = vec![0u8; u16_byte_count * 2];
-
-                    let readback_start = Instant::now();
-                    for eye in 0..2u32 {
-                        // Step 1: Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_read));
-                        gl.framebuffer_texture_layer(
-                            glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT,
-                            Some(runtime_tex), 0, eye as i32,
-                        );
-                        let read_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-                        let attach_err = gl.get_error();
-
-                        // Step 2: Blit depth from runtime FBO → local D16 FBO
-                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(readback.fbo_read));
-                        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(readback.fbo_write));
-                        gl.blit_framebuffer(
-                            0, 0, w, h,
-                            0, 0, w, h,
-                            glow::DEPTH_BUFFER_BIT, glow::NEAREST,
-                        );
-                        let blit_err = gl.get_error();
-
-                        // Step 3: CopyImageSubData from local D16 → R16UI (bitwise, both 16-bit)
-                        gl.copy_image_sub_data(
-                            readback.depth_2d_tex, glow::TEXTURE_2D, 0, 0, 0, 0,
-                            readback.r16ui_tex, glow::TEXTURE_2D, 0, 0, 0, 0,
-                            w, h, 1,
-                        );
-                        let copy_err = gl.get_error();
-
-                        // Step 4: Read raw u16 depth from R16UI via integer ReadPixels
-                        let offset = eye as usize * u16_byte_count;
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_r16ui));
-                        gl.read_pixels(
-                            0, 0, w, h,
-                            glow::RED_INTEGER, glow::UNSIGNED_SHORT,
-                            glow::PixelPackData::Slice(Some(&mut depth_bytes[offset..offset + u16_byte_count])),
-                        );
-                        let read_err = gl.get_error();
-
-                        let errors = [attach_err, blit_err, copy_err, read_err];
-                        if read_status != glow::FRAMEBUFFER_COMPLETE
-                            || errors.iter().any(|&e| e != glow::NO_ERROR)
-                        {
-                            readback_failure.get_or_insert(format!(
-                                "eye {eye}: fbo status {read_status:#x}, GL errors attach/blit/\
-                                 copy/read {attach_err:#x}/{blit_err:#x}/{copy_err:#x}/\
-                                 {read_err:#x}"
-                            ));
-                        }
-                    }
-
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    readback.frame_count += 1;
-                    // Synchronous: ReadPixels into client memory waits for the GPU
-                    self.depth_perf.record("readback_ms", elapsed_ms(readback_start));
-                    let flip_start = Instant::now();
-
-                    // Flip rows: glReadPixels returns bottom-up, send top-down
-                    let row_bytes = width as usize * 2;
-                    let h = height as usize;
-                    for eye in 0..2usize {
-                        let eye_offset = eye * u16_byte_count;
-                        for row in 0..h / 2 {
-                            let top = eye_offset + row * row_bytes;
-                            let bot = eye_offset + (h - 1 - row) * row_bytes;
-                            for col in 0..row_bytes {
-                                depth_bytes.swap(top + col, bot + col);
-                            }
-                        }
-                    }
-
-                    self.depth_perf.record("flip_ms", elapsed_ms(flip_start));
-
-                    // A failed GL step leaves zeros or stale data in the buffer
-                    readback_failure.is_none().then_some(depth_bytes)
-                }
-            }
-        } else {
-            // No readback pipeline
-            None
-        };
-
-        // Without a readback there is no depth: skip the frame instead of sending a constant
-        // 0x8080 image that viewers would take for real depth.
-        let Some(depth_bytes) = depth_bytes else {
-            self.depth_skipped_frames += 1;
-            if self.depth_skipped_frames <= 3 || self.depth_skipped_frames % 100 == 0 {
-                alvr_common::warn!(
-                    "[XR_DATA] depth readback unavailable, frame skipped ({} so far){}",
-                    self.depth_skipped_frames,
-                    readback_failure
-                        .map(|f| format!(": {f}"))
-                        .unwrap_or_default()
-                );
-            }
+        let texture_id = depth_provider
+            .swapchain_images
+            .get(swapchain_idx)
+            .copied()
+            .unwrap_or(0);
+        let Some(texture_id) = std::num::NonZeroU32::new(texture_id) else {
+            Self::note_depth_skip(&mut self.depth_skipped_frames, None);
             self.last_depth_capture = Instant::now();
-            return;
+            return false;
         };
 
         // Each depth view has its own pose (stage space) and FOV; the depth cameras are not
         // the eye cameras, so both must be forwarded for correct unprojection.
-        let view_poses = [
-            crate::from_xr_pose(depth_image.views[0].pose),
-            crate::from_xr_pose(depth_image.views[1].pose),
-        ];
-        let fov_angles = [0, 1].map(|i| {
-            let fov = depth_image.views[i].fov;
-            [fov.angle_left, fov.angle_right, fov.angle_up, fov.angle_down]
-        });
+        let meta = DepthFrameMeta {
+            display_time,
+            view_poses: [0, 1].map(|i| crate::from_xr_pose(depth_image.views[i].pose)),
+            fov_angles: [0, 1].map(|i| {
+                let fov = depth_image.views[i].fov;
+                [fov.angle_left, fov.angle_right, fov.angle_up, fov.angle_down]
+            }),
+            near_z: depth_image.near_z,
+            far_z: depth_image.far_z,
+            width,
+            height,
+            enqueued_at: Instant::now(),
+        };
 
+        self.gfx_ctx.make_current();
+        let gl = &self.gfx_ctx.gl_context;
+        let enqueue_start = Instant::now();
+        let result = unsafe {
+            readback.ensure_size(gl, width, height);
+            readback.enqueue(gl, glow::NativeTexture(texture_id), slot)
+        };
+        self.depth_perf.record("enqueue_ms", elapsed_ms(enqueue_start));
+        match result {
+            Ok(fence) => readback.ring.submit(slot, fence, meta, self.depth_frame_index),
+            // A failed GL step leaves zeros or stale data in the buffer
+            Err(failure) => Self::note_depth_skip(&mut self.depth_skipped_frames, Some(failure)),
+        }
+        self.last_depth_capture = Instant::now();
+        true
+    }
+
+    fn note_depth_skip(skipped_frames: &mut u64, failure: Option<String>) {
+        *skipped_frames += 1;
+        if *skipped_frames <= 3 || *skipped_frames % 100 == 0 {
+            alvr_common::warn!(
+                "[XR_DATA] depth readback unavailable, frame skipped ({} so far){}",
+                skipped_frames,
+                failure.map(|f| format!(": {f}")).unwrap_or_default()
+            );
+        }
+    }
+
+    fn send_depth_frame(
+        core_context: &ClientCoreContext,
+        xr_instance: &xr::Instance,
+        perf: &mut StageSet,
+        meta: &DepthFrameMeta,
+        depth_bytes: Vec<u8>,
+    ) {
         // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
-        // Depth data is only ~819 KB/frame at 320x640x2 eyes, so even raw is fine,
-        // but LZ4 reduces it to ~200-400 KB with <1ms latency.
-        let stacked_height = height * 2;
         let lz4_start = Instant::now();
         let compressed = lz4_flex::compress_prepend_size(&depth_bytes);
-        self.depth_perf.record("lz4_ms", elapsed_ms(lz4_start));
+        perf.record("lz4_ms", elapsed_ms(lz4_start));
         let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
 
         // Sampled after readback and compression, as close to the send as possible, so that the
         // server-side offset estimate (receive time - send time) only contains network latency.
-        let client_send_time = crate::xr_runtime_now(self.xr_session.instance())
+        let client_send_time = crate::xr_runtime_now(xr_instance)
             .map(crate::from_xr_time)
-            .unwrap_or_else(|| crate::from_xr_time(display_time));
+            .unwrap_or_else(|| crate::from_xr_time(meta.display_time));
 
         let header = DepthFrameHeader {
-            timestamp: crate::from_xr_time(display_time),
+            timestamp: crate::from_xr_time(meta.display_time),
             client_send_time,
-            view_poses,
-            width,
-            height: stacked_height,
-            near_z: depth_image.near_z,
-            far_z: depth_image.far_z,
+            view_poses: meta.view_poses,
+            width: meta.width,
+            height: meta.height * 2,
+            near_z: meta.near_z,
+            far_z: meta.far_z,
             format: send_format,
-            fov_angles,
+            fov_angles: meta.fov_angles,
         };
 
         let send_start = Instant::now();
-        self.core_context.send_depth_frame(&header, &send_data);
-        self.depth_perf.record("send_ms", elapsed_ms(send_start));
-        self.depth_perf.record("render_thread_ms", elapsed_ms(capture_start));
-        self.last_depth_capture = Instant::now();
-
-        self.depth_perf_captures += 1;
-        if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
-            alvr_common::info!(
-                "[XR_PERF] depth {} captures: {}",
-                self.depth_perf_captures,
-                self.depth_perf.format_and_reset()
-            );
-        }
+        core_context.send_depth_frame(&header, &send_data);
+        perf.record("send_ms", elapsed_ms(send_start));
     }
 
     fn maybe_capture_camera(&mut self) {
@@ -1208,13 +1439,7 @@ impl Drop for StreamContext {
         // Clean up depth readback GL resources
         if let Some(readback) = self.depth_readback.take() {
             self.gfx_ctx.make_current();
-            unsafe {
-                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_read);
-                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_write);
-                self.gfx_ctx.gl_context.delete_framebuffer(readback.fbo_r16ui);
-                self.gfx_ctx.gl_context.delete_texture(readback.depth_2d_tex);
-                self.gfx_ctx.gl_context.delete_texture(readback.r16ui_tex);
-            }
+            unsafe { readback.destroy(&self.gfx_ctx.gl_context) };
         }
     }
 }
