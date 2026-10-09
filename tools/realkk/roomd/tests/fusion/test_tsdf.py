@@ -179,3 +179,38 @@ def test_floor_plane_ignores_low_platform_within_search_band():
     fp = fusion.floor_plane()
     assert abs(fp.y) <= 0.005
     assert fp.rms < 0.01
+
+
+def _corrupted_floor_payload(scene, eye, target, rng, frac=0.4, scale=1.3, size=128):
+    """Real room tap: looking steeply down, ~40% of floor samples come back 5-30 cm beyond
+    the floor. Reproduce by stretching a random subset of the rendered depth."""
+    from roomd.fusion.decode import quat_to_matrix
+    from roomd.fusion.synthscene import look_at_xr, metric_payload, unity_to_xr
+
+    e = unity_to_xr(eye)
+    q = look_at_xr(e, unity_to_xr(target))
+    right = quat_to_matrix(q)[:, 0]
+    intr = (size / 2, size / 2, size / 2, size / 2)
+    depths, poses = [], []
+    for side in (-0.032, 0.032):
+        p = e + right * side
+        z = scene.depth(p, q, intr, size, size)
+        bad = rng.random(z.shape) < frac
+        z[bad] *= scale
+        depths.append(z)
+        poses.append((p, q))
+    return metric_payload(depths, poses, [intr, intr], 0.1, float("inf"))
+
+
+def test_measurements_beyond_the_floor_do_not_carve_it():
+    scene = SynthScene(floor_y=0.0)
+    fusion = TsdfFusion(FusionConfig())
+    rng = np.random.default_rng(3)
+    for k in range(20):
+        a = 2 * np.pi * k / 20
+        target = (0.6 * np.sin(a), 0.0, 1.0 + 0.4 * np.cos(a))
+        fusion.integrate(_corrupted_floor_payload(scene, (0.0, 1.15, 0.0), target, rng))
+    below = fusion.region_stats(Obb(center=(0.0, -0.04, 1.0), half_extents=(0.4, 0.015, 0.3)))
+    assert below["free"] == 0  # nothing may be carved under the stage floor
+    fp = fusion.floor_plane()
+    assert fp is not None and abs(fp.y) <= 0.01
