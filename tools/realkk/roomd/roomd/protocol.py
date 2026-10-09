@@ -1,8 +1,8 @@
 """Wire formats of CONTRACT-roomd.md (9944 relay and 9945 plugin sockets).
 
 Every frame on both sockets is little-endian `u32 type, u32 len, payload[len]`.
-The depth header parser and the .rktap format live in tools/realkk (depth_listener.py,
-rktap.py) and are reused here, not copied.
+The depth header and room snapshot parsers and the .rktap format live in tools/realkk
+(depth_listener.py, rktap.py; stdlib-only) and are reused here, not copied.
 """
 
 import json
@@ -18,10 +18,10 @@ from ._legacy import depth_listener, rktap, tap_inspect
 # --- 9944 relay (ALVR server <-> roomd) ---
 MSG_CAMERA_FRAME = depth_listener.MSG_CAMERA_FRAME  # 2
 MSG_DEPTH_FRAME_V2 = depth_listener.MSG_DEPTH_FRAME_V2  # 3
-MSG_ROOM_SNAPSHOT = 4
-MSG_PLAYSPACE_CHANGED = 5
+MSG_ROOM_SNAPSHOT = depth_listener.MSG_ROOM_SNAPSHOT  # 4
+MSG_PLAYSPACE_CHANGED = depth_listener.MSG_PLAYSPACE_CHANGED  # 5
 MSG_STREAM_CONTROL = depth_listener.MSG_STREAM_CONTROL  # 100, roomd -> ALVR
-MSG_ROOM_REQUEST = 101  # roomd -> ALVR
+MSG_ROOM_REQUEST = depth_listener.MSG_ROOM_REQUEST  # 101, roomd -> ALVR
 MSG_MARKER = rktap.MSG_MARKER  # recorder only, never on the wire
 STREAM_DEPTH = depth_listener.STREAM_DEPTH
 STREAM_CAMERA = depth_listener.STREAM_CAMERA
@@ -267,29 +267,16 @@ def encode_room_snapshot(snap):
 
 
 def decode_room_snapshot(payload):
-    header_size, version, snapshot_id = struct.unpack_from("<III", payload, 0)
-    if version != SNAPSHOT_VERSION:
-        raise ValueError("unsupported room snapshot version %d" % version)
-    recenter = struct.unpack_from("<7f", payload, 12)
-    off = header_size
-    (json_len,) = struct.unpack_from("<I", payload, off)
-    off += 4
-    scene = json.loads(payload[off:off + json_len].decode("utf-8"))
-    off += json_len
-    (mesh_count,) = struct.unpack_from("<I", payload, off)
-    off += 4
-    meshes = []
-    for _ in range(mesh_count):
-        anchor = bytes(payload[off:off + 16])
-        pose = struct.unpack_from("<7f", payload, off + 16)
-        vcount, icount = struct.unpack_from("<II", payload, off + 44)
-        off += 52
-        verts = np.frombuffer(payload, dtype="<f4", count=vcount * 3, offset=off).reshape(vcount, 3)
-        off += vcount * 12
-        idx = np.frombuffer(payload, dtype="<u4", count=icount, offset=off)
-        off += icount * 4
-        meshes.append(SnapshotMesh(anchor, pose, verts, idx))
-    return RoomSnapshot(snapshot_id, recenter, scene, meshes, version)
+    """Layout parsing is depth_listener.parse_room_snapshot (stdlib-only, shared with the
+    listener); this wraps the mesh data in numpy arrays."""
+    raw = depth_listener.parse_room_snapshot(payload, unpack_mesh=False)
+    if raw["version"] != SNAPSHOT_VERSION:
+        raise ValueError("unsupported room snapshot version %d" % raw["version"])
+    meshes = [SnapshotMesh(uuid_bytes(m["anchor_uuid"]), m["pose"],
+                           np.frombuffer(m["vertex_data"], dtype="<f4").reshape(m["vcount"], 3),
+                           np.frombuffer(m["index_data"], dtype="<u4"))
+              for m in raw["meshes"]]
+    return RoomSnapshot(raw["snapshot_id"], raw["recenter_pose"], raw["scene"], meshes, raw["version"])
 
 
 def encode_playspace_changed(recenter_pose):
@@ -297,7 +284,7 @@ def encode_playspace_changed(recenter_pose):
 
 
 def decode_playspace_changed(payload):
-    return struct.unpack_from("<7f", payload, 4)
+    return depth_listener.parse_playspace_changed(payload)["recenter_pose"]
 
 
 # --- 9945 plugin messages ---
