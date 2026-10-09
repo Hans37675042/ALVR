@@ -34,6 +34,7 @@ class SemanticsParams:
     seat_h: Tuple[float, float] = (0.35, 0.60)
     back_min_rise: float = 0.25        # m above seat
     back_min_cover: float = 0.45       # backrest length / seat width (office chair top edge is narrow)
+    back_max_ratio: float = 0.8        # backrest cells / seat cells; more = side of other furniture
     seat_min_side: float = 0.30        # m, chair/couch footprint narrower than this is a ledge
     couch_min_len: float = 1.2
     table_h: Tuple[float, float] = (0.65, 0.80)

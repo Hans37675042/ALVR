@@ -71,6 +71,7 @@ class _Geom:
     upper_rel: np.ndarray
     surface_h: float
     flat_ratio: float
+    upper_refilled: Optional[np.ndarray] = None
 
 
 def _nearest(seeds, queries):
@@ -218,9 +219,11 @@ def _segment(raster, floor_y, p: SemanticsParams, is_overhang=None) -> List[_Geo
         uiz = np.concatenate([cells[k][0] for k in members if k != r] or [np.empty(0, int)])
         uix = np.concatenate([cells[k][1] for k in members if k != r] or [np.empty(0, int)])
         surface_h, flat = _dominant_band(rel[biz, bix], p.surface_band)
+        refilled = (raster.refilled[uiz, uix] if raster.refilled is not None and len(uiz)
+                    else np.zeros(len(uiz), dtype=bool))
         out.append(_Geom(raster.centres(biz, bix), rel[biz, bix],
                          raster.centres(uiz, uix), rel[uiz, uix] if len(uiz) else np.empty(0),
-                         surface_h, flat))
+                         surface_h, flat, refilled))
     return out
 
 
@@ -256,7 +259,14 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     has_back = False
     front = None
     if len(g.upper_xz):
-        back = g.upper_xz[g.upper_rel >= s + p.back_min_rise]
+        # a backrest is real geometry (not shelving seen under an overhang) and smaller
+        # than the seat (not the side of the next, taller piece of furniture)
+        is_back = g.upper_rel >= s + p.back_min_rise
+        if g.upper_refilled is not None:
+            is_back &= ~g.upper_refilled
+        back = g.upper_xz[is_back]
+        if len(back) > p.back_max_ratio * len(g.base_xz):
+            back = back[:0]
         if len(back):
             d = g.base_xz.mean(axis=0) - back.mean(axis=0)
             if abs(d @ u) >= abs(d @ v):
@@ -447,7 +457,7 @@ def _refill_overhangs(raster, pts, nrm, floor_y, p: SemanticsParams) -> Raster:
         return raster
     top = raster.top.copy()
     top[sel] = under[sel]
-    return Raster(raster.cell, raster.ox, raster.oz, top)
+    return Raster(raster.cell, raster.ox, raster.oz, top, refilled=sel)
 
 
 def _overhang_probe(view: MapView, floor_y, cell, p: SemanticsParams):

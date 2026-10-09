@@ -41,6 +41,7 @@ class Raster:
     ox: float
     oz: float
     top: np.ndarray
+    refilled: Optional[np.ndarray] = None  # cells whose top came from under an overhang
 
     def centres(self, iz, ix):
         return np.stack([self.ox + (np.asarray(ix) + 0.5) * self.cell,
