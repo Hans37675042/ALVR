@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "android")]
+pub const USE_SCENE_PERMISSION: &str = "com.oculus.permission.USE_SCENE";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 // Anchors are usually locatable right after loading; give the runtime a few frames otherwise.
 const MAX_LOCATE_RETRY_FRAMES: u32 = 45;
@@ -70,7 +72,8 @@ enum State {
         query_done: bool,
         locate_retries: u32,
     },
-    Done(SceneSnapshot),
+    // None: the query failed or timed out, nothing is sent and the server keeps its cache
+    Done(Option<SceneSnapshot>),
 }
 
 pub struct SceneLoader {
@@ -126,6 +129,15 @@ impl SceneLoader {
     pub fn request(&mut self) {
         if !matches!(self.state, State::Idle) {
             self.requery = true;
+            return;
+        }
+
+        // Without the permission the runtime reports no rooms, which must not be mistaken for an
+        // empty room
+        #[cfg(target_os = "android")]
+        if !alvr_system_info::has_permission(USE_SCENE_PERMISSION) {
+            warn!("[SCENE] USE_SCENE permission not granted, scene query skipped");
+            alvr_system_info::try_get_permission(USE_SCENE_PERMISSION);
             return;
         }
 
@@ -308,7 +320,8 @@ impl SceneLoader {
         let results = match self.retrieve_results(request) {
             Ok(results) => results,
             Err(e) => {
-                error!("[SCENE] xrRetrieveSpaceQueryResultsFB failed: {e:?}");
+                error!("[SCENE] xrRetrieveSpaceQueryResultsFB failed: {e:?}, nothing sent");
+                self.finish(None);
                 return;
             }
         };
@@ -393,16 +406,18 @@ impl SceneLoader {
                 ..
             } if *r == request => {
                 if result.into_raw() < 0 {
-                    warn!("[SCENE] room query finished with {result:?}");
+                    warn!("[SCENE] room query failed with {result:?}, nothing sent");
+                    self.finish(None);
+                    return;
                 }
                 let rooms = std::mem::take(rooms);
                 let mut uuids = std::mem::take(anchor_uuids);
                 if uuids.is_empty() {
                     info!("[SCENE] no Space Setup room found on the headset");
-                    self.finish(SceneSnapshot {
+                    self.finish(Some(SceneSnapshot {
                         rooms,
                         ..Default::default()
-                    });
+                    }));
                     return;
                 }
 
@@ -436,11 +451,8 @@ impl SceneLoader {
                         };
                     }
                     Err(e) => {
-                        error!("[SCENE] xrQuerySpacesFB(uuids) failed: {e:?}");
-                        self.finish(SceneSnapshot {
-                            rooms,
-                            ..Default::default()
-                        });
+                        error!("[SCENE] xrQuerySpacesFB(uuids) failed: {e:?}, nothing sent");
+                        self.finish(None);
                     }
                 }
             }
@@ -450,7 +462,9 @@ impl SceneLoader {
                 ..
             } if *r == request => {
                 if result.into_raw() < 0 {
-                    warn!("[SCENE] anchor query finished with {result:?}");
+                    warn!("[SCENE] anchor query failed with {result:?}, nothing sent");
+                    self.finish(None);
+                    return;
                 }
                 *query_done = true;
             }
@@ -477,7 +491,8 @@ impl SceneLoader {
         info!("[SCENE] Space Setup finished: {result:?}");
     }
 
-    /// Call once per frame. Returns a finished snapshot (possibly empty) at most once per query.
+    /// Call once per frame. Returns a finished snapshot at most once per query: complete, or
+    /// empty when the headset has no room. Failed or timed out queries return nothing.
     pub fn update(&mut self, time: xr::Time) -> Option<SceneSnapshot> {
         let now = Instant::now();
         let snapshot = match &self.state {
@@ -488,15 +503,12 @@ impl SceneLoader {
                 };
                 snapshot
             }
-            State::QueryingRooms { deadline, rooms, .. } => {
+            State::QueryingRooms { deadline, .. } => {
                 if now <= *deadline {
                     return None;
                 }
-                warn!("[SCENE] room query timed out");
-                SceneSnapshot {
-                    rooms: rooms.clone(),
-                    ..Default::default()
-                }
+                warn!("[SCENE] room query timed out, nothing sent");
+                None
             }
             State::QueryingAnchors {
                 deadline,
@@ -515,25 +527,26 @@ impl SceneLoader {
                         || self.locate(a.space, time).is_some()
                 });
                 if timed_out {
-                    warn!("[SCENE] anchor query timed out, sending what was loaded");
+                    warn!("[SCENE] anchor query timed out, nothing sent");
+                    None
                 } else if !all_located && *locate_retries < MAX_LOCATE_RETRY_FRAMES {
                     if let State::QueryingAnchors { locate_retries, .. } = &mut self.state {
                         *locate_retries += 1;
                     }
                     return None;
+                } else {
+                    Some(self.build_snapshot(time))
                 }
-
-                self.build_snapshot(time)
             }
         };
 
         self.finish_state();
 
-        Some(snapshot)
+        snapshot
     }
 
-    // Used from event handlers: the snapshot is handed out by the next update()
-    fn finish(&mut self, snapshot: SceneSnapshot) {
+    // Used from event handlers: the result is handed out by the next update()
+    fn finish(&mut self, snapshot: Option<SceneSnapshot>) {
         self.state = State::Done(snapshot);
     }
 

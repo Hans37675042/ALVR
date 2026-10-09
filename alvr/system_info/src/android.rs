@@ -22,6 +22,22 @@ fn get_api_level() -> i32 {
         .unwrap()
 }
 
+pub fn has_permission(permission: &str) -> bool {
+    let vm = vm();
+    let mut env = vm.attach_current_thread().unwrap();
+
+    let permission_jstring = env.new_string(permission).unwrap();
+
+    env.call_method(
+        unsafe { JObject::from_raw(context()) },
+        "checkSelfPermission",
+        "(Ljava/lang/String;)I",
+        &[(&permission_jstring).into()],
+    )
+    .and_then(|status| status.i())
+    .is_ok_and(|status| status == 0)
+}
+
 pub fn try_get_permission(permission: &str) {
     let vm = vm();
     let mut env = vm.attach_current_thread().unwrap();
