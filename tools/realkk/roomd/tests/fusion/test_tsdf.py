@@ -167,3 +167,15 @@ def test_noisy_depth_still_meets_box_top_tolerance():
     scan(fusion, scene, scan_poses(40), noise=0.004, rng=rng)
     _, top_y, _ = fusion.heightmap().sample(0.5, 1.5)
     assert abs(top_y - 0.45) <= 0.01
+
+
+def test_floor_plane_ignores_low_platform_within_search_band():
+    # a 10 cm high platform covering as much area as the visible floor (real tap: low
+    # furniture inside the +-15 cm floor search band dragged the fit to rms 6.8 cm)
+    scene = SynthScene(floor_y=0.0, boxes=[((-0.8, 0.0, 1.2), (1.8, 0.10, 2.6))])
+    fusion = TsdfFusion(FusionConfig())
+    first_frame(fusion, scene)
+    scan(fusion, scene, scan_poses())
+    fp = fusion.floor_plane()
+    assert abs(fp.y) <= 0.005
+    assert fp.rms < 0.01
