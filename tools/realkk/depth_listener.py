@@ -74,8 +74,13 @@ def room_request_message(recapture):
     return struct.pack("<II", MSG_ROOM_REQUEST, len(payload)) + payload
 
 
-def parse_room_snapshot(payload):
-    """MSG_ROOM_SNAPSHOT (CONTRACT-roomd.md). Poses are (px, py, pz, qx, qy, qz, qw), recentered."""
+def parse_room_snapshot(payload, unpack_mesh=True):
+    """MSG_ROOM_SNAPSHOT (CONTRACT-roomd.md). Poses are (px, py, pz, qx, qy, qz, qw), recentered.
+
+    This is the only parser of the layout; roomd.protocol.decode_room_snapshot wraps it.
+    unpack_mesh=False leaves each mesh's data as raw little-endian bytes ("vertex_data" f32x3,
+    "index_data" u32) instead of Python tuples, for callers that load them into arrays.
+    """
     header_size, version, snapshot_id = struct.unpack_from("<III", payload, 0)
     snap = {
         "version": version,
@@ -95,18 +100,20 @@ def parse_room_snapshot(payload):
         pose = struct.unpack_from("<7f", payload, off + 16)
         vcount, icount = struct.unpack_from("<II", payload, off + 44)
         off += 52
-        flat = struct.unpack_from("<%df" % (3 * vcount), payload, off)
-        off += 12 * vcount
-        indices = struct.unpack_from("<%dI" % icount, payload, off)
-        off += 4 * icount
-        meshes.append({
-            "anchor_uuid": anchor_uuid,
-            "pose": pose,
-            "vcount": vcount,
-            "icount": icount,
-            "vertices": [flat[i:i + 3] for i in range(0, len(flat), 3)],
-            "indices": indices,
-        })
+        vertex_data = bytes(payload[off:off + 12 * vcount])
+        index_data = bytes(payload[off + 12 * vcount:off + 12 * vcount + 4 * icount])
+        if len(vertex_data) != 12 * vcount or len(index_data) != 4 * icount:
+            raise struct.error("room snapshot mesh data truncated")
+        off += 12 * vcount + 4 * icount
+        mesh = {"anchor_uuid": anchor_uuid, "pose": pose, "vcount": vcount, "icount": icount}
+        if unpack_mesh:
+            flat = struct.unpack("<%df" % (3 * vcount), vertex_data)
+            mesh["vertices"] = [flat[i:i + 3] for i in range(0, len(flat), 3)]
+            mesh["indices"] = struct.unpack("<%dI" % icount, index_data)
+        else:
+            mesh["vertex_data"] = vertex_data
+            mesh["index_data"] = index_data
+        meshes.append(mesh)
     snap["meshes"] = meshes
     return snap
 
