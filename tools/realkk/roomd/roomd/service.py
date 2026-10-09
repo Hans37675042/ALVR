@@ -149,8 +149,12 @@ class RoomService:
         room.FloorY = out.floor_y if out.floor_y is not None else (sc.FloorY if sc else 0.0)
         room.FloorRms = out.floor_rms if out.floor_rms is not None else (sc.FloorRms if sc else 0.0)
         room.Walls = list(out.walls) if out.walls is not None else (list(sc.Walls) if sc else [])
-        room.Objects = (list(sc.Objects) if sc else []) + list(out.objects or [])
-        room.Seats = (list(sc.Seats) if sc else []) + list(out.seats or [])
+        # The sink's version of an object wins over the Scene API copy with the same id
+        # (semantics tracks scene objects and moves them with the fused geometry).
+        own = {o.Id for o in out.objects or []}
+        room.Objects = [o for o in (sc.Objects if sc else []) if o.Id not in own] + list(out.objects or [])
+        room.Seats = ([s for s in (sc.Seats if sc else []) if s.ObjectId not in own]
+                      + list(out.seats or []))
         now = utc_now()
         for o in room.Objects:
             d = M.object_to_dict(o)
