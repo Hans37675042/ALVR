@@ -4,7 +4,7 @@ import numpy as np
 
 from roomd.semantics import Obb, SyntheticRoom
 from roomd.semantics.geometry import (
-    detect_walls, fit_floor, footprint_iou, label_components, min_area_rect)
+    detect_walls, fit_floor, footprint_iou, label_components, min_area_rect, rasterize_max)
 
 
 def _rect_points(cx, cz, deg, w, d, step=0.02):
@@ -73,3 +73,26 @@ def test_detect_walls_finds_room_box():
         on_x = abs(abs(ax) - 2.5) < 0.05 and abs(abs(bx) - 2.5) < 0.05
         on_z = abs(abs(az) - 2.0) < 0.05 and abs(abs(bz) - 2.0) < 0.05
         assert on_x or on_z
+
+
+def test_raster_of_voxel_lattice_points_has_no_holes():
+    # TSDF surface points sit exactly on the 2 cm voxel grid (multiples of the cell size)
+    i, k = np.meshgrid(np.arange(20, 41), np.arange(13, 31))
+    pts = np.column_stack([i.ravel() * 0.02, np.full(i.size, 0.45), k.ravel() * 0.02])
+    r = rasterize_max(pts, 0.02)
+    mask = np.isfinite(r.top)
+    assert mask.sum() == i.size
+    labels, n = label_components(mask, r.top, 0.1)
+    assert n == 1
+
+
+def test_raster_fills_isolated_dropouts():
+    rng = np.random.default_rng(1)
+    i, k = np.meshgrid(np.arange(0, 25), np.arange(0, 20))
+    pts = np.column_stack([i.ravel() * 0.02 + 0.003, np.full(i.size, 0.45), k.ravel() * 0.02 + 0.004])
+    keep = rng.uniform(size=len(pts)) > 0.1
+    r = rasterize_max(pts[keep], 0.02)
+    mask = np.isfinite(r.top)
+    labels, n = label_components(mask, r.top, 0.1)
+    assert n == 1
+    assert mask.sum() >= 0.97 * i.size
