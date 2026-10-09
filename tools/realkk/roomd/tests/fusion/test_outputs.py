@@ -118,5 +118,12 @@ def test_force_snapshot_returns_everything(session):
     fusion, _, _, _ = session
     out = fusion.snapshot_outputs(now=200.0, force=True)
     assert out.heightmap is not None
+    verts, _ = fusion.extract_mesh()
+    assert len(verts) == 0  # box removed, floor excluded: nothing left
+
+
+def test_extract_mesh_merges_chunks(scanned):
+    fusion, _ = scanned
     verts, idx = fusion.extract_mesh()
-    assert len(verts) > 0 and idx.max() < len(verts)
+    assert len(verts) > 0 and len(idx) % 3 == 0 and idx.max() < len(verts)
+    assert np.abs(verts[:, 1] - 0.45).min() < 0.01

@@ -49,8 +49,9 @@ def test_region_fractions_on_present_box(scanned):
     assert fusion.occupied_fraction(BOX_BODY) > 0.1
     assert fusion.visible_fraction(BOX_BODY, max_age_frames=30) > 0.1
     air = Obb(center=(0.5, 1.0, 1.5), half_extents=(0.25, 0.2, 0.25))
-    assert fusion.free_fraction(air) > 0.95
-    assert fusion.occupied_fraction(air) == 0.0
+    stats = fusion.region_stats(air)
+    assert stats["free"] > 0.8 * stats["total"]  # the rest is outside every view: unknown
+    assert stats["occupied"] == 0
 
 
 def test_obb_yaw_selects_rotated_region(scanned):
@@ -134,7 +135,8 @@ def test_mask_border_range_and_grazing():
     masked = fusion.masked_depth(floor.frame_payload((0, 0.3, 0), (0, 0.3, 3.0), width=100, height=100))
     for m in masked:
         assert np.count_nonzero(m[52:58, 20:80]) == 0
-        assert np.count_nonzero(m[80:90, 20:80]) > 0
+        # rows below ~66 hit the floor closer than min_depth; 68..74 are 70 deg off-normal
+        assert np.count_nonzero(m[68:74, 20:80]) > 0
 
 
 def test_prior_mesh_low_weight_and_overridden_by_depth():
