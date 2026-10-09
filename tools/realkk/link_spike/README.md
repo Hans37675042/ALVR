@@ -8,13 +8,14 @@ KKS 走 OpenVR，所以就算可行，這條路也只是開發／測試管道；
 
 ## 判讀標準
 
-**可行＝深度 ≥ 9 fps 而且讀得到像素，並且有 scene 資料。** `report.json` 的
+**可行＝深度 ≥ 9 fps（且中間沒有超過 500 ms 的斷流）而且讀得到像素，並且有 scene 資料。** `report.json` 的
 `verdict.feasible` 會照這條自動算：
 
 | 欄位 | 意思 |
 |---|---|
-| `verdict.depth_fps` | 10 秒內「內容有變」的深度幀數換算的 fps（同一張圖重複拿到不算） |
-| `verdict.depth_pixels_ok` | D3D11 readback 全程沒有錯 |
+| `verdict.depth_fps` | 新深度幀數 ÷ 整個擷取窗口秒數（預設 10 秒）；同一張圖重複 acquire 不算新幀 |
+| `verdict.depth_fps_ok` | `depth_fps` ≥ 9 且相鄰新幀最大間隔 `max_gap_ms` < 500 |
+| `verdict.depth_pixels_ok` | 至少寫出一幀像素，且 D3D11 readback 全程沒有錯 |
 | `verdict.scene_ok` | 至少拿到一個 room layout 或一個有 label 的 anchor |
 | `verdict.last_failed_step` | 最後失敗的步驟名稱，可對照下面的「失敗點對照表」 |
 
@@ -27,7 +28,8 @@ KKS 走 OpenVR，所以就算可行，這條路也只是開發／測試管道；
 3. 建 instance（開 runtime 有提供的 D3D11／headless／depth／scene／mesh 相關擴充）並取 HMD system。
 4. 建 session：有 `XR_KHR_D3D11_enable` 就用最小 D3D11 device。深度像素要靠圖形 API 才讀得出來，
    所以 D3D11 優先；只有在沒有 D3D11 但有 `XR_MND_headless` 時才退到 headless，這時只做 scene。
-5. 深度（`--seconds`，預設 10 秒）：建 provider／swapchain、start、每幀 acquire，
+5. 深度（`--seconds`，預設 10 秒）：session 跑起來後先等 2 秒，建 provider／swapchain、start
+   （暫時失敗就每秒重試，最多 5 次，跟 fork client 的做法一樣），空一幀後每幀 acquire，
    D3D11 把兩個 array slice 讀回 CPU，上下堆疊（view 0 在上），以 `MSG_DEPTH_FRAME_V2`
    版面寫進 `depth.rktap`。格式是 RawD16（format 0），值是 runtime 給的原始 D16，跟 fork 一樣不換算。
 6. 場景：`xrQuerySpacesFB(ROOM_LAYOUT)` 拿 floor／ceiling／walls uuid，
@@ -84,7 +86,7 @@ KKS 走 OpenVR，所以就算可行，這條路也只是開發／測試管道；
 |---|---|
 | `report.json` | 每步結果、XrResult、session 狀態變化、`verdict` |
 | `extensions.json` | runtime 名稱／版本、全部擴充與版本、目標擴充是否存在 |
-| `depth_summary.json` | 解析度、texture 描述、acquire 統計、fps、最大間隔、near/far、首末幀 pose／FOV／intrinsics、D16 值域 |
+| `depth_summary.json` | 解析度、texture 描述、acquire 統計、fps（窗口）與 span_fps（首末幀間）、最大間隔、像素變化次數、near/far、首末幀 pose／FOV／intrinsics、D16 值域 |
 | `depth.rktap` | 深度幀，可直接給 `tap_inspect.py`／融合工具讀 |
 | `scene.json` | room layout、每個 anchor 的 label／component／bbox／pose、mesh 三角形數 |
 
@@ -108,7 +110,7 @@ python tap_inspect.py --no-decode link_spike\out\<時間戳>\depth.rktap
 | `depth_create` 某步失敗 | 看該步的 XrResult；`environment_depth_props.supports_environment_depth` 為 false 表示 runtime 不支援 |
 | `depth_capture` 的 acquire 全是 not_available | Passthrough over Link 沒開，或缺權限 |
 | `readback_errors` 有內容 | runtime 給的 texture 格式／版面跟預期不同；附上 `depth_summary.json` 的 `texture_desc` 回報 |
-| `fps` < 9 | Link 頻寬或 dev runtime 限制，記錄 `max_gap_ms` |
+| `fps` < 9 或 `max_gap_ms` ≥ 500 | Link 頻寬或 dev runtime 限制；`span_fps` 高但 `fps` 低表示一開始有流、後來停了 |
 | `scene` 的 `anchor_count` 為 0 | Spatial Data over Link 沒開、沒做 Space Setup，或空間資料權限被拒 |
 
 ## 已知假設與限制
@@ -119,7 +121,11 @@ python tap_inspect.py --no-decode link_spike\out\<時間戳>\depth.rktap
   跨管道比對不能假設同一個原點。
 - **時間**：`client_timestamp_ns` 是 predicted display time，不是深度實際擷取時間；
   有 `XR_KHR_win32_convert_performance_counter_time` 時會算出 unix−XrTime 的 offset 填進 header。
-- **新幀判定**：用像素內容的 hash；同一張圖被重複 acquire 不算新幀。
+- **新幀判定**：swapchain index 或深度相機 pose 改變才算新幀（不用像素 hash，避免讀到寫一半的圖灌高 fps）；
+  像素實際變了幾次另記在 `pixel_changes`，跟 `new_frames` 差很多時值得回報。
+- **readback 防呆**：texture 不屬於程式自己的 D3D11 device、或尺寸跟 swapchain state 不符時，記成 readback error 而不是硬讀。
+- **runtime DLL**：先一般載入，失敗再把 DLL 所在目錄加進相依搜尋路徑重試（同 Khronos loader）；DLL 不會在結束前卸載。
+- **label**：讀 semantic label 時帶 support info（讓 GLOBAL_MESH 等新 label 可見），runtime 拒絕就不帶再讀一次。
 - 程式沒有開 passthrough layer。如果 acquire 一直 not_available 而開關都對，下一步是加上
   `XR_FB_passthrough` 啟動後再試（目前不在 spike 範圍）。
 - 沒做 hand removal、沒觸發 Space Setup（`XR_FB_scene_capture`）。
@@ -142,6 +148,9 @@ python tap_inspect.py --no-decode link_spike\out\<時間戳>\depth.rktap
 - 為了驗證自製的 runtime 載入／negotiation 與擴充列舉，用 `--list-only --runtime-json`
   對 Virtual Desktop runtime 跑過一次（不建 instance）：negotiation 成功（runtime API 1.0.34），
   列出 30 個擴充；VD 沒有 depth／scene 類擴充，這是預期中的。SteamVR runtime 刻意沒碰。
-- `cargo test`：`tap_layout` 3 項、`d3d_readback` 1 項全過（後者用 D16_UNORM depth-stencil texture array）。
+- `cargo test`：`tap_layout` 3 項、`d3d_readback` 1 項全過（後者用 D16_UNORM depth-stencil texture array，
+  另驗尺寸不符時回錯）。
+- 程式另經一輪獨立 code review，8 項意見（fps 定義、DLL 搜尋路徑、provider 重試、跨 device texture、
+  尺寸核對、新幀判定、DLL 卸載、label 退路）都已修正。
 - `--synth-tap` 產出的檔案用 `tap_inspect.py` 讀取正常，`depth_listener.decode_d16` 解出 640×320。
 - instance 之後的步驟（system、session、frame loop、depth acquire、scene query）要接頭盔才驗得到。
