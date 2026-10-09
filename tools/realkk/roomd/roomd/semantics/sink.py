@@ -77,8 +77,12 @@ class SemanticsSink(FusionSink):
             return out
         frag = self.semantics.update(self.view, self.clock(), self._labels, self._head)
         room = M.room_from_dict(dict(frag, Version=M.CURRENT_VERSION))
+        # Geometry-only "Other" objects are not published: obstacles reach the plugin through
+        # NAV_HEIGHTMAP and occlusion through MESH_CHUNK; they stay tracked here so they
+        # still absorb clutter. Scene API "Other" objects (labelled) are published.
         objects = [o for o in room.Objects
-                   if self.publish_scene_objects or o.Source != M.SOURCE_SCENE]
+                   if (self.publish_scene_objects or o.Source != M.SOURCE_SCENE)
+                   and not (o.Source == M.SOURCE_FUSED and o.Kind == M.Kind.Other)]
         ids = {o.Id for o in objects}
         out.objects = objects
         out.seats = [s for s in room.Seats if s.ObjectId in ids]
