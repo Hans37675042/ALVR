@@ -776,6 +776,28 @@ mod tests {
     }
 
     #[test]
+    fn raw_d16_frame_is_relayed_as_format_0_with_pixels_untouched() {
+        let header = DepthFrameHeader {
+            format: DepthFrameFormat::RawD16,
+            ..sample_header()
+        };
+        // Both stacked views of 320x320 u16, as the client sends them uncompressed
+        let data: Vec<u8> = (0..320 * 640 * 2).map(|i| (i % 251) as u8).collect();
+        let timing = DepthTiming {
+            server_timestamp_unix_ns: 1,
+            clock_offset_ns: 0,
+            server_receive_unix_ns: 2,
+        };
+        let buf = encode_depth_frame(&header, &timing, &data);
+
+        assert_eq!(u32_at(&buf, 84), 0);
+        assert_eq!(u32_at(&buf, 68), 320);
+        assert_eq!(u32_at(&buf, 72), 640);
+        assert_eq!(buf.len(), DEPTH_FRAME_V2_HEADER_SIZE as usize + 409_600);
+        assert_eq!(&buf[DEPTH_FRAME_V2_HEADER_SIZE as usize..], &data[..]);
+    }
+
+    #[test]
     fn clock_offset_uses_minimum_latency_sample_in_window() {
         let mut est = ClientClockOffsetEstimator::new(Duration::from_secs(10));
         let t0 = Instant::now();
