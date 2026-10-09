@@ -514,6 +514,12 @@ fn connection_pipeline(
                         );
                     }
                     Ok(ServerControlPacket::KeepAlive) => (),
+                    Ok(ServerControlPacket::SceneRequest { recapture }) => {
+                        info!("Scene request: recapture={recapture}");
+                        event_queue
+                            .lock()
+                            .push_back(ClientCoreEvent::SceneRequest { recapture });
+                    }
                     Ok(
                         ServerControlPacket::Reserved(_) | ServerControlPacket::ReservedBuffer(_),
                     ) => {}

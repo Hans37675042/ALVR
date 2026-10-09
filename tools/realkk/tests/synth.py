@@ -41,3 +41,29 @@ def depth_payload(width=4, height=4, fmt=2, pixels=None, near=0.1, far=float("in
 def fake_depth_payload(width=4, height=4, fmt=2):
     """Frame produced by a failed GPU readback: every D16 sample is 0x8080."""
     return depth_payload(width, height, fmt, pixels=[0x8080] * (width * height))
+
+
+def room_snapshot_payload(snapshot_id, recenter, scene, meshes, extra_header=b""):
+    """MSG_ROOM_SNAPSHOT per CONTRACT-roomd.md. meshes: [(uuid16, pose7, vertices, indices)].
+
+    extra_header simulates header fields appended by a newer streamer.
+    """
+    import json
+
+    header_size = 40 + len(extra_header)
+    buf = struct.pack("<III", header_size, 1, snapshot_id) + struct.pack("<7f", *recenter)
+    buf += extra_header
+    text = json.dumps(scene).encode()
+    buf += struct.pack("<I", len(text)) + text
+    buf += struct.pack("<I", len(meshes))
+    for uuid, pose, vertices, indices in meshes:
+        buf += uuid + struct.pack("<7f", *pose) + struct.pack("<II", len(vertices), len(indices))
+        for v in vertices:
+            buf += struct.pack("<3f", *v)
+        buf += struct.pack("<%dI" % len(indices), *indices)
+    return buf
+
+
+def playspace_payload(recenter):
+    """MSG_PLAYSPACE_CHANGED: u32 version, f32x7 recenter pose (px py pz qx qy qz qw)."""
+    return struct.pack("<I7f", 1, *recenter)

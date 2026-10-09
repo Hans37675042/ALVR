@@ -186,6 +186,14 @@ pub fn build_streamer(
         )
         .unwrap();
 
+        // libvpl 2.x builds a shared library by default, in which case vpl.lib is only an import
+        // library and driver_alvr_server.dll needs libvpl.dll next to it (else SteamVR error 126)
+        let libvpl_dll = afs::deps_dir().join("windows/libvpl/alvr_build/bin/libvpl.dll");
+        if libvpl_dll.exists() {
+            sh.copy_file(libvpl_dll, build_layout.openvr_driver_lib_dir())
+                .unwrap();
+        }
+
         // copy ffmpeg binaries
         if gpl {
             let bin_dir = &build_layout.openvr_driver_lib_dir();
