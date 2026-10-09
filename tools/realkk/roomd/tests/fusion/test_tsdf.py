@@ -4,7 +4,7 @@ import pytest
 from roomd.fusion import FusionConfig, Obb, TsdfFusion
 from roomd.fusion.synthscene import SynthScene, box_mesh
 
-from conftest import (BOX_CENTER, BOX_MAX, BOX_MIN, HEAD_START, box_scene, first_frame, scan,
+from fusionkit import (BOX_CENTER, BOX_MAX, BOX_MIN, HEAD_START, box_scene, first_frame, scan,
                       scan_poses)
 
 # Box volume minus the floor's own truncation band.

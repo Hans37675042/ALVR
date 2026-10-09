@@ -6,7 +6,7 @@ import pytest
 from roomd.fusion import decode as dec
 from roomd.fusion.synthscene import SynthScene, encode_payload, look_at_xr, metric_payload
 
-from conftest import BOX_MAX, BOX_MIN
+from fusionkit import BOX_MAX, BOX_MIN
 
 Q = (0.1, 0.2, 0.3, math.sqrt(1 - 0.14))
 

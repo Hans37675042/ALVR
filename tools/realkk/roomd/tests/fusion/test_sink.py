@@ -1,17 +1,13 @@
 import numpy as np
 import pytest
 
-from roomd_io_stubs import ensure_io_modules
+from roomd import protocol
+from roomd.fusion import create_sink
+from roomd.fusion.sink import TsdfFusionSink
+from roomd.fusion.synthscene import box_mesh
+from roomd.sink import FusionSink, ScenePrior, load_sink
 
-ensure_io_modules()
-
-from roomd import protocol  # noqa: E402
-from roomd.sink import FusionSink, ScenePrior  # noqa: E402
-from roomd.fusion import create_sink  # noqa: E402
-from roomd.fusion.sink import TsdfFusionSink  # noqa: E402
-from roomd.fusion.synthscene import box_mesh  # noqa: E402
-
-from conftest import BOX_MAX, BOX_MIN, HEAD_START, box_scene, scan_poses  # noqa: E402
+from fusionkit import BOX_MAX, BOX_MIN, HEAD_START, box_scene, scan_poses
 
 IDENTITY = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 
@@ -41,6 +37,8 @@ def test_factory_returns_fusion_sink():
     sink = create_sink()
     assert isinstance(sink, FusionSink) and isinstance(sink, TsdfFusionSink)
     assert sink.name == "tsdf"
+    for spec in ("roomd.fusion:create_sink", "roomd.fusion.sink:create_sink"):
+        assert isinstance(load_sink(spec), TsdfFusionSink)
 
 
 def test_snapshot_maps_to_io_outputs(fed):

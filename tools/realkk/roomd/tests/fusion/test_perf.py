@@ -4,7 +4,7 @@ import numpy as np
 
 from roomd.fusion import FusionConfig, TsdfFusion
 
-from conftest import box_scene, first_frame, scan_poses
+from fusionkit import box_scene, first_frame, scan_poses
 
 
 def test_integrate_latency_report():

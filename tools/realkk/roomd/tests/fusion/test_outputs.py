@@ -7,7 +7,7 @@ from roomd.fusion import FusionConfig, TsdfFusion
 from roomd.fusion.outputs import (decode_mesh_chunk, decode_nav_heightmap, encode_mesh_chunk,
                                   encode_nav_heightmap)
 
-from conftest import box_scene, first_frame, scan, scan_poses
+from fusionkit import box_scene, first_frame, scan, scan_poses
 
 BOX_CHUNK = (0, 0, 1)  # chunk holding the box: x 0..1, y 0..1, z 1..2
 
