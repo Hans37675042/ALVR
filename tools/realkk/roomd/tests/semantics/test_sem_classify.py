@@ -206,7 +206,7 @@ def test_low_box_against_taller_furniture_is_not_a_chair():
     # real tap: suitcase / basket drawers next to taller furniture read as seat + backrest
     from roomd.semantics import Obb
     suitcase = Obb(0.0, 0.0, 0.0, 0.5, 0.35, 0.0, 0.5)
-    shelf = Obb(0.0, -0.32, 0.0, 0.6, 0.28, 0.0, 1.2)
+    shelf = Obb(0.0, -0.335, 0.0, 0.6, 0.28, 0.0, 1.2)  # 2 cm behind the suitcase
     cands = _detect([suitcase, shelf])
     assert cands and not any(c.sittable for c in cands), [(c.kind, c.sx, c.sz) for c in cands]
 
