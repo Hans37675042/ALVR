@@ -116,4 +116,76 @@ mod tests {
         set.record("map_ms", 2.0);
         assert_eq!(set.format_and_reset(), "map_ms p50 2.00 p95 2.00 max 2.00 (n=1)");
     }
+
+    use std::time::{Duration, Instant};
+
+    /// Runs the pacer against a fixed display clock; returns the capture times (seconds).
+    fn simulate_pacer(
+        refresh_hz: f64,
+        seconds: f64,
+        interval: Duration,
+        stall: Option<(f64, f64)>,
+    ) -> Vec<f64> {
+        let t0 = Instant::now();
+        let mut pacer = CapturePacer::default();
+        let mut captures = vec![];
+        let frames = (refresh_hz * seconds) as u64;
+        for k in 0..frames {
+            let t = k as f64 / refresh_hz;
+            if let Some((at, length)) = stall
+                && t >= at
+                && t < at + length
+            {
+                continue; // no frames rendered during the stall
+            }
+            let now = t0 + Duration::from_secs_f64(t);
+            if pacer.is_due(now) {
+                pacer.on_captured(now, interval);
+                captures.push(t);
+            }
+        }
+        captures
+    }
+
+    #[test]
+    fn pacer_holds_target_rate_at_common_refresh_rates() {
+        for hz in [72.0, 90.0, 120.0] {
+            let captures = simulate_pacer(hz, 10.0, Duration::from_millis(100), None);
+            let fps = captures.len() as f64 / 10.0;
+            assert!((fps - 10.0).abs() <= 0.2, "{hz} Hz -> {fps} fps");
+        }
+    }
+
+    #[test]
+    fn pacer_does_not_burst_after_a_stall() {
+        let captures = simulate_pacer(72.0, 3.0, Duration::from_millis(100), Some((1.0, 0.2)));
+        let min_gap = captures
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f64::MAX, f64::min);
+        // Frame-quantized gaps at 72 Hz never drop below ~86 ms unless captures bunch up
+        assert!(min_gap > 0.08, "captures bunched up after the stall: gap {min_gap}");
+    }
+
+    #[test]
+    fn pacer_retries_on_the_next_frame_when_nothing_was_captured() {
+        let t0 = Instant::now();
+        let mut pacer = CapturePacer::default();
+        assert!(pacer.is_due(t0));
+        // e.g. the runtime had no depth image yet: do not wait a full interval
+        let next_frame = t0 + Duration::from_millis(14);
+        assert!(pacer.is_due(next_frame));
+        pacer.on_captured(next_frame, Duration::from_millis(100));
+        assert!(!pacer.is_due(next_frame + Duration::from_millis(50)));
+        assert!(pacer.is_due(next_frame + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn pacer_defer_waits_one_interval_from_now() {
+        let t0 = Instant::now();
+        let mut pacer = CapturePacer::default();
+        pacer.defer(t0, Duration::from_millis(100));
+        assert!(!pacer.is_due(t0 + Duration::from_millis(99)));
+        assert!(pacer.is_due(t0 + Duration::from_millis(100)));
+    }
 }
