@@ -212,3 +212,24 @@ def test_structure_cut_follows_fusion_heightmap_cap():
         structure_min_h=1.5), obb_cls=FakeFusionObb)
     assert explicit.semantics.p.structure_min_h == 1.5
     assert SemanticsSink(FakeInner(_room()), obb_cls=FakeFusionObb).semantics.p.structure_min_h is None
+
+
+def test_fused_other_objects_are_not_published_but_scene_other_is():
+    from roomd.semantics.synthetic import storage
+    room = _room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    room.place("box", storage(-1.2, -1.0, 0.0, w=0.6, d=0.4, h=0.8))
+    room.place("cab", storage(1.5, -1.5, 0.0, w=0.8, d=0.4, h=0.9))
+    sink = _sink(room)
+    cab = M.RoomObject(Id="scene:cab", Kind=M.Kind.Other, Source=M.SOURCE_SCENE, Label="STORAGE",
+                       Pose=M.Pose(M.Vec3(1.5, 0.0, -1.5), M.Quat.from_yaw(0.0)),
+                       Size=M.Vec3(0.8, 0.9, 0.4), Locked=False)
+    sink.set_scene_prior(ScenePrior(snapshot_id=1, floor_y=0.0, objects=[cab], walls=[]))
+    for _ in range(4):
+        out = sink.snapshot_outputs()
+    published = {(o.Id, o.Kind, o.Source) for o in out.objects}
+    assert ("scene:cab", M.Kind.Other, M.SOURCE_SCENE) in published
+    assert not any(k == M.Kind.Other and s == M.SOURCE_FUSED for _, k, s in published)
+    assert any(k == M.Kind.Chair for _, k, _ in published)
+    assert any(o["Kind"] == "Other" and o["Source"] == "Fused"
+               for o in sink.semantics._output(0.0, 0.0)["Objects"])  # still tracked internally
