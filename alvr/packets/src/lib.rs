@@ -260,17 +260,54 @@ pub enum DepthFrameFormat {
     Lz4D16,
 }
 
+/// Header of one environment depth frame (XR_META_environment_depth).
+///
+/// The payload contains both depth views stacked vertically: view 0 (left) in the top half,
+/// view 1 (right) in the bottom half, each `width` x `height / 2`, rows ordered top-down.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DepthFrameHeader {
     pub timestamp: Duration,
-    pub head_pose: Pose,
+    /// Pose of each depth view (0 = left, 1 = right), as returned by
+    /// xrAcquireEnvironmentDepthImageMETA in the client's stage reference space.
+    /// The depth cameras are not the eye cameras, so each view must be unprojected with its own
+    /// pose and FOV.
+    pub view_poses: [Pose; 2],
     pub width: u32,
+    /// Total height of the stacked image (two views).
     pub height: u32,
     pub near_z: f32,
     pub far_z: f32,
     pub format: DepthFrameFormat,
-    // Camera intrinsics per eye (fx, fy, cx, cy)
-    pub intrinsics: [[f32; 4]; 2],
+    /// Per-view OpenXR `XrFovf` half-angles in radians: [left, right, up, down]
+    /// (left and down are usually negative). These are angles, not pinhole intrinsics; use
+    /// [`fov_to_pinhole_intrinsics`] to convert.
+    pub fov_angles: [[f32; 4]; 2],
+}
+
+impl DepthFrameHeader {
+    /// Pinhole intrinsics (fx, fy, cx, cy) in pixels for one view of this frame.
+    pub fn view_intrinsics(&self, view: usize) -> [f32; 4] {
+        fov_to_pinhole_intrinsics(self.fov_angles[view], self.width, self.height / 2)
+    }
+}
+
+/// Convert OpenXR FOV half-angles [left, right, up, down] (radians) into pinhole intrinsics
+/// [fx, fy, cx, cy] (pixels) for an image of `width` x `height` whose rows are ordered top-down
+/// (pixel y grows downwards) and whose pixel centers sit at half-integer coordinates.
+///
+/// A view-space point (x, y, z) with z < 0 in front of the camera (OpenXR convention) maps to
+/// u = fx * (x / -z) + cx, v = fy * (-y / -z) + cy.
+pub fn fov_to_pinhole_intrinsics(fov: [f32; 4], width: u32, height: u32) -> [f32; 4] {
+    let [left, right, up, down] = fov;
+    let (tan_l, tan_r, tan_u, tan_d) = (left.tan(), right.tan(), up.tan(), down.tan());
+    let (w, h) = (width as f32, height as f32);
+
+    let fx = w / (tan_r - tan_l);
+    let fy = h / (tan_u - tan_d);
+    let cx = -tan_l * fx;
+    let cy = tan_u * fy;
+
+    [fx, fy, cx, cy]
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -393,5 +430,61 @@ impl RealTimeConfig {
             xr_data_config: settings.video.xr_data.clone().into_option(),
             ext_str: String::new(), // No extensions for now
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn symmetric_fov_gives_centered_principal_point() {
+        let a = std::f32::consts::FRAC_PI_4;
+        let [fx, fy, cx, cy] = fov_to_pinhole_intrinsics([-a, a, a, -a], 320, 240);
+        assert!(approx(fx, 160.0) && approx(fy, 120.0));
+        assert!(approx(cx, 160.0) && approx(cy, 120.0));
+    }
+
+    #[test]
+    fn fov_edges_project_to_image_borders() {
+        // Asymmetric FOV like a real depth view
+        let fov = [-0.9_f32, 0.6, 0.7, -0.8];
+        let (w, h) = (320, 320);
+        let [fx, fy, cx, cy] = fov_to_pinhole_intrinsics(fov, w, h);
+
+        // Ray along the left/up edges (z = -1): x = tan(left), y = tan(up)
+        let u_left = fx * fov[0].tan() + cx;
+        let u_right = fx * fov[1].tan() + cx;
+        let v_top = fy * -fov[2].tan() + cy;
+        let v_bottom = fy * -fov[3].tan() + cy;
+
+        assert!(approx(u_left, 0.0), "{u_left}");
+        assert!(approx(u_right, w as f32), "{u_right}");
+        assert!(approx(v_top, 0.0), "{v_top}");
+        assert!(approx(v_bottom, h as f32), "{v_bottom}");
+    }
+
+    #[test]
+    fn view_intrinsics_use_per_view_height() {
+        let a = std::f32::consts::FRAC_PI_4;
+        let header = DepthFrameHeader {
+            timestamp: Duration::ZERO,
+            view_poses: [Pose::IDENTITY; 2],
+            width: 320,
+            height: 640, // two stacked 320x320 views
+            near_z: 0.1,
+            far_z: f32::INFINITY,
+            format: DepthFrameFormat::Lz4D16,
+            fov_angles: [[-a, a, a, -a], [-a, 0.5, a, -a]],
+        };
+        let [_, fy, _, cy] = header.view_intrinsics(0);
+        assert!(approx(fy, 160.0) && approx(cy, 160.0));
+        let [fx1, _, cx1, _] = header.view_intrinsics(1);
+        assert!(approx(fx1, 320.0 / (0.5_f32.tan() + 1.0)));
+        assert!(approx(cx1, fx1));
     }
 }

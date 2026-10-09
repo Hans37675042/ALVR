@@ -918,11 +918,15 @@ impl StreamContext {
             vec![0x80u8; pixel_count * 2 * 2]
         };
 
-        // Build header with pose from first view (left eye)
-        let view = &depth_image.views[0];
-        let head_pose = crate::from_xr_pose(xr::Posef {
-            orientation: view.pose.orientation,
-            position: view.pose.position,
+        // Each depth view has its own pose (stage space) and FOV; the depth cameras are not
+        // the eye cameras, so both must be forwarded for correct unprojection.
+        let view_poses = [
+            crate::from_xr_pose(depth_image.views[0].pose),
+            crate::from_xr_pose(depth_image.views[1].pose),
+        ];
+        let fov_angles = [0, 1].map(|i| {
+            let fov = depth_image.views[i].fov;
+            [fov.angle_left, fov.angle_right, fov.angle_up, fov.angle_down]
         });
 
         // LZ4 compress the raw D16 depth bytes (lossless, fast, ~2-4x compression).
@@ -934,26 +938,13 @@ impl StreamContext {
 
         let header = DepthFrameHeader {
             timestamp: crate::from_xr_time(display_time),
-            head_pose,
+            view_poses,
             width,
             height: stacked_height,
             near_z: depth_image.near_z,
             far_z: depth_image.far_z,
             format: send_format,
-            intrinsics: [
-                [
-                    depth_image.views[0].fov.angle_left,
-                    depth_image.views[0].fov.angle_right,
-                    depth_image.views[0].fov.angle_up,
-                    depth_image.views[0].fov.angle_down,
-                ],
-                [
-                    depth_image.views[1].fov.angle_left,
-                    depth_image.views[1].fov.angle_right,
-                    depth_image.views[1].fov.angle_up,
-                    depth_image.views[1].fov.angle_down,
-                ],
-            ],
+            fov_angles,
         };
 
         self.core_context.send_depth_frame(&header, &send_data);

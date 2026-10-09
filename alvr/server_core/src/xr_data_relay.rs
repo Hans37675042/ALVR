@@ -11,8 +11,10 @@ use alvr_packets::{CameraFrameHeader, DepthFrameHeader};
 
 pub const DEFAULT_VIEWER_PORT: u16 = 9944;
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
-const MSG_DEPTH_FRAME: u32 = 1;
+// Message type 1 (legacy depth layout with a single head pose and FOV angles mislabeled as
+// intrinsics) is no longer sent; viewers must parse MSG_DEPTH_FRAME_V2.
 const MSG_CAMERA_FRAME: u32 = 2;
+const MSG_DEPTH_FRAME_V2: u32 = 3;
 const MSG_STREAM_CONTROL: u32 = 100;
 
 #[derive(Clone, Debug)]
@@ -112,7 +114,7 @@ impl XrDataRelay {
             return;
         }
         let payload = encode_depth_frame(header, data);
-        self.broadcast(MSG_DEPTH_FRAME, &payload);
+        self.broadcast(MSG_DEPTH_FRAME_V2, &payload);
     }
 
     pub fn send_camera_frame(&self, header: &CameraFrameHeader, data: &[u8]) {
@@ -203,30 +205,58 @@ fn read_viewer_commands(
     }
 }
 
-fn encode_depth_frame(header: &DepthFrameHeader, data: &[u8]) -> Vec<u8> {
-    // Header layout (matches test viewer parser):
-    // timestamp(8) + pose(7*4=28) + width(4) + height(4) + near_z(4) + far_z(4) + format(4) + intrinsics(8*4=32) = 88 bytes
-    // Then raw pixel data
-    let mut buf = Vec::with_capacity(88 + data.len());
+fn put_pose(buf: &mut Vec<u8>, pose: &alvr_common::Pose) {
+    // qx, qy, qz, qw, px, py, pz
+    for v in [
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+        pose.position.x,
+        pose.position.y,
+        pose.position.z,
+    ] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
 
-    // timestamp as nanos u64
-    buf.extend_from_slice(&header.timestamp.as_nanos().to_le_bytes()[..8]);
+/// Size of the MSG_DEPTH_FRAME_V2 header. New fields are only ever appended, and the header
+/// starts with its own size, so viewers can skip fields they do not know.
+pub const DEPTH_FRAME_V2_HEADER_SIZE: u32 = 152;
 
-    // pose: qx, qy, qz, qw, px, py, pz
-    buf.extend_from_slice(&header.head_pose.orientation.x.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.orientation.y.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.orientation.z.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.orientation.w.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.position.x.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.position.y.to_le_bytes());
-    buf.extend_from_slice(&header.head_pose.position.z.to_le_bytes());
+/// MSG_DEPTH_FRAME_V2 payload layout (all little-endian):
+///
+/// | offset | type      | field                                                        |
+/// |--------|-----------|--------------------------------------------------------------|
+/// | 0      | u32       | header_size (bytes, including this field; pixel data follows) |
+/// | 4      | u64       | client_timestamp_ns (client XR time of the requested frame)  |
+/// | 12     | f32 x 7   | view_pose[0] qx qy qz qw px py pz (client stage space)       |
+/// | 40     | f32 x 7   | view_pose[1]                                                 |
+/// | 68     | u32       | width                                                        |
+/// | 72     | u32       | height (stacked: view 0 top half, view 1 bottom half)        |
+/// | 76     | f32       | near_z (m)                                                   |
+/// | 80     | f32       | far_z (m, may be +inf)                                       |
+/// | 84     | u32       | format (0 = RawD16, 1 = H264, 2 = Lz4D16)                    |
+/// | 88     | f32 x 4   | fov_angles[0] left right up down (radians)                   |
+/// | 104    | f32 x 4   | fov_angles[1]                                                |
+/// | 120    | f32 x 4   | intrinsics[0] fx fy cx cy (pixels, per-view image, y down)   |
+/// | 136    | f32 x 4   | intrinsics[1]                                                |
+/// | 152    | u8[]      | pixel data                                                   |
+pub fn encode_depth_frame(header: &DepthFrameHeader, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DEPTH_FRAME_V2_HEADER_SIZE as usize + data.len());
+
+    buf.extend_from_slice(&DEPTH_FRAME_V2_HEADER_SIZE.to_le_bytes());
+    buf.extend_from_slice(&(header.timestamp.as_nanos() as u64).to_le_bytes());
+
+    for pose in &header.view_poses {
+        put_pose(&mut buf, pose);
+    }
 
     buf.extend_from_slice(&header.width.to_le_bytes());
     buf.extend_from_slice(&header.height.to_le_bytes());
     buf.extend_from_slice(&header.near_z.to_le_bytes());
     buf.extend_from_slice(&header.far_z.to_le_bytes());
 
-    // depth format: 0=RawD16, 1=H264, 2=Lz4D16
     let format_id: u32 = match &header.format {
         alvr_packets::DepthFrameFormat::RawD16 => 0,
         alvr_packets::DepthFrameFormat::H264 => 1,
@@ -234,12 +264,19 @@ fn encode_depth_frame(header: &DepthFrameHeader, data: &[u8]) -> Vec<u8> {
     };
     buf.extend_from_slice(&format_id.to_le_bytes());
 
-    // intrinsics: [eye0: left,right,up,down] [eye1: left,right,up,down]
-    for eye in &header.intrinsics {
-        for val in eye {
+    for fov in &header.fov_angles {
+        for val in fov {
             buf.extend_from_slice(&val.to_le_bytes());
         }
     }
+
+    for view in 0..2 {
+        for val in header.view_intrinsics(view) {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    debug_assert_eq!(buf.len(), DEPTH_FRAME_V2_HEADER_SIZE as usize);
 
     buf.extend_from_slice(data);
     buf
@@ -280,3 +317,74 @@ fn encode_camera_frame(header: &CameraFrameHeader, data: &[u8]) -> Vec<u8> {
     buf
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alvr_common::{Pose, glam::{Quat, Vec3}};
+    use alvr_packets::DepthFrameFormat;
+
+    fn f32_at(buf: &[u8], offset: usize) -> f32 {
+        f32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn u32_at(buf: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn sample_header() -> DepthFrameHeader {
+        DepthFrameHeader {
+            timestamp: Duration::from_nanos(123_456_789),
+            view_poses: [
+                Pose {
+                    orientation: Quat::IDENTITY,
+                    position: Vec3::new(-0.03, 1.6, 0.0),
+                },
+                Pose {
+                    orientation: Quat::from_rotation_y(0.1),
+                    position: Vec3::new(0.03, 1.6, 0.0),
+                },
+            ],
+            width: 320,
+            height: 640,
+            near_z: 0.1,
+            far_z: f32::INFINITY,
+            format: DepthFrameFormat::Lz4D16,
+            fov_angles: [[-0.9, 0.6, 0.7, -0.8], [-0.6, 0.9, 0.7, -0.8]],
+        }
+    }
+
+    #[test]
+    fn depth_v2_layout_matches_documented_offsets() {
+        let header = sample_header();
+        let data = [1u8, 2, 3];
+        let buf = encode_depth_frame(&header, &data);
+
+        assert_eq!(buf.len(), DEPTH_FRAME_V2_HEADER_SIZE as usize + data.len());
+        assert_eq!(u32_at(&buf, 0), DEPTH_FRAME_V2_HEADER_SIZE);
+        assert_eq!(
+            u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+            123_456_789
+        );
+
+        // view_pose[0].px and view_pose[1].qy / px
+        assert_eq!(f32_at(&buf, 12 + 4 * 4), -0.03);
+        assert_eq!(f32_at(&buf, 40 + 4), header.view_poses[1].orientation.y);
+        assert_eq!(f32_at(&buf, 40 + 4 * 4), 0.03);
+
+        assert_eq!(u32_at(&buf, 68), 320);
+        assert_eq!(u32_at(&buf, 72), 640);
+        assert_eq!(f32_at(&buf, 76), 0.1);
+        assert!(f32_at(&buf, 80).is_infinite());
+        assert_eq!(u32_at(&buf, 84), 2);
+
+        assert_eq!(f32_at(&buf, 88), -0.9);
+        assert_eq!(f32_at(&buf, 104), -0.6);
+
+        let intr1 = header.view_intrinsics(1);
+        assert_eq!(f32_at(&buf, 120), header.view_intrinsics(0)[0]);
+        assert_eq!(f32_at(&buf, 136 + 8), intr1[2]);
+
+        assert_eq!(&buf[DEPTH_FRAME_V2_HEADER_SIZE as usize..], &data);
+    }
+}
