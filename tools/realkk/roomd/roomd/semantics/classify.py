@@ -85,6 +85,18 @@ def _nearest(seeds, queries):
     return out
 
 
+def _dominant_band(heights, band):
+    """(median, share) of the height window of width ``band`` holding most cells: the
+    main surface of a blob, tolerant of cushions and of the 5 cm heightmap."""
+    s = np.sort(heights)
+    if s.size == 0:
+        return 0.0, 0.0
+    end = np.searchsorted(s, s + band, side="right")
+    counts = end - np.arange(s.size)
+    i = int(counts.argmax())
+    return float(np.median(s[i:end[i]])), float(counts[i]) / s.size
+
+
 def _split_by_patches(pieces, n, patches, big, patch_mean, p: SemanticsParams):
     """Split a piece holding two or more large flat patches at different heights
     (bed + nightstand pushed together, both under ``split_dh`` apart): every cell
@@ -114,6 +126,8 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
     rel = top - floor_y
     with np.errstate(invalid="ignore"):
         mask = np.isfinite(top) & (rel >= p.blob_min_h) & (rel <= p.blob_max_h)
+        if p.structure_min_h is not None:
+            mask &= rel < p.structure_min_h
     pieces, n = label_components(mask, top, p.split_dh)
     if n == 0:
         return []
@@ -192,16 +206,7 @@ def _segment(raster, floor_y, p: SemanticsParams) -> List[_Geom]:
         biz, bix = cells[r]
         uiz = np.concatenate([cells[k][0] for k in members if k != r] or [np.empty(0, int)])
         uix = np.concatenate([cells[k][1] for k in members if k != r] or [np.empty(0, int)])
-        base_patch = patches[biz, bix]
-        surface_h, flat = float(np.median(rel[biz, bix])), 0.0
-        valid = base_patch[(base_patch >= 0)]
-        valid = valid[patch_ok[valid]] if valid.size else valid
-        if valid.size:
-            ids, cnt = np.unique(valid, return_counts=True)
-            best = ids[cnt.argmax()]
-            sel = base_patch == best
-            surface_h = float(np.median(rel[biz[sel], bix[sel]]))
-            flat = float(cnt.max()) / len(biz)
+        surface_h, flat = _dominant_band(rel[biz, bix], p.surface_band)
         out.append(_Geom(raster.centres(biz, bix), rel[biz, bix],
                          raster.centres(uiz, uix), rel[uiz, uix] if len(uiz) else np.empty(0),
                          surface_h, flat))

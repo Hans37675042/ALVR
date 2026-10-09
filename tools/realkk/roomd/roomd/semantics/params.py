@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -13,6 +13,7 @@ class SemanticsParams:
     up_normal_min: float = 0.8         # normal.y for "horizontal surface" points
     blob_min_h: float = 0.05           # m above floor; lower = floor
     blob_max_h: float = 2.0            # m above floor; higher = structure, ignored
+    structure_min_h: Optional[float] = None  # m; capped heightmap: cells this high = walls/unknown, ignored
     split_dh: float = 0.10             # m, neighbour step that cuts a blob in two
     split_patch_dh: float = 0.03       # m, two large flat patches this far apart split a blob
     split_patch_fill: float = 0.6      # ... if each fills this much of its min-area rectangle
@@ -26,7 +27,8 @@ class SemanticsParams:
     attach_reach: int = 2              # cells; TSDF leaves a gap at seat/backrest edges
 
     # --- classification (R15 table)
-    flat_min_ratio: float = 0.5        # main patch area / base area
+    surface_band: float = 0.10         # m, height window of the main (seat/table) surface
+    flat_min_ratio: float = 0.5        # share of base cells inside that window
     seat_h: Tuple[float, float] = (0.35, 0.60)
     back_min_rise: float = 0.25        # m above seat
     back_min_cover: float = 0.6        # backrest length / seat width

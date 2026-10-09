@@ -28,8 +28,14 @@ def _legs(w, d, h, leg):
 
 
 def chair(x, z, yaw=0.0, seat_h=0.45, width=0.45, depth=0.45, back_h=0.9,
-          back_t=0.05, slab=0.04, leg=0.04):
-    parts = [(0.0, 0.0, width, depth, seat_h - slab, seat_h)]
+          back_t=0.05, slab=0.04, leg=0.04, seat_contour=0.0):
+    """``seat_contour``: total height spread of a cushioned seat (4 strips across X)."""
+    if seat_contour:
+        strip = width / 4
+        parts = [(-width / 2 + (k + 0.5) * strip, 0.0, strip, depth, seat_h - slab,
+                  seat_h + seat_contour * (k / 3 - 0.5)) for k in range(4)]
+    else:
+        parts = [(0.0, 0.0, width, depth, seat_h - slab, seat_h)]
     parts += _legs(width, depth, seat_h - slab, leg)
     parts.append((0.0, -depth / 2 + back_t / 2, width, back_t, seat_h, back_h))
     return _place(x, z, yaw, parts)
@@ -89,13 +95,15 @@ class SyntheticRoom:
 
     def __init__(self, half_x=2.5, half_z=2.5, floor_y=0.0, wall_h=2.5, walls=True,
                  noise=0.0, seed=0, point_step=0.02, side_step=0.05, floor_step=0.04,
-                 hm_cell=0.05):
+                 hm_cell=0.05, hm_margin=0.0, hm_cap=None):
         self.half_x, self.half_z = half_x, half_z
         self.floor_y = floor_y
         self.wall_h = wall_h
         self.noise = noise
         self.point_step, self.side_step, self.floor_step = point_step, side_step, floor_step
         self.hm_cell = hm_cell
+        self.hm_margin = hm_margin  # heightmap reaches this far past the walls (fusion does)
+        self.hm_cap = hm_cap        # heightmap tops clamp here (fusion obstacle_max_height)
         self.items: Dict[str, List[Obb]] = {}
         self.hidden: List[Obb] = []
         self._rng = np.random.default_rng(seed)
@@ -209,9 +217,10 @@ class SyntheticRoom:
 
     def heightmap(self) -> HeightMap:
         c = self.hm_cell
-        w = int(round(2 * self.half_x / c))
-        h = int(round(2 * self.half_z / c))
-        ox, oz = -self.half_x, -self.half_z
+        m = self.hm_margin
+        w = int(round(2 * (self.half_x + m) / c))
+        h = int(round(2 * (self.half_z + m) / c))
+        ox, oz = -self.half_x - m, -self.half_z - m
         iz, ix = np.mgrid[0:h, 0:w]
         x = ox + (ix + 0.5) * c
         z = oz + (iz + 0.5) * c
@@ -223,6 +232,8 @@ class SyntheticRoom:
                 for b in self.boxes():
                     m = b.contains_xz(x + sx, z + sz)
                     top[m] = np.maximum(top[m], b.y1)
+        if self.hm_cap is not None:
+            top = np.minimum(top, self.floor_y + self.hm_cap)
         if self.noise > 0:
             top = top + self._rng.normal(0.0, self.noise, top.shape)
         floor = np.full((h, w), self.floor_y, dtype=float)
