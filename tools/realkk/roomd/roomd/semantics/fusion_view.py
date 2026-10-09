@@ -31,9 +31,12 @@ def _default_obb_cls():
 class FusionMapView:
     """Adapts a TsdfFusion-like object to :class:`~.mapview.MapView`."""
 
-    def __init__(self, fusion, obb_cls=None):
+    def __init__(self, fusion, obb_cls=None, up_normal_min=None):
         self.fusion = fusion
         self._obb_cls = obb_cls
+        # TsdfFusion filters surface points by config.upward_min_normal_y (0.85); its
+        # gradient normals are noisy, so semantics queries with a looser value.
+        self.up_normal_min = up_normal_min
 
     def to_fusion_obb(self, o: Obb):
         if self._obb_cls is None:
@@ -53,8 +56,16 @@ class FusionMapView:
         return as_heightmap(self.fusion.heightmap())
 
     def surface_points(self, min_y, max_y, region=None):
-        return self.fusion.surface_points(min_y, max_y,
-                                          None if region is None else self.to_fusion_obb(region))
+        box = None if region is None else self.to_fusion_obb(region)
+        cfg = getattr(self.fusion, "config", None)
+        if self.up_normal_min is None or not hasattr(cfg, "upward_min_normal_y"):
+            return self.fusion.surface_points(min_y, max_y, box)
+        saved = cfg.upward_min_normal_y
+        cfg.upward_min_normal_y = self.up_normal_min
+        try:
+            return self.fusion.surface_points(min_y, max_y, box)
+        finally:
+            cfg.upward_min_normal_y = saved
 
     def free_fraction(self, obb: Obb) -> float:
         return float(self.fusion.free_fraction(self.to_fusion_obb(obb)))

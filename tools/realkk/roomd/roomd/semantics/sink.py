@@ -56,7 +56,7 @@ class SemanticsSink(FusionSink):
         self.params = params
         self.clock = clock
         self.publish_scene_objects = publish_scene_objects
-        self.view = FusionMapView(inner.fusion, obb_cls)
+        self.view = FusionMapView(inner.fusion, obb_cls, up_normal_min=params.up_normal_min)
         self.semantics = RoomSemantics(params)
         self._labels = []
         self._prior_walls = None
