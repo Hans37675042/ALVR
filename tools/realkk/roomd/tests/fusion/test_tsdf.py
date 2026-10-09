@@ -214,3 +214,27 @@ def test_measurements_beyond_the_floor_do_not_carve_it():
     assert below["free"] == 0  # nothing may be carved under the stage floor
     fp = fusion.floor_plane()
     assert fp is not None and abs(fp.y) <= 0.01
+
+
+def test_new_object_appears_within_n_frames():
+    # real room tap: a chair moved into well-carved free space took ~6 s of viewing to show up,
+    # while the old position cleared in < 1 s (R14 target: moved chair published p95 <= 2 s)
+    fusion = TsdfFusion(FusionConfig())
+    poses = scan_poses()
+    empty = box_scene(with_box=False)
+    first_frame(fusion, empty)
+    scan(fusion, empty, poses)
+    scan(fusion, empty, poses)  # free space at full weight
+    assert fusion.occupied_fraction(BOX_BODY) == 0.0
+    reference = TsdfFusion(FusionConfig())
+    first_frame(reference, box_scene())
+    scan(reference, box_scene(), poses)
+    target = 0.8 * reference.occupied_fraction(BOX_BODY)
+    appeared_at = None
+    for n, (eye, target_pt) in enumerate(poses, start=1):
+        fusion.integrate(box_scene().frame_payload(eye, target_pt))
+        if fusion.occupied_fraction(BOX_BODY) >= target:
+            appeared_at = n
+            break
+    print("box appeared after %s frames" % appeared_at)
+    assert appeared_at is not None and appeared_at <= 8
