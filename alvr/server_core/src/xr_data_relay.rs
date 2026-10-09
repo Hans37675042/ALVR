@@ -312,7 +312,7 @@ pub const DEPTH_FRAME_V2_HEADER_SIZE: u32 = 176;
 /// |--------|-----------|--------------------------------------------------------------|
 /// | 0      | u32       | header_size (bytes, including this field; pixel data follows) |
 /// | 4      | u64       | client_timestamp_ns (client XR time of the requested frame)  |
-/// | 12     | f32 x 7   | view_pose[0] qx qy qz qw px py pz (client stage space)       |
+/// | 12     | f32 x 7   | view_pose[0] qx qy qz qw px py pz (recentered stage space)   |
 /// | 40     | f32 x 7   | view_pose[1]                                                 |
 /// | 68     | u32       | width                                                        |
 /// | 72     | u32       | height (stacked: view 0 top half, view 1 bottom half)        |

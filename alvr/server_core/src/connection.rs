@@ -1112,9 +1112,18 @@ fn connection_pipeline(
                     Err(ConnectionError::TryAgain(_)) => continue,
                     Err(ConnectionError::Other(_)) => return,
                 };
-                let Ok((header, payload)) = data.get() else {
+                let Ok((mut header, payload)) = data.get() else {
                     return;
                 };
+
+                // Bring the depth view poses into the same (recentered) space as the head and
+                // controller poses handed to SteamVR. No-op when recentering is disabled.
+                {
+                    let tracking_manager = ctx.tracking_manager.read();
+                    for pose in &mut header.view_poses {
+                        *pose = tracking_manager.recenter_pose(*pose);
+                    }
+                }
 
                 depth_frame_count += 1;
                 if depth_frame_count <= 3 || depth_frame_count % 100 == 0 {
