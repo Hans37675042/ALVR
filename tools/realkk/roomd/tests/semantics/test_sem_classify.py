@@ -185,3 +185,18 @@ def test_narrow_ledge_with_tall_back_is_not_a_chair():
     back = Obb(0.0, -0.125, 0.0, 0.5, 0.05, 0.0, 1.1)
     cands = _detect([ledge, back])
     assert cands and not any(c.kind == "Chair" or c.sittable for c in cands)
+
+
+@pytest.mark.parametrize("cut", [None, 1.5])
+def test_desk_under_loft_bed_is_found(cut):
+    # real room: loft bed underside at ~1.55 m over the desk hides it in the heightmap
+    from roomd.semantics import Obb
+    room = make_room()
+    room.place("desk", table(0.0, -1.6, 0.0, w=1.6, d=0.7, h=0.72))
+    room.place("loft", [Obb(0.0, -1.6, 0.0, 2.0, 0.9, 1.55, 1.65)])
+    room.place("cab", storage(1.6, 1.2, 0.0, w=0.8, d=0.5, h=1.3))
+    cands = detect(room, SemanticsParams(structure_min_h=cut)).candidates
+    tables = [c for c in cands if c.kind == "Table"]
+    assert len(tables) == 1, [(c.kind, round(c.surface_h, 2)) for c in cands]
+    assert abs(tables[0].surface_h - 0.72) < 0.03
+    assert abs(tables[0].sx - 1.6) < 0.1 and abs(tables[0].sz - 0.7) < 0.1
