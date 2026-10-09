@@ -52,3 +52,15 @@ def test_standing_user_next_to_chair_does_not_occupy():
     room, sem, oid, t = _setup(chair(0.5, 0.5, 0.0))
     out, t = run(sem, room, 1, t, user_head=(0.5, 1.65, 0.5))
     assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+
+
+def test_user_sitting_ends_moving_state():
+    room, sem, oid, t = _setup(chair(0.5, 0.5, 0.0))
+    room.place("c", chair(0.58, 0.5, 0.0))  # body/occlusion shifts the observed chair
+    out, t = run(sem, room, 2, t)
+    assert by_id(out)[oid]["State"] == "Moving"
+    room.place("c", chair(0.5, 0.5, 0.0))
+    room.place("user", user_torso(0.5, 0.5, 0.0, seat_h=0.45))
+    out, t = run(sem, room, 1, t, user_head=(0.5, 1.2, 0.42))
+    assert by_id(out)[oid]["State"] == "Present"
+    assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]

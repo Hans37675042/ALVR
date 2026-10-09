@@ -229,3 +229,13 @@ def test_seat_deeper_than_any_chair_is_not_a_chair():
     cands = _detect([strip, back])
     assert cands and not any(c.kind == "Chair" or c.sittable for c in cands), \
         [(c.kind, round(c.sx, 2), round(c.sz, 2)) for c in cands]
+
+
+def test_seat_under_a_loft_bed_is_not_sittable():
+    # PM: seat-height things under the loft (drawer unit, suitcase) must not become seats
+    from roomd.semantics import Obb
+    room = make_room()
+    room.place("c", chair(0.0, -1.6, 0.0))
+    room.place("loft", [Obb(0.0, -1.7, 0.0, 2.0, 0.9, 1.55, 1.65)])
+    cands = detect(room).candidates
+    assert not any(c.sittable for c in cands), [(c.kind, round(c.surface_h, 2)) for c in cands]
