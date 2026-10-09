@@ -1,8 +1,12 @@
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    net::TcpStream,
-    sync::{Arc, Mutex},
+    net::{Shutdown, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -41,67 +45,147 @@ pub type StreamControlCallback = Box<dyn Fn(bool, bool) + Send + Sync>;
 /// Called with the `recapture` flag of a MSG_ROOM_REQUEST.
 pub type SceneRequestCallback = Box<dyn Fn(bool) + Send + Sync>;
 
-/// Latest scene received from the client, kept in client space so it can be re-sent with
-/// whatever recentering is current.
-struct SceneCache {
-    snapshot: Option<(u32, SceneSnapshot)>,
-    next_snapshot_id: u32,
-    recenter_pose: Pose,
+/// The current viewer socket plus a generation counter, so that the reader thread of a replaced
+/// connection can never clear a newer one. Dropped sockets are shut down so the viewer (and the
+/// reader thread holding a cloned handle) see EOF right away.
+#[derive(Default)]
+struct ConnectionSlot {
+    inner: Mutex<(u64, Option<TcpStream>)>,
 }
 
-struct Shared {
-    connection: Mutex<Option<TcpStream>>,
-    stream_flags: Mutex<XrStreamFlags>,
-    control_callback: Mutex<Option<StreamControlCallback>>,
-    scene_request_callback: Mutex<Option<SceneRequestCallback>>,
-    scene: Mutex<SceneCache>,
-}
+impl ConnectionSlot {
+    fn replace(&self, stream: TcpStream) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(old) = inner.1.take() {
+            old.shutdown(Shutdown::Both).ok();
+        }
+        inner.0 += 1;
+        inner.1 = Some(stream);
 
-impl Shared {
+        inner.0
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.0 == generation && inner.1.is_some()
+    }
+
+    fn is_connected(&self) -> bool {
+        self.inner.lock().unwrap().1.is_some()
+    }
+
+    /// Clears the connection only if it is still `generation`.
+    fn clear_if(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.0 != generation || inner.1.is_none() {
+            return false;
+        }
+        if let Some(stream) = inner.1.take() {
+            stream.shutdown(Shutdown::Both).ok();
+        }
+
+        true
+    }
+
+    // A partial write leaves the stream unusable: close it for both sides
+    fn shutdown_locked(inner: &mut (u64, Option<TcpStream>)) {
+        if let Some(stream) = inner.1.take() {
+            stream.shutdown(Shutdown::Both).ok();
+        }
+    }
+
+    #[cfg(test)]
+    fn drop_connection(&self) {
+        Self::shutdown_locked(&mut self.inner.lock().unwrap());
+    }
+
     fn broadcast(&self, msg_type: u32, payload: &[u8]) {
-        let mut conn = self.connection.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(stream) = conn.as_mut() {
+        if let Some(stream) = inner.1.as_mut() {
             let mut header = [0u8; 8];
             header[0..4].copy_from_slice(&msg_type.to_le_bytes());
             header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
 
             if stream.write_all(&header).is_err() || stream.write_all(payload).is_err() {
                 warn!("XR Data Relay: viewer disconnected, will reconnect");
-                *conn = None;
+                Self::shutdown_locked(&mut inner);
             }
         }
     }
+}
 
-    // The scene lock is held while sending so that a concurrent recenter or new snapshot cannot
-    // be overtaken by an older one.
-    fn send_cached_scene(&self) {
-        let scene = self.scene.lock().unwrap();
-        if let Some((id, snapshot)) = &scene.snapshot {
-            let payload = encode_room_snapshot(*id, scene.recenter_pose, snapshot);
-            self.broadcast(MSG_ROOM_SNAPSHOT, &payload);
+enum SceneCommand {
+    Snapshot(u32, SceneSnapshot),
+    Recenter(Pose),
+    Resend,
+}
+
+/// Owns the latest scene (client space) and does all scene sends on its own thread, so callers
+/// (control receive thread, recenter, reader thread) never block on viewer writes.
+fn scene_thread(connection: Arc<ConnectionSlot>, commands: mpsc::Receiver<SceneCommand>) {
+    let mut snapshot = None::<(u32, SceneSnapshot)>;
+    let mut recenter_pose = Pose::IDENTITY;
+
+    let send_snapshot = |snapshot: &Option<(u32, SceneSnapshot)>, recenter_pose: Pose| {
+        if let Some((id, snapshot)) = snapshot {
+            let payload = encode_room_snapshot(*id, recenter_pose, snapshot);
+            connection.broadcast(MSG_ROOM_SNAPSHOT, &payload);
         }
+    };
+
+    while let Ok(command) = commands.recv() {
+        match command {
+            SceneCommand::Snapshot(id, new_snapshot) => {
+                snapshot = Some((id, new_snapshot));
+                send_snapshot(&snapshot, recenter_pose);
+            }
+            SceneCommand::Recenter(pose) => {
+                recenter_pose = pose;
+                connection.broadcast(MSG_PLAYSPACE_CHANGED, &encode_playspace_changed(pose));
+                send_snapshot(&snapshot, recenter_pose);
+            }
+            SceneCommand::Resend => send_snapshot(&snapshot, recenter_pose),
+        }
+    }
+}
+
+struct Shared {
+    connection: Arc<ConnectionSlot>,
+    stream_flags: Mutex<XrStreamFlags>,
+    control_callback: Mutex<Option<StreamControlCallback>>,
+    scene_request_callback: Mutex<Option<SceneRequestCallback>>,
+    scene_commands: Mutex<mpsc::Sender<SceneCommand>>,
+}
+
+impl Shared {
+    fn scene_command(&self, command: SceneCommand) {
+        self.scene_commands.lock().unwrap().send(command).ok();
     }
 }
 
 pub struct XrDataRelay {
     shared: Arc<Shared>,
+    next_snapshot_id: AtomicU32,
     _connector_thread: thread::JoinHandle<()>,
+    _scene_thread: thread::JoinHandle<()>,
 }
 
 impl XrDataRelay {
     pub fn new(port: u16) -> Self {
         let viewer_addr = format!("127.0.0.1:{port}");
+        let connection = Arc::new(ConnectionSlot::default());
+        let (scene_sender, scene_receiver) = mpsc::channel();
+        let scene_thread = thread::spawn({
+            let connection = Arc::clone(&connection);
+            move || scene_thread(connection, scene_receiver)
+        });
         let shared = Arc::new(Shared {
-            connection: Mutex::new(None),
+            connection,
             stream_flags: Mutex::new(XrStreamFlags::default()),
             control_callback: Mutex::new(None),
             scene_request_callback: Mutex::new(None),
-            scene: Mutex::new(SceneCache {
-                snapshot: None,
-                next_snapshot_id: 1,
-                recenter_pose: Pose::IDENTITY,
-            }),
+            scene_commands: Mutex::new(scene_sender),
         });
 
         let connector_thread = {
@@ -109,7 +193,7 @@ impl XrDataRelay {
             thread::spawn(move || {
                 loop {
                     // Only try to connect if we don't already have a connection
-                    if shared.connection.lock().unwrap().is_some() {
+                    if shared.connection.is_connected() {
                         thread::sleep(RETRY_INTERVAL);
                         continue;
                     }
@@ -120,18 +204,18 @@ impl XrDataRelay {
                             stream.set_nodelay(true).ok();
                             stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
 
-                            // Spawn reader thread for incoming commands from viewer
                             if let Ok(reader_stream) = stream.try_clone() {
-                                let shared = Arc::clone(&shared);
-                                thread::spawn(move || {
-                                    read_viewer_commands(reader_stream, &shared);
+                                let generation = shared.connection.replace(stream);
+
+                                // Reader thread for incoming commands from the viewer
+                                thread::spawn({
+                                    let shared = Arc::clone(&shared);
+                                    move || read_viewer_commands(reader_stream, generation, &shared)
                                 });
+
+                                // A new viewer has no room model yet
+                                shared.scene_command(SceneCommand::Resend);
                             }
-
-                            *shared.connection.lock().unwrap() = Some(stream);
-
-                            // A new viewer has no room model yet
-                            shared.send_cached_scene();
                         }
                         Err(_) => {
                             // Viewer not running yet, retry silently
@@ -145,7 +229,9 @@ impl XrDataRelay {
 
         Self {
             shared,
+            next_snapshot_id: AtomicU32::new(1),
             _connector_thread: connector_thread,
+            _scene_thread: scene_thread,
         }
     }
 
@@ -162,7 +248,7 @@ impl XrDataRelay {
             return;
         }
         let payload = encode_depth_frame(header, timing, data);
-        self.shared.broadcast(MSG_DEPTH_FRAME_V2, &payload);
+        self.shared.connection.broadcast(MSG_DEPTH_FRAME_V2, &payload);
     }
 
     pub fn send_camera_frame(&self, header: &CameraFrameHeader, data: &[u8]) {
@@ -170,35 +256,29 @@ impl XrDataRelay {
             return;
         }
         let payload = encode_camera_frame(header, data);
-        self.shared.broadcast(MSG_CAMERA_FRAME, &payload);
+        self.shared.connection.broadcast(MSG_CAMERA_FRAME, &payload);
     }
 
     /// Cache a scene snapshot (client space) and send it to the viewer, recentered. Scene
-    /// messages are not gated by the stream flags. Returns the assigned snapshot id.
+    /// messages are not gated by the stream flags. Returns the assigned snapshot id; sending
+    /// happens asynchronously on the relay's scene thread.
     pub fn set_scene_snapshot(&self, snapshot: SceneSnapshot) -> u32 {
-        let id = {
-            let mut scene = self.shared.scene.lock().unwrap();
-            let id = scene.next_snapshot_id;
-            scene.next_snapshot_id = scene.next_snapshot_id.wrapping_add(1).max(1);
-            scene.snapshot = Some((id, snapshot));
-            id
-        };
-        self.shared.send_cached_scene();
+        let id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .scene_command(SceneCommand::Snapshot(id, snapshot));
 
         id
     }
 
-    /// Mirror of `TrackingManager::recenter_pose`'s transform. Sends MSG_PLAYSPACE_CHANGED and
-    /// re-sends the cached snapshot in the new space.
+    /// Mirror of `TrackingManager::recenter_transform`. Sends MSG_PLAYSPACE_CHANGED and re-sends
+    /// the cached snapshot in the new space (asynchronously).
     pub fn set_recenter_pose(&self, recenter_pose: Pose) {
-        self.shared.scene.lock().unwrap().recenter_pose = recenter_pose;
         self.shared
-            .broadcast(MSG_PLAYSPACE_CHANGED, &encode_playspace_changed(recenter_pose));
-        self.shared.send_cached_scene();
+            .scene_command(SceneCommand::Recenter(recenter_pose));
     }
 }
 
-fn read_viewer_commands(mut stream: TcpStream, shared: &Shared) {
+fn read_viewer_commands(mut stream: TcpStream, generation: u64, shared: &Shared) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     loop {
@@ -207,15 +287,15 @@ fn read_viewer_commands(mut stream: TcpStream, shared: &Shared) {
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Check if the write side is still connected
-                if shared.connection.lock().unwrap().is_none() {
+                // Stop once this connection was dropped or replaced
+                if !shared.connection.is_current(generation) {
                     return;
                 }
                 continue;
             }
             Err(_) => {
                 info!("XR Data Relay: viewer reader disconnected");
-                *shared.connection.lock().unwrap() = None;
+                shared.connection.clear_if(generation);
                 return;
             }
         }
@@ -226,7 +306,7 @@ fn read_viewer_commands(mut stream: TcpStream, shared: &Shared) {
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             if stream.read_exact(&mut payload).is_err() {
-                *shared.connection.lock().unwrap() = None;
+                shared.connection.clear_if(generation);
                 return;
             }
         }
@@ -260,9 +340,7 @@ fn read_viewer_commands(mut stream: TcpStream, shared: &Shared) {
             info!("XR Data Relay: room request from viewer (recapture={recapture})");
 
             // Answer right away from the cache; the client query refreshes it afterwards
-            if !recapture {
-                shared.send_cached_scene();
-            }
+            shared.scene_command(SceneCommand::Resend);
             if let Some(cb) = shared.scene_request_callback.lock().unwrap().as_ref() {
                 cb(recapture);
             }

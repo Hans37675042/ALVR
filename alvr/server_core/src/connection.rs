@@ -12,6 +12,7 @@ use alvr_adb::{WiredConnection, WiredConnectionStatus};
 use alvr_common::{
     AnyhowToCon, BUTTON_INFO, CONTROLLER_PROFILE_INFO, ConResult, ConnectionError, ConnectionState,
     LifecycleState, QUEST_CONTROLLER_PROFILE_PATH, con_bail, dbg_connection, debug, error,
+    Pose,
     glam::{UVec2, Vec2},
     info,
     parking_lot::{Condvar, Mutex, RwLock},
@@ -1046,6 +1047,8 @@ fn connection_pipeline(
 
     *ctx.tracking_manager.write() =
         TrackingManager::new(initial_settings.connection.statistics_history_size);
+    // Keep the relay's recentering in sync with the fresh TrackingManager
+    ctx.xr_data_relay.set_recenter_pose(Pose::IDENTITY);
     let hand_gesture_manager = Arc::new(Mutex::new(HandGestureManager::new()));
 
     let tracking_receive_thread = thread::spawn({
@@ -1309,14 +1312,17 @@ fn connection_pipeline(
                 match packet {
                     ClientControlPacket::PlayspaceSync(packet) => {
                         if !initial_settings.headset.tracking_ref_only {
-                            let session_manager_lock = SESSION_MANAGER.read();
-                            let config = &session_manager_lock.settings().headset;
-                            let recenter_transform = {
-                                let mut tracking_manager = ctx.tracking_manager.write();
-                                tracking_manager.recenter(
+                            let (position_mode, rotation_mode) = {
+                                let session_manager_lock = SESSION_MANAGER.read();
+                                let config = &session_manager_lock.settings().headset;
+                                (
                                     config.position_recentering_mode,
                                     config.rotation_recentering_mode,
-                                );
+                                )
+                            };
+                            let recenter_transform = {
+                                let mut tracking_manager = ctx.tracking_manager.write();
+                                tracking_manager.recenter(position_mode, rotation_mode);
                                 tracking_manager.recenter_transform()
                             };
                             ctx.xr_data_relay.set_recenter_pose(recenter_transform);
