@@ -28,10 +28,10 @@ class SemanticsParams:
 
     # --- classification (R15 table)
     surface_band: float = 0.10         # m, height window of the main (seat/table) surface
-    flat_min_ratio: float = 0.5        # share of base cells inside that window
+    flat_min_ratio: float = 0.35       # share of base cells inside that window (cushion + armrests)
     seat_h: Tuple[float, float] = (0.35, 0.60)
     back_min_rise: float = 0.25        # m above seat
-    back_min_cover: float = 0.6        # backrest length / seat width
+    back_min_cover: float = 0.45       # backrest length / seat width (office chair top edge is narrow)
     seat_min_side: float = 0.30        # m, chair/couch footprint narrower than this is a ledge
     couch_min_len: float = 1.2
     table_h: Tuple[float, float] = (0.65, 0.80)
@@ -74,7 +74,7 @@ class SemanticsParams:
     cost_w_surface: float = 2.0
     cost_w_hist: float = 0.5
     move_dist: float = 0.05
-    move_yaw: float = 10.0
+    move_yaw: float = 25.0             # deg; real chair yaw jitters about +-20
     move_confirm: int = 3              # consistent deviating observations to republish
     moving_after: int = 2              # deviating observations before State=Moving
     ema_alpha: float = 0.3
