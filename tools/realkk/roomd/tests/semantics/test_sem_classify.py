@@ -1,7 +1,7 @@
 """R15 classification table and the R15 §1.3 style misclassification cases."""
 import pytest
 
-from roomd.semantics import detect, yaw_diff
+from roomd.semantics import SemanticsParams, detect, yaw_diff
 from roomd.semantics.synthetic import (
     bed, chair, clothes_pile, coffee_table, couch, stool, storage, table)
 from sem_helpers import make_room
@@ -151,3 +151,28 @@ def test_sparse_points_still_find_chair_and_table_from_heightmap(yaw):
     ch = next(c for c in cands if c.kind == "Chair")
     assert abs(ch.surface_h - 0.45) < 0.03
     assert yaw_diff(ch.yaw, yaw) < 12.0
+
+
+def _fusion_like_room(**kw):
+    # fusion heightmap: covers the walls too and stops at obstacle_max_height
+    return make_room(hm_margin=0.3, hm_cap=1.9, **kw)
+
+
+def test_capped_heightmap_walls_are_not_objects():
+    room = _fusion_like_room()
+    assert detect(room, SemanticsParams(structure_min_h=1.85)).candidates == []
+
+
+def test_wall_next_to_chair_is_not_its_backrest():
+    room = _fusion_like_room()
+    room.place("c", chair(0.0, 2.2, 0.0))  # front (+Z) towards the wall at z = 2.5
+    cands = detect(room, SemanticsParams(structure_min_h=1.85)).candidates
+    assert [c.kind for c in cands] == ["Chair"]
+    assert yaw_diff(cands[0].yaw, 0.0) < 12.0
+    assert cands[0].sy < 1.0
+
+
+def test_contoured_seat_is_still_a_seat():
+    c = _one(chair(0.0, 0.0, 30.0, seat_h=0.44, seat_contour=0.07))
+    assert c.kind == "Chair" and c.sittable
+    assert abs(c.surface_h - 0.44) < 0.05
