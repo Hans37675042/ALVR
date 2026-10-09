@@ -66,13 +66,19 @@ Meta anchor already converted to Unity stage space.
 
 ## Pipeline
 
-1. Upward surface points 5 cm–2 m above the floor -> 2 cm max-height raster, aligned to
-   the points' lattice phase (TSDF voxel columns) with single-cell dropouts filled.
+1. Raster: the map's heightmap (`raster_source="heightmap"`, default; TSDF upward points
+   are too sparse for chair seats), or upward surface points on a 2 cm grid aligned to the
+   points' lattice phase with single-cell dropouts filled (`"points"`). Cells 5 cm–2 m
+   above the floor; with a capped heightmap (fusion stops at `obstacle_max_height`) cells
+   at `structure_min_h` and above are walls/unknown and ignored (the sink sets it to the
+   cap − 5 cm).
 2. Blobs = 8-connected cells, cut where neighbours step > `split_dh`; a blob holding
    two large solid flat patches more than `split_patch_dh` apart is split between them.
 3. Thin pieces (short side <= `thin_max`) higher than a neighbour within
    `attach_reach` cells attach to it (backrests, arms, headboards).
-4. Main surface = largest horizontal patch (neighbour step <= 2 cm, 5–95 % range <= 5 cm).
+4. Main surface = the `surface_band` (10 cm) height window holding most base cells
+   (cushioned seats, 5 cm heightmap); `flat_min_ratio` of the cells must be in it.
+   Footprint extents come from the cell spread (sqrt(12 var + cell²)).
 5. Classification (R15): Bed (>= 1.5 m², not couch-like) -> Chair/Couch (seat
    0.35–0.60, backrest >= 0.25 m above covering >= 60 % of the seat width; front =
    backrest -> seat; Couch when the seat side >= 1.2 m) -> Table (0.65–0.80) ->
@@ -94,6 +100,21 @@ Meta anchor already converted to Unity stage space.
    above the seat; object Moving/Missing/Removed propagate to its seats.
 
 All thresholds live in `SemanticsParams` (`params.py`) for on-device tuning.
+
+## Real tap (2026-10-09-room2.rktap, 129 s, office chair moved ~1 m at t≈74 s, PM sits)
+
+Replayed through RoomService + SemanticsSink + TsdfFusionSink (feat/roomd-fusion defaults).
+
+| setting | chair ids | id kept across move | OccupiedByUser | false chairs |
+|---|---|---|---|---|
+| shipped defaults (+ cap cut 1.85) | 2 | no (Removed, new id) | yes | 0 |
+| suggested (below) | 1 | yes | yes (t≈95–102 s) | 0 |
+
+Suggested on-device values: `structure_min_h` 1.5, `back_min_cover` 0.45 (the top of an
+office chair backrest is narrower than seat + armrests), `flat_min_ratio` 0.35 (cushion +
+armrests), `gate_surface_dh` 0.10 (seat height read 0.375–0.46 m from different views),
+`move_yaw` 25 (yaw of a real chair jitters ±20°). Many `Other` fragments (walls under the
+cut, clutter) remain; tables were not verified against ground truth.
 
 ## Known limits
 
