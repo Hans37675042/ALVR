@@ -4,6 +4,7 @@ use crate::{
 };
 use alvr_client_core::{
     ClientCoreContext,
+    depth_pipeline::StageSet,
     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
 };
 use alvr_common::{
@@ -34,6 +35,13 @@ use std::{
 };
 
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+
+// Depth stage timings are summarized in the log every this many captures
+const DEPTH_PERF_REPORT_INTERVAL: u64 = 50;
+
+fn elapsed_ms(since: Instant) -> f32 {
+    since.elapsed().as_secs_f32() * 1000.0
+}
 
 pub struct ParsedStreamConfig {
     pub view_resolution: UVec2,
@@ -129,6 +137,8 @@ pub struct StreamContext {
     last_depth_capture: Instant,
     depth_readback: Option<DepthReadback>,
     depth_skipped_frames: u64,
+    depth_perf: StageSet,
+    depth_perf_captures: u64,
     camera_capture: Option<crate::camera_capture::CameraCapture>,
     camera_capture_right: Option<crate::camera_capture::CameraCapture>,
     last_camera_capture: Instant,
@@ -339,6 +349,8 @@ impl StreamContext {
             last_depth_capture: Instant::now(),
             depth_readback,
             depth_skipped_frames: 0,
+            depth_perf: StageSet::default(),
+            depth_perf_captures: 0,
             camera_capture: None,
             camera_capture_right: None,
             last_camera_capture: Instant::now(),
@@ -770,6 +782,7 @@ impl StreamContext {
         }
 
         // Acquire depth image
+        let capture_start = Instant::now();
         let depth_image = match depth_provider.acquire_depth_image(
             self.stage_reference_space.as_raw(),
             display_time,
@@ -786,6 +799,7 @@ impl StreamContext {
             }
         };
 
+        self.depth_perf.record("acquire_ms", elapsed_ms(capture_start));
         let width = depth_provider.swapchain_width;
         let height = depth_provider.swapchain_height;
 
@@ -855,6 +869,7 @@ impl StreamContext {
                     let u16_byte_count = pixel_count * 2;
                     let mut depth_bytes = vec![0u8; u16_byte_count * 2];
 
+                    let readback_start = Instant::now();
                     for eye in 0..2u32 {
                         // Step 1: Attach runtime TEXTURE_2D_ARRAY layer as depth on fbo_read
                         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(readback.fbo_read));
@@ -907,7 +922,9 @@ impl StreamContext {
 
                     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                     readback.frame_count += 1;
-
+                    // Synchronous: ReadPixels into client memory waits for the GPU
+                    self.depth_perf.record("readback_ms", elapsed_ms(readback_start));
+                    let flip_start = Instant::now();
 
                     // Flip rows: glReadPixels returns bottom-up, send top-down
                     let row_bytes = width as usize * 2;
@@ -922,6 +939,8 @@ impl StreamContext {
                             }
                         }
                     }
+
+                    self.depth_perf.record("flip_ms", elapsed_ms(flip_start));
 
                     // A failed GL step leaves zeros or stale data in the buffer
                     readback_failure.is_none().then_some(depth_bytes)
@@ -964,7 +983,9 @@ impl StreamContext {
         // Depth data is only ~819 KB/frame at 320x640x2 eyes, so even raw is fine,
         // but LZ4 reduces it to ~200-400 KB with <1ms latency.
         let stacked_height = height * 2;
+        let lz4_start = Instant::now();
         let compressed = lz4_flex::compress_prepend_size(&depth_bytes);
+        self.depth_perf.record("lz4_ms", elapsed_ms(lz4_start));
         let (send_data, send_format) = (compressed, alvr_packets::DepthFrameFormat::Lz4D16);
 
         // Sampled after readback and compression, as close to the send as possible, so that the
@@ -985,8 +1006,20 @@ impl StreamContext {
             fov_angles,
         };
 
+        let send_start = Instant::now();
         self.core_context.send_depth_frame(&header, &send_data);
+        self.depth_perf.record("send_ms", elapsed_ms(send_start));
+        self.depth_perf.record("render_thread_ms", elapsed_ms(capture_start));
         self.last_depth_capture = Instant::now();
+
+        self.depth_perf_captures += 1;
+        if self.depth_perf_captures % DEPTH_PERF_REPORT_INTERVAL == 0 {
+            alvr_common::info!(
+                "[XR_PERF] depth {} captures: {}",
+                self.depth_perf_captures,
+                self.depth_perf.format_and_reset()
+            );
+        }
     }
 
     fn maybe_capture_camera(&mut self) {

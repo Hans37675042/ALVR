@@ -2,6 +2,78 @@
 //! readback slot ring, row flipping, send worker link). Nothing here touches GL or OpenXR, so it
 //! can be unit tested on the host; `alvr_client_openxr` drives it from the render thread.
 
+/// Percentile summary of one stage's samples since the last report.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StageSummary {
+    pub count: usize,
+    pub p50: f32,
+    pub p95: f32,
+    pub max: f32,
+}
+
+/// Samples of one pipeline stage (milliseconds, frames, ...), summarized and cleared together.
+#[derive(Default)]
+pub struct StageStats {
+    samples: Vec<f32>,
+}
+
+impl StageStats {
+    pub fn record(&mut self, value: f32) {
+        self.samples.push(value);
+    }
+
+    /// Nearest-rank p50/p95 and max of the samples recorded since the last call.
+    pub fn take_summary(&mut self) -> Option<StageSummary> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        self.samples.sort_by(f32::total_cmp);
+        let n = self.samples.len();
+        let rank = |p: f32| self.samples[((p * n as f32).ceil() as usize).clamp(1, n) - 1];
+        let summary = StageSummary {
+            count: n,
+            p50: rank(0.50),
+            p95: rank(0.95),
+            max: self.samples[n - 1],
+        };
+        self.samples.clear();
+        Some(summary)
+    }
+}
+
+/// Named stages reported on one `[XR_PERF]` log line, in the order they were first recorded.
+#[derive(Default)]
+pub struct StageSet {
+    stages: Vec<(&'static str, StageStats)>,
+}
+
+impl StageSet {
+    pub fn record(&mut self, name: &'static str, value: f32) {
+        if let Some((_, stats)) = self.stages.iter_mut().find(|(n, _)| *n == name) {
+            stats.record(value);
+        } else {
+            let mut stats = StageStats::default();
+            stats.record(value);
+            self.stages.push((name, stats));
+        }
+    }
+
+    /// One line with every stage that got samples since the last call; clears the samples.
+    pub fn format_and_reset(&mut self) -> String {
+        self.stages
+            .iter_mut()
+            .filter_map(|(name, stats)| {
+                let s = stats.take_summary()?;
+                Some(format!(
+                    "{name} p50 {:.2} p95 {:.2} max {:.2} (n={})",
+                    s.p50, s.p95, s.max, s.count
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
