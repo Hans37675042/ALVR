@@ -8,7 +8,8 @@ from typing import Tuple
 @dataclass
 class SemanticsParams:
     # --- 2.5D raster / segmentation
-    raster_cell: float = 0.02          # m, top-surface raster from upward surface points
+    raster_source: str = "heightmap"   # "heightmap" (fusion 5 cm map) or "points" (upward points)
+    raster_cell: float = 0.02          # m, raster cell when raster_source = "points"
     up_normal_min: float = 0.8         # normal.y for "horizontal surface" points
     blob_min_h: float = 0.05           # m above floor; lower = floor
     blob_max_h: float = 2.0            # m above floor; higher = structure, ignored

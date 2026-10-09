@@ -216,9 +216,13 @@ class SyntheticRoom:
         x = ox + (ix + 0.5) * c
         z = oz + (iz + 0.5) * c
         top = np.full((h, w), self.floor_y, dtype=float)
-        for b in self.boxes():
-            m = b.contains_xz(x, z)
-            top[m] = np.maximum(top[m], b.y1)
+        # max over 4 x 4 sub-samples per cell, like a TSDF scanning every voxel column
+        subs = [(k + 0.5) * c / 4 - c / 2 for k in range(4)]
+        for sx in subs:
+            for sz in subs:
+                for b in self.boxes():
+                    m = b.contains_xz(x + sx, z + sz)
+                    top[m] = np.maximum(top[m], b.y1)
         if self.noise > 0:
             top = top + self._rng.normal(0.0, self.noise, top.shape)
         floor = np.full((h, w), self.floor_y, dtype=float)

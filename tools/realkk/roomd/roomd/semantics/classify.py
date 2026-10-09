@@ -8,8 +8,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from .geometry import (
-    adjacency_counts, detect_walls, footprint_iou, label_components, min_area_rect, rasterize_max)
-from .mapview import MapView, as_heightmap, heightmap_cells
+    Raster, adjacency_counts, detect_walls, footprint_iou, label_components, min_area_rect, rasterize_max)
+from .mapview import FLAG_KNOWN, MapView, as_heightmap, heightmap_cells
 from .params import SemanticsParams
 from .basics import Kind, Obb, SceneLabel, wrap_deg, yaw_diff, yaw_from_front, yaw_from_right
 
@@ -227,9 +227,12 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     area = len(all_xz) * cell * cell
     if area < p.min_object_area:
         return None
-    centre, u, v, eu, ev = min_area_rect(all_xz)
-    eu += cell
-    ev += cell
+    centre, u, v, _, _ = min_area_rect(all_xz)
+    # Length of a filled footprint from its projected spread: uniform fill has
+    # L^2 = 12 var, and each cell adds its own cell^2 / 12. ptp + cell over-counts the
+    # staircase of a rotated box on a coarse grid.
+    eu = math.sqrt(12.0 * np.var(all_xz @ u) + cell * cell)
+    ev = math.sqrt(12.0 * np.var(all_xz @ v) + cell * cell)
     s = g.surface_h
     sy = float(all_rel.max())
 
@@ -397,13 +400,26 @@ def fuse_scene_labels(cands: List[Candidate], labels: Sequence[SceneLabel], view
 
 # ---------------------------------------------------------------- entry point
 
+def heightmap_raster(hm, floor_y) -> Raster:
+    """Known cells of the fusion heightmap as a max-height raster (unknown = NaN), with
+    per-cell floor height differences folded into the global floor."""
+    known = (np.asarray(hm.flags) & FLAG_KNOWN) != 0
+    with np.errstate(invalid="ignore"):
+        rel = np.asarray(hm.top_y, dtype=float) - np.asarray(hm.floor_y, dtype=float)
+    top = np.where(known & np.isfinite(rel), floor_y + rel, np.nan)
+    return Raster(hm.cell, hm.origin_x, hm.origin_z, top)
+
+
 def detect(view: MapView, params: Optional[SemanticsParams] = None,
            scene_labels: Sequence[SceneLabel] = ()) -> Detection:
     p = params or SemanticsParams()
     floor_y, floor_rms = view.floor_plane()
     pts, nrm = view.surface_points(floor_y + 0.03, floor_y + p.blob_max_h + 1.0)
     walls = detect_walls(pts, nrm, floor_y, p)
-    if len(pts):
+    hm = as_heightmap(view.heightmap()) if p.raster_source == "heightmap" else None
+    if hm is not None:
+        raster = heightmap_raster(hm, floor_y)
+    elif len(pts):
         rel = pts[:, 1] - floor_y
         up = (nrm[:, 1] >= p.up_normal_min) & (rel >= p.blob_min_h) & (rel <= p.blob_max_h)
         raster = rasterize_max(pts[up], p.raster_cell)
