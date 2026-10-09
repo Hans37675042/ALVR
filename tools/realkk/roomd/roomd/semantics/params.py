@@ -36,6 +36,7 @@ class SemanticsParams:
     back_min_cover: float = 0.45       # backrest length / seat width (office chair top edge is narrow)
     back_max_ratio: float = 0.8        # backrest cells / seat cells; more = side of other furniture
     seat_min_side: float = 0.30        # m, chair/couch footprint narrower than this is a ledge
+    seat_max_depth: float = 1.1        # m, front-to-back depth no chair or couch exceeds
     couch_min_len: float = 1.2
     table_h: Tuple[float, float] = (0.65, 0.80)
     bed_min_area: float = 1.5          # m^2
