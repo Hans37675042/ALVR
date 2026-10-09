@@ -701,4 +701,12 @@ mod tests {
         drop(link);
         assert_eq!(handle.join().unwrap(), 1);
     }
+
+    #[test]
+    fn detailed_gl_checks_run_early_then_every_hundredth_capture() {
+        let checked: Vec<u64> = (0..450).filter(|&i| detailed_gl_check_due(i)).collect();
+        let mut expected: Vec<u64> = (0..20).collect();
+        expected.extend([100, 200, 300, 400]);
+        assert_eq!(checked, expected);
+    }
 }
