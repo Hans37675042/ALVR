@@ -174,3 +174,13 @@ def test_reclassified_object_is_still_never_removed():
     room.remove("c")
     out, t = run(sem, room, 40, t)
     assert by_id(out)[oid]["State"] == "Missing"
+
+
+def test_unstable_chair_keeps_its_kind_while_the_user_sits_on_it():
+    # the seated body distorts the geometry; the seat must not vanish under the user
+    room, sem, oid, out, t = _chair_track(CREATE)
+    room.place("c", stool(0.5, 0.5, 0.0, h=0.44))           # reads as Other
+    out, t = run(sem, room, 4, t, user_head=(0.5, 1.2, 0.45))
+    o = by_id(out)[oid]
+    assert o["Kind"] == "Chair"
+    assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]
