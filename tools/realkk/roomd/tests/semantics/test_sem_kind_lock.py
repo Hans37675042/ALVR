@@ -2,7 +2,7 @@
 follows the classifier until it is stable, then stays fixed; pose and state keep updating.
 A stable (confirmed) object is never removed automatically; re-classification is on request."""
 from roomd.semantics import Obb, SemanticsParams
-from roomd.semantics.synthetic import chair, coffee_table, stool
+from roomd.semantics.synthetic import chair, coffee_table, couch, stool
 from roomd.semantics.tracker import iso_utc
 from sem_helpers import by_id, live, make_room, near, new_sem, pos, run, seats_of
 
@@ -157,6 +157,30 @@ def test_second_chair_seen_together_with_the_first_is_not_merged():
     assert by_id(out)[a]["State"] == "Missing"
     assert by_id(out)[b[0]]["State"] == "Present"
     assert near(pos(by_id(out)[b[0]]), (1.8, 1.8), 0.06)
+
+
+def test_other_furniture_on_a_missing_stable_chairs_spot_appears():
+    # chair carried away (Missing), a couch or a low table pushed onto its spot
+    for name, obj in (("Couch", couch(0.5, 0.5, 0.0)),
+                      ("Table", coffee_table(0.5, 0.5, 0.0, w=1.0, d=0.5, h=0.42))):
+        room, sem, oid, t = _locked_chair()
+        room.remove("c")
+        out, t = run(sem, room, 6, t)
+        assert by_id(out)[oid]["State"] == "Missing"
+        room.place("x", obj)
+        out, t = run(sem, room, 20, t)
+        assert len(live(out, name)) == 1, (name, [(x["Id"], x["Kind"], x["State"]) for x in out["Objects"]])
+        o = by_id(out)[oid]
+        assert o["Kind"] == "Chair" and o["State"] == "Missing"
+
+
+def test_couch_replacing_a_present_stable_chair_appears():
+    # swapped while the spot stays occupied: the larger couch is not the chair's reading
+    room, sem, oid, t = _locked_chair()
+    room.place("c", couch(0.5, 0.5, 0.0))
+    out, t = run(sem, room, 20, t)
+    assert len(live(out, "Couch")) == 1, [(x["Id"], x["Kind"], x["State"]) for x in out["Objects"]]
+    assert by_id(out)[oid]["Kind"] == "Chair"
 
 
 def test_never_stable_track_still_expires():
