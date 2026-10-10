@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -64,7 +64,16 @@ class Track:
     seat_states: List[str] = field(default_factory=list)
     blocked_counts: List[int] = field(default_factory=list)
     seat_baseline: Optional[List[float]] = None  # high share per seat at the published pose
-    revive_count: int = 0           # consecutive frames a Removed tombstone was seen again
+    revive_count: int = 0           # consecutive frames a Removed tombstone (or a Missing
+                                    # stable object beyond gate_dist) was seen again
+    # kind lock: the classifier decides the kind until it is stable, then it stays fixed
+    kind_locked: bool = False
+    confirmed: bool = False         # was stable once: never removed automatically
+    kind_streak: int = 1            # consecutive observations reading the track's kind
+    kind_since: Optional[float] = None  # time of the first observation of that streak
+    alt_kind: Optional[str] = None  # another kind read on an unlocked track ...
+    alt_streak: int = 0             # ... this many consecutive times
+    lock_size: Optional[Tuple[float, float, float]] = None  # (sx, sy, sz) at lock time
 
     def footprint(self, floor_y) -> Obb:
         o = self.pub
@@ -165,6 +174,9 @@ class RoomSemantics:
         live = [tr for tr in self.tracks.values()
                 if tr.state in LIVE_STATES and tr.id not in matched_tracks]
         rest = self._assign(rest, live, matched_tracks, t)
+        for tr in live:
+            if tr.id not in matched_tracks:
+                tr.revive_count = 0
 
         # 2b) only candidates no live track wants may revive a Removed tombstone within
         # revive_dist; it was a confirmed object, so revive_confirm frames are enough
@@ -215,7 +227,9 @@ class RoomSemantics:
             tr = tracks[j]
             matched.add(tr.id)
             taken.add(i)
-            if revive:
+            far = (tr.state == ObjectState.MISSING
+                   and math.hypot(cands[i].cx - tr.pub.cx, cands[i].cz - tr.pub.cz) >= self.p.gate_dist)
+            if revive or far:
                 tr.revive_count += 1
                 if tr.revive_count < self.p.revive_confirm:
                     continue
@@ -224,12 +238,21 @@ class RoomSemantics:
 
     def _cost(self, c: Candidate, tr: Track) -> float:
         p = self.p
-        if c.kind != tr.kind:
+        same = c.kind == tr.kind
+        if not same and tr.state == ObjectState.REMOVED:
             return _BIG
         if c.scene_uuid is not None and tr.source == Source.SCENE_API:
             return _BIG  # another anchor's object
         dist = math.hypot(c.cx - tr.pub.cx, c.cz - tr.pub.cz)
-        if dist >= (p.revive_dist if tr.state == ObjectState.REMOVED else p.gate_dist):
+        if tr.state == ObjectState.REMOVED:
+            gate = p.revive_dist
+        elif tr.state == ObjectState.MISSING and tr.confirmed and same:
+            gate = max(p.gate_dist, p.missing_gate_dist)  # moved while unseen
+        else:
+            gate = p.gate_dist
+        if not same:
+            gate = min(gate, p.kind_gate_dist)  # the same object read as another kind
+        if dist >= gate:
             return _BIG
         dsurf = abs(c.surface_h - tr.est.surface_h)
         if dsurf >= p.gate_surface_dh:
@@ -237,17 +260,105 @@ class RoomSemantics:
         dsize = (abs(max(c.sx, c.sz) - max(tr.est.sx, tr.est.sz))
                  + abs(min(c.sx, c.sz) - min(tr.est.sx, tr.est.sz)))
         dhist = 0.5 * float(np.abs(c.hist - tr.hist).sum()) if len(c.hist) == len(tr.hist) else 1.0
-        return dist + p.cost_w_size * dsize + p.cost_w_surface * dsurf + p.cost_w_hist * dhist
+        return (dist + p.cost_w_size * dsize + p.cost_w_surface * dsurf + p.cost_w_hist * dhist
+                + (0.0 if same else p.cost_kind_mismatch))
+
+    # ------------------------------------------------------------ kind lock
+    def _observe_kind(self, tr: Track, c: Candidate, t: float) -> str:
+        """Kind bookkeeping for one matched observation. Returns "pose" (update pose and
+        size as usual), "presence" (only keep the object seen) or "done" (the track switched
+        kind and took this observation as its new pose)."""
+        p = self.p
+        if c.kind == tr.kind:
+            tr.alt_kind, tr.alt_streak = None, 0
+            if tr.kind_streak <= 0 or tr.kind_since is None:
+                tr.kind_streak, tr.kind_since = 0, t
+            tr.kind_streak += 1
+            self._maybe_lock(tr, t)
+            return "pose"
+        tr.kind_streak, tr.kind_since = 0, None
+        if tr.kind_locked:
+            # e.g. someone leaning on a chair or a bag on its seat: the kind stays; a reading
+            # whose size does not fit the object only keeps it Present
+            return "pose" if self._size_ok(tr, c) else "presence"
+        if c.kind == tr.alt_kind:
+            tr.alt_streak += 1
+        else:
+            tr.alt_kind, tr.alt_streak = c.kind, 1
+        if tr.alt_streak < p.kind_switch_confirm:
+            return "presence"
+        # not stable yet: the classifier changed its mind, follow it
+        tr.kind, tr.label, tr.sittable, tr.symmetric = c.kind, c.label, c.sittable, c.symmetric
+        tr.movable = c.kind == Kind.CHAIR
+        tr.kind_streak, tr.kind_since = tr.alt_streak, t
+        tr.alt_kind, tr.alt_streak = None, 0
+        obs = _Obs.of(c)
+        tr.pub = obs
+        tr.est = _Obs(**vars(obs))
+        tr.hist = np.array(c.hist, dtype=float)
+        tr.confidence = c.confidence
+        tr.pending.clear()
+        tr.seat_baseline = None
+        tr.seat_states, tr.blocked_counts = [], []
+        tr.last_seen = t
+        tr.free_count = 0
+        tr.missing_since = None
+        tr.revive_count = 0
+        self._bump(tr, ObjectState.PRESENT, t)
+        self._maybe_lock(tr, t)
+        return "done"
+
+    def _maybe_lock(self, tr: Track, t: float):
+        p = self.p
+        if tr.kind_locked or tr.kind not in p.lock_kinds:
+            return
+        if (tr.kind_streak >= p.kind_lock_obs
+                or (tr.kind_streak >= 2 and t - tr.kind_since >= p.kind_lock_s)):
+            tr.kind_locked = True
+            tr.confirmed = True
+            if tr.lock_size is None:
+                tr.lock_size = (tr.est.sx, tr.est.sy, tr.est.sz)
+
+    def _size_ok(self, tr: Track, c: Candidate) -> bool:
+        ref = tr.lock_size or (tr.est.sx, tr.est.sy, tr.est.sz)
+        tol = self.p.kind_size_tol
+        pairs = ((max(c.sx, c.sz), max(ref[0], ref[2])), (min(c.sx, c.sz), min(ref[0], ref[2])),
+                 (c.sy, ref[1]))
+        return all(abs(v - r) <= tol * r for v, r in pairs)
+
+    def _clamp_size(self, tr: Track, obs: _Obs):
+        """A locked object keeps its size within kind_size_tol of the size at lock time
+        (footprint long / short side, so a 90 deg yaw flip of the box does not matter)."""
+        if not tr.kind_locked or tr.lock_size is None:
+            return
+        tol = self.p.kind_size_tol
+        ref = tr.lock_size
+        long_r, short_r = max(ref[0], ref[2]), min(ref[0], ref[2])
+
+        def clamp(v, r):
+            return min(max(v, r * (1.0 - tol)), r * (1.0 + tol))
+
+        if obs.sx >= obs.sz:
+            obs.sx, obs.sz = clamp(obs.sx, long_r), clamp(obs.sz, short_r)
+        else:
+            obs.sx, obs.sz = clamp(obs.sx, short_r), clamp(obs.sz, long_r)
+        obs.sy = clamp(obs.sy, ref[1])
 
     def _observe(self, tr: Track, c: Candidate, t: float):
         p = self.p
+        how = self._observe_kind(tr, c, t)
+        if how == "done":
+            return
         tr.last_seen = t
         tr.free_count = 0
+        if how == "presence":
+            return
         tr.missing_since = None
         tr.hist = (1 - p.ema_alpha) * tr.hist + p.ema_alpha * c.hist if len(tr.hist) == len(c.hist) else c.hist
         tr.confidence = (1 - p.ema_alpha) * tr.confidence + p.ema_alpha * c.confidence
         obs = _Obs.of(c)
         obs.yaw = _align_yaw(obs.yaw, tr.pub.yaw, tr.symmetric)
+        self._clamp_size(tr, obs)
         if tr.state in (ObjectState.MISSING, ObjectState.REMOVED):
             tr.revive_count = 0
             tr.pub = obs
@@ -340,7 +451,7 @@ class RoomSemantics:
             id=tid, kind=c.kind, source=source, label=c.label, sittable=c.sittable,
             movable=c.kind == Kind.CHAIR, symmetric=c.symmetric, pub=obs, est=_Obs(**vars(obs)),
             hist=np.array(c.hist, dtype=float), confidence=c.confidence, pub_conf=c.confidence,
-            state=ObjectState.PRESENT, created=t, updated=t, last_seen=t)
+            state=ObjectState.PRESENT, created=t, updated=t, last_seen=t, kind_since=t)
         self._dirty = True
 
     # ------------------------------------------------------------ disappearance
@@ -355,7 +466,8 @@ class RoomSemantics:
                 tr.missing_since = t
                 tr.pending.clear()
                 self._bump(tr, ObjectState.MISSING, t)
-        elif t - tr.missing_since >= p.remove_after_s:
+        elif not tr.confirmed and t - tr.missing_since >= p.remove_after_s:
+            # a stable object stays Missing at its last pose: furniture is moved, not removed
             self._bump(tr, ObjectState.REMOVED, t)
 
     def _gone_evidence(self, tr: Track, view: MapView, hm, user_head, floor_y) -> bool:
