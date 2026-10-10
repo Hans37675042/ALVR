@@ -255,12 +255,19 @@ class RoomService:
         self.tick(force=True)
 
     def process_plugin(self):
-        """Handle the plugin's queued requests; True if there were any."""
+        """Handle the plugin's queued requests; True if there were any. Queued ROOM_RECLASSIFY
+        requests are merged (any "all" request means all) into one sink call and one forced
+        output poll."""
         take = getattr(self.plugin, "take_reclassify", None)
         requests = take() if take is not None else []
-        for ids in requests:
-            self.reclassify(ids)
-        return bool(requests)
+        if not requests:
+            return False
+        if any(ids is None for ids in requests):
+            merged = None
+        else:
+            merged = list(dict.fromkeys(i for ids in requests for i in ids))
+        self.reclassify(merged)
+        return True
 
     def process(self, inbox):
         """Handle everything waiting in the inbox and the plugin's requests; True if anything
