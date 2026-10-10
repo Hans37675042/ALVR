@@ -302,7 +302,8 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     if area >= p.bed_min_area and _in(s, p.bed_h) and flat and not couch_like:
         kind, sittable, conf = Kind.BED, p.bed_sittable, p.conf_bed
     elif (has_back and flat and _in(s, p.seat_h) and min(sx, sz) >= p.seat_min_side
-          and sz <= p.seat_max_depth and g.base_refilled <= p.seat_max_overhung):
+          and sz <= p.seat_max_depth and sy <= p.seat_max_top
+          and g.base_refilled <= p.seat_max_overhung):
         if sx >= p.couch_min_len:
             kind, conf = Kind.COUCH, p.conf_couch
         else:

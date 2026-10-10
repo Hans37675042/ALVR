@@ -35,7 +35,10 @@ class SemanticsParams:
     back_min_rise: float = 0.25        # m above seat
     back_min_cover: float = 0.45       # backrest length / seat width (office chair top edge is narrow)
     back_max_ratio: float = 0.8        # backrest cells / seat cells; more = side of other furniture
-    seat_min_side: float = 0.30        # m, chair/couch footprint narrower than this is a ledge
+    seat_min_side: float = 0.35        # m, chair/couch footprint narrower than this is a ledge
+                                       # (measured on the 5 cm heightmap: ~5 cm wider than true)
+    seat_max_top: float = 1.32         # m, chair/couch with anything higher is a cabinet side
+                                       # (room2 office chair reads 1.23-1.27; false 1.34-1.48)
     seat_max_depth: float = 1.1        # m, front-to-back depth no chair or couch exceeds
     seat_max_overhung: float = 0.5     # seat seen mostly under an overhang (loft desk zone) is not a seat
     couch_min_len: float = 1.2
@@ -89,9 +92,13 @@ class SemanticsParams:
     new_match_dist: float = 0.3
     absorb_iou: float = 0.3            # unmatched candidate over a live track = same thing
     revive_dist: float = 1.0           # Removed tombstone revived within this distance
+    revive_confirm: int = 2            # consecutive observations that revive a tombstone
     missing_visible_min: float = 0.5
     missing_free_min: float = 0.6
     missing_confirm: int = 2           # consecutive free-space observations -> Missing
+    missing_floor_frac: float = 0.5    # heightmap top below this share of the surface = floor
+    missing_floor_min: float = 0.6     # ... over this share of the known probe cells
+    missing_body_clear: float = 0.45   # m; user's head this close to the footprint: no evidence
     remove_after_s: float = 5.0
     probe_below: float = 0.04          # probe slab around the surface for free-space evidence
     probe_above: float = 0.01
@@ -100,6 +107,9 @@ class SemanticsParams:
     # --- seat states
     blocked_rise: float = 0.08
     blocked_fraction: float = 0.4
+    blocked_confirm: int = 2           # consecutive blocked observations before Blocked
+    blocked_over_baseline: float = 0.25  # more high share than when the pose was published
+    blocked_baseline_max: float = 0.6  # baseline cap (a pile there at publish time still counts)
     seat_area_len_frac: float = 0.8
     seat_area_depth_frac: float = 0.5
     head_h: Tuple[float, float] = (1.1, 1.3)

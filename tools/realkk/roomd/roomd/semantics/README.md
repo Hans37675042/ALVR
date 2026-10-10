@@ -96,11 +96,21 @@ Meta anchor already converted to Unity stage space.
    consistent observations > 5 cm or > 10° away (`Moving` after 2); smaller changes go
    into an EMA. New objects need 3 consecutive observations (scene objects: 1);
    leftovers overlapping a live or Rejected object are absorbed. An unmatched object
-   becomes `Missing` after 2 frames whose surface probe is visible and free, `Removed`
-   5 s later (tombstone kept, revived if the same kind reappears within 1 m).
+   becomes `Missing` after 2 frames of "gone" evidence, `Removed` 5 s later. Gone = the
+   surface slab is visible and free **and** the heightmap shows floor (top below half the
+   surface height) over ≥ 60 % of the known probe cells (cells reading ≥ 1.4 m are an
+   overhang such as the loft bed and carry no floor evidence; with only such cells the free
+   slab decides alone); never while a seat is `OccupiedByUser` or the user's head is within
+   0.45 m of the footprint (the fusion body mask hides what the user stands at or sits on).
+   A `Removed` tombstone is matched only by candidates no live track took (gate
+   `revive_dist` = 1 m) and is revived after 2 consecutive matched frames.
 8. Seats: `OccupiedByUser` when the head is 1.1–1.3 m above the floor within 0.35 m of
    the seat (freezes the object pose); `Blocked` when > 40 % of the seat area is > 8 cm
-   above the seat; object Moving/Missing/Removed propagate to its seats.
+   above the seat for 2 consecutive frames **and** that share is ≥ 0.25 above the
+   baseline taken on the first frame after the pose is published in which the user does
+   not occupy the seat (the object's own
+   armrests / backrest under a shifted area; baseline capped at 0.6); object
+   Moving/Missing/Removed propagate to its seats.
 
 All thresholds live in `SemanticsParams` (`params.py`) for on-device tuning.
 
@@ -124,8 +134,37 @@ wander across the room.
 Real-data rules (each from a failure on this tap): heightmap segmentation (points too
 sparse), overhang refill + free-space probe (desk under the loft), refilled cells are never a
 backrest and seats seen mostly under an overhang are not seats, backrest ≤ 0.8 × seat,
-seat side ≥ 0.30 m and depth ≤ 1.1 m, table ≥ 0.30 m² with side ≥ 0.40 m, a user sitting
-ends Moving. Geometry-only `Other` objects are not published by the sink.
+seat side ≥ 0.35 m and depth ≤ 1.1 m, chair/couch top ≤ 1.32 m, table ≥ 0.30 m² with side
+≥ 0.40 m, a user sitting ends Moving.
+
+### Seat robustness (live 2026-10-10: "the room has no available seat")
+
+Live roomd model at the time: the real office chair `Removed` while in the room, two
+narrow/tall pieces (`0.31 m` wide; `1.39 m` tall) published as chairs with `Blocked` seats.
+Replaying room2 with candidate dumps showed the causes:
+
+- The free-slab probe alone sent a present chair `Missing` (base: t=58 s, one second after
+  creation, while the PM stood at it): the published seat height is noisy (0.39–0.47 m on
+  this chair) and the body mask leaves the slab carved. Now the heightmap must also show
+  floor, and the user's spot never counts.
+- Tall false chairs passed the old rules and, while the real chair was Moving/Missing, the
+  3 m gate let it take their observations (base t=77–85 s: `Moving` with no real motion).
+  The real chair reads 1.23–1.27 m tall here (p90 of its backrest cells 1.22–1.26); the
+  false pieces 1.34–1.48 m, or 0.30–0.37 m wide → top ≤ 1.32 m, side ≥ 0.35 m.
+  The top is the highest cell on purpose: several false pieces had a backrest p75 of
+  1.0–1.2 m and a single cell above 1.32 m, while the real chair never read above 1.27 m
+  (250 samples); a percentile let them back in (replay: the chair went Missing 83–92 s
+  instead of 79–81 s while a false chair took its observations).
+- After the user stood up (t≈105 s) the re-measured box put the armrests (0.61–0.79 m)
+  and backrest into the seat area: 55 % high cells, `Blocked` until the end. The per-pose
+  baseline keeps it `Available`.
+
+| room2, defaults | chair ids | false chairs | Missing while present | id kept across move | OccupiedByUser | seat after t=57 s (polls Available / Moving / Missing / Occupied / Blocked) |
+|---|---|---|---|---|---|---|
+| before | 1 | 0 tracks (Chair candidates at 14, 36, 57–84, 103 s) | t=58 s | yes (Moving 77–86, Missing 86–92) | t=95–102 | 20 / 13 / 6 / 7 / 23 |
+| after  | 1 | 0 tracks (no tall/narrow Chair candidates) | none | yes (Missing 79–81, Present at the new spot from 81) | t=95–102 | 52 / 8 / 2 / 7 / 0 |
+
+Geometry-only `Other` objects are not published by the sink.
 
 ## Known limits
 
@@ -140,14 +179,19 @@ ends Moving. Geometry-only `Other` objects are not published by the sink.
   user sits on it the fusion body mask hides it too, so the chair the PM sat on at the
   start of the tap is first seen at t≈60 s (OccupiedByUser cannot fire before that).
 - Seats seen only under an overhang (loft desk zone) are never offered.
-- A re-measured pose can shift ~9 cm (room2 t≈105 s, after the user stood up): the seat
-  area then covers the armrests/backrest and the seat reads Blocked. Anchoring size and
-  seat height to the tracked template does not help (56 % high cells at the shifted
-  centre vs 36 % before); needs pose anchoring (e.g. backrest edge) or hysteresis.
+- A re-measured pose can shift ~9 cm (room2 t≈105 s, after the user stood up) so the seat
+  area covers the armrests/backrest; the per-pose baseline keeps such a seat Available,
+  but a pile already on the seat when a pose is published raises the baseline (cap 0.6):
+  it then needs > 0.85 high cells. Pose anchoring (backrest edge) is still not done.
+- `seat_max_top` (1.32 m) is tuned to one chair: a high-back gaming chair taller than that
+  would not be offered.
 - Table ids can jump to another table-like candidate within `gate_dist` (3 m); a per-kind
   gate (≈1 m for tables) is the next step.
-- Seat states have no hysteresis; a single noisy frame can flip Blocked.
+- Only Blocked is debounced (2 frames); Available / OccupiedByUser apply at once.
 - Beds are not sittable by default (`bed_sittable`); SeatGenerator would put the
   seat in the middle of the mattress.
-- Revival of a Removed object is by kind + distance only; two identical chairs
-  taken out and brought back may swap ids.
+- Revival of a Removed object is by kind + distance (1 m) + seat height only; two identical
+  chairs taken out and brought back may swap ids. A chair carried > 1 m while Removed gets
+  a new id after 3 observations.
+- Under an overhang the disappearance check falls back to the free slab alone, which can
+  read free above a seat whose height was published a few cm off (see above).

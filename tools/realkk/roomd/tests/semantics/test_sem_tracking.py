@@ -207,3 +207,112 @@ def test_rejected_object_is_kept_and_not_redetected():
     out, t = run(sem, room, 6, t)
     assert by_id(out)[oid]["State"] == "Rejected"
     assert live(out) == []
+
+
+def _removed_chair():
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")
+    out, t = run(sem, room, 16, t)
+    assert by_id(out)[oid]["State"] == "Removed"
+    return room, sem, oid, t
+
+
+def test_removed_object_revives_on_second_observation():
+    # live 2026-10-10: the office chair stayed Removed while back in the room
+    room, sem, oid, t = _removed_chair()
+    room.place("c", chair(0.7, 0.4, 20.0))
+    out, t = run(sem, room, 1, t)
+    assert by_id(out)[oid]["State"] == "Removed"
+    out, t = run(sem, room, 1, t)
+    o = _single(out)
+    assert o["Id"] == oid and o["State"] == "Present"
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+
+
+def test_seat_height_mismatch_is_not_free_space_evidence():
+    # real chairs read 0.375-0.46 m across views: a probe slab at the published seat height can
+    # be free while the seat (seen as something else, e.g. no backrest) still stands there
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0, seat_h=0.52))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    from roomd.semantics.synthetic import stool
+    room.place("c", stool(0.5, 0.5, 0.0, h=0.44, w=0.45))
+    out, t = run(sem, room, 20, t)
+    assert by_id(out)[oid]["State"] == "Present"
+
+
+def test_chair_the_user_sits_on_never_goes_missing():
+    # the fusion body mask hides a chair the user sits on; its slab can read free
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")  # worst case: the map shows only free space there
+    out, t = run(sem, room, 20, t, user_head=(0.5, 1.2, 0.45))
+    o = by_id(out)[oid]
+    assert o["State"] == "Present"
+    assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]
+
+
+def test_user_standing_on_the_spot_gives_no_free_space_evidence():
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")
+    out, t = run(sem, room, 20, t, user_head=(0.55, 1.65, 0.5))
+    assert by_id(out)[oid]["State"] == "Present"
+    out, t = run(sem, room, 2, t, user_head=(-1.5, 1.65, -1.5))  # walks away: now it is gone
+    assert by_id(out)[oid]["State"] == "Missing"
+
+
+def test_one_flash_does_not_revive_a_tombstone():
+    # a single same-kind candidate near a tombstone (e.g. a Table flash next to the desk)
+    # must not bring back a key-coloured occluder
+    room, sem, oid, t = _removed_chair()
+    room.place("c", chair(0.6, 0.45, 10.0))
+    out, t = run(sem, room, 1, t)
+    room.remove("c")
+    out, t = run(sem, room, 4, t)
+    assert by_id(out)[oid]["State"] == "Removed"
+    assert live(out) == []
+
+
+def test_live_track_wins_over_a_nearer_tombstone():
+    # chair Removed at A, re-detected as a new track at B (> revive_dist away), then pushed
+    # back next to A: the live track follows it, the tombstone stays dead
+    room, sem, old, t = _removed_chair()
+    room.place("c", chair(-0.9, 0.5, 0.0))
+    out, t = run(sem, room, 3, t)
+    new = _single(out)["Id"]
+    assert new != old
+    room.place("c", chair(0.4, 0.5, 0.0))
+    out, t = run(sem, room, 5, t)
+    o = _single(out)
+    assert o["Id"] == new and o["State"] == "Present" and near(pos(o), (0.4, 0.5), 0.08)
+    assert by_id(out)[old]["State"] == "Removed"
+
+
+def test_desk_under_a_loft_goes_missing_when_taken_away():
+    # the heightmap under a loft shows the loft (>= 1.4 m), never the floor: those cells
+    # cannot carry floor evidence, so the free surface slab decides there
+    from roomd.semantics import Obb
+    room = make_room()
+    room.place("desk", table(0.0, -1.6, 0.0, w=1.6, d=0.7, h=0.72))
+    room.place("loft", [Obb(0.0, -1.6, 0.0, 2.0, 0.9, 1.55, 1.65)])
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    desks = live(out, "Table")
+    assert len(desks) == 1, [(o["Kind"], o["Size"]) for o in live(out)]
+    oid = desks[0]["Id"]
+    room.remove("desk")
+    out, t = run(sem, room, 4, t)
+    assert by_id(out)[oid]["State"] in ("Missing", "Removed")

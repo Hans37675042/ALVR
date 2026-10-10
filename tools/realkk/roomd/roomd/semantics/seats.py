@@ -75,27 +75,38 @@ def seat_areas(cx, cz, yaw, size, p: SemanticsParams) -> List[Obb]:
     return out
 
 
+def seat_high_fraction(area: Obb, seat_h: float, hm: Optional[HeightMap],
+                       p: SemanticsParams) -> Optional[float]:
+    """Share of the known heightmap cells of a seat area more than blocked_rise above the
+    seat (None when nothing is known)."""
+    if hm is None:
+        return None
+    rel, known = heightmap_cells(hm, area)
+    if known.sum() == 0:
+        return None
+    with np.errstate(invalid="ignore"):
+        return float((rel[known] > seat_h + p.blocked_rise).mean())
+
+
 def seat_occupancy(areas: Sequence[Obb], seat_h: float, hm: Optional[HeightMap],
                    user_head: Optional[Sequence[float]], floor_y: float,
-                   p: SemanticsParams) -> List[str]:
+                   p: SemanticsParams,
+                   baseline: Optional[Sequence[Optional[float]]] = None) -> List[str]:
     """Available / Blocked (something > blocked_rise above the seat over enough of its
-    area) / OccupiedByUser (head at seated height above the seat)."""
+    area) / OccupiedByUser (head at seated height above the seat). ``baseline``: high
+    share each area showed when the pose was published (the object's own armrests or
+    backrest under a shifted area); Blocked then also needs blocked_over_baseline more."""
     states = []
-    for a in areas:
+    for i, a in enumerate(areas):
         if user_head is not None:
             hx, hy, hz = user_head
             if (p.head_h[0] <= hy - floor_y <= p.head_h[1]
                     and math.hypot(hx - a.cx, hz - a.cz) <= p.head_seat_radius):
                 states.append(SeatState.OCCUPIED_BY_USER)
                 continue
-        if hm is None:
-            states.append(SeatState.AVAILABLE)
-            continue
-        rel, known = heightmap_cells(hm, a)
-        if known.sum() == 0:
-            states.append(SeatState.AVAILABLE)
-            continue
-        with np.errstate(invalid="ignore"):
-            high = (rel[known] > seat_h + p.blocked_rise).mean()
-        states.append(SeatState.BLOCKED if high > p.blocked_fraction else SeatState.AVAILABLE)
+        high = seat_high_fraction(a, seat_h, hm, p)
+        base = baseline[i] if baseline is not None and i < len(baseline) else None
+        blocked = (high is not None and high > p.blocked_fraction
+                   and (base is None or high - base >= p.blocked_over_baseline))
+        states.append(SeatState.BLOCKED if blocked else SeatState.AVAILABLE)
     return states

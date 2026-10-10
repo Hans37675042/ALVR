@@ -10,9 +10,9 @@ import numpy as np
 
 from .classify import Candidate, detect
 from .geometry import footprint_iou, linear_assignment
-from .mapview import MapView, as_heightmap
+from .mapview import MapView, as_heightmap, heightmap_cells
 from .params import SemanticsParams
-from .seats import generate_seats, pose_json, seat_areas, seat_occupancy
+from .seats import generate_seats, pose_json, seat_areas, seat_high_fraction, seat_occupancy
 from .basics import (
     Kind, Obb, ObjectState, SceneLabel, SeatState, Source, wrap_deg, yaw_diff)
 
@@ -62,6 +62,9 @@ class Track:
     free_count: int = 0
     missing_since: Optional[float] = None
     seat_states: List[str] = field(default_factory=list)
+    blocked_counts: List[int] = field(default_factory=list)
+    seat_baseline: Optional[List[float]] = None  # high share per seat at the published pose
+    revive_count: int = 0           # consecutive frames a Removed tombstone was seen again
 
     def footprint(self, floor_y) -> Obb:
         o = self.pub
@@ -135,7 +138,7 @@ class RoomSemantics:
         # seat states first: a seat occupied by the user freezes its object's pose, and an
         # object someone sits on is not moving (the body only distorts its geometry)
         for tr in self.tracks.values():
-            self._update_seats(tr, hm, user_head, floor_y)
+            self._update_seats(tr, hm, user_head, floor_y, advance=False)
             if tr.seat_frozen() and tr.state == ObjectState.MOVING:
                 tr.pending.clear()
                 self._bump(tr, ObjectState.PRESENT, t)
@@ -161,20 +164,16 @@ class RoomSemantics:
         # 2) Hungarian between remaining candidates and live tracks
         live = [tr for tr in self.tracks.values()
                 if tr.state in LIVE_STATES and tr.id not in matched_tracks]
-        if rest and live:
-            cost = np.full((len(rest), len(live)), _BIG)
-            for i, c in enumerate(rest):
-                for j, tr in enumerate(live):
-                    cost[i, j] = self._cost(c, tr)
-            rows, cols = linear_assignment(cost)
-            taken = set()
-            for i, j in zip(rows, cols):
-                if cost[i, j] >= _BIG:
-                    continue
-                self._observe(live[j], rest[i], t)
-                matched_tracks.add(live[j].id)
-                taken.add(i)
-            rest = [c for i, c in enumerate(rest) if i not in taken]
+        rest = self._assign(rest, live, matched_tracks, t)
+
+        # 2b) only candidates no live track wants may revive a Removed tombstone within
+        # revive_dist; it was a confirmed object, so revive_confirm frames are enough
+        tombs = [tr for tr in self.tracks.values() if tr.state == ObjectState.REMOVED]
+        seen = set()
+        rest = self._assign(rest, tombs, seen, t, revive=True)
+        for tr in tombs:
+            if tr.id not in seen:
+                tr.revive_count = 0
 
         # 3) leftovers: absorbed by an existing object, or new-object candidates
         for c in rest:
@@ -190,13 +189,39 @@ class RoomSemantics:
         for tr in self.tracks.values():
             if tr.id in matched_tracks or tr.state not in LIVE_STATES:
                 continue
-            self._check_missing(tr, view, t, floor_y)
+            self._check_missing(tr, view, hm, user_head, t, floor_y)
 
         for tr in self.tracks.values():
             self._update_seats(tr, hm, user_head, floor_y)
         return self._output(floor_y, t)
 
     # ------------------------------------------------------------ matching
+    def _assign(self, cands: List[Candidate], tracks: List[Track], matched: set, t: float,
+                revive: bool = False) -> List[Candidate]:
+        """Hungarian between ``cands`` and ``tracks``; returns the unassigned candidates.
+        With ``revive`` an assignment counts towards reviving the tombstone instead of
+        observing it at once."""
+        if not cands or not tracks:
+            return cands
+        cost = np.full((len(cands), len(tracks)), _BIG)
+        for i, c in enumerate(cands):
+            for j, tr in enumerate(tracks):
+                cost[i, j] = self._cost(c, tr)
+        rows, cols = linear_assignment(cost)
+        taken = set()
+        for i, j in zip(rows, cols):
+            if cost[i, j] >= _BIG:
+                continue
+            tr = tracks[j]
+            matched.add(tr.id)
+            taken.add(i)
+            if revive:
+                tr.revive_count += 1
+                if tr.revive_count < self.p.revive_confirm:
+                    continue
+            self._observe(tr, cands[i], t)
+        return [c for i, c in enumerate(cands) if i not in taken]
+
     def _cost(self, c: Candidate, tr: Track) -> float:
         p = self.p
         if c.kind != tr.kind:
@@ -204,7 +229,7 @@ class RoomSemantics:
         if c.scene_uuid is not None and tr.source == Source.SCENE_API:
             return _BIG  # another anchor's object
         dist = math.hypot(c.cx - tr.pub.cx, c.cz - tr.pub.cz)
-        if dist >= p.gate_dist:
+        if dist >= (p.revive_dist if tr.state == ObjectState.REMOVED else p.gate_dist):
             return _BIG
         dsurf = abs(c.surface_h - tr.est.surface_h)
         if dsurf >= p.gate_surface_dh:
@@ -224,7 +249,9 @@ class RoomSemantics:
         obs = _Obs.of(c)
         obs.yaw = _align_yaw(obs.yaw, tr.pub.yaw, tr.symmetric)
         if tr.state in (ObjectState.MISSING, ObjectState.REMOVED):
+            tr.revive_count = 0
             tr.pub = obs
+            tr.seat_baseline = None
             tr.est = _Obs(**vars(obs))
             tr.pending.clear()
             self._bump(tr, ObjectState.PRESENT, t)
@@ -252,6 +279,7 @@ class RoomSemantics:
             m = _mean_obs(last)
             if not any(_deviates(m, o, tr.symmetric, p) for o in last):
                 tr.pub = m
+                tr.seat_baseline = None
                 tr.est = _Obs(**vars(m))
                 tr.pending.clear()
                 self._bump(tr, ObjectState.PRESENT, t)
@@ -316,16 +344,11 @@ class RoomSemantics:
         self._dirty = True
 
     # ------------------------------------------------------------ disappearance
-    def _check_missing(self, tr: Track, view: MapView, t: float, floor_y: float):
+    def _check_missing(self, tr: Track, view: MapView, hm, user_head, t: float, floor_y: float):
         p = self.p
-        o = tr.pub
-        probe = Obb(o.cx, o.cz, o.yaw, o.sx * p.probe_shrink, o.sz * p.probe_shrink,
-                    floor_y + o.surface_h - p.probe_below, floor_y + o.surface_h + p.probe_above)
-        vis = view.visible_fraction(probe)
-        free = view.free_fraction(probe) if vis >= p.missing_visible_min else 0.0
-        if vis < p.missing_visible_min or free < p.missing_free_min:
+        if not self._gone_evidence(tr, view, hm, user_head, floor_y):
             tr.free_count = 0
-            return  # occluded or still occupied: no evidence of disappearance
+            return  # occluded, still occupied or under the user: no evidence of disappearance
         tr.free_count += 1
         if tr.state != ObjectState.MISSING:
             if tr.free_count >= p.missing_confirm:
@@ -335,14 +358,74 @@ class RoomSemantics:
         elif t - tr.missing_since >= p.remove_after_s:
             self._bump(tr, ObjectState.REMOVED, t)
 
+    def _gone_evidence(self, tr: Track, view: MapView, hm, user_head, floor_y) -> bool:
+        """True when the map shows the object's place empty: the surface slab is free
+        space AND the heightmap shows floor there. The slab alone fails on real chairs
+        (seat height reads 0.375-0.46 m across views, so a slab at the published height
+        can be free above the real seat); a seated or nearby user hides the object from
+        the fusion (body mask), so the user's own spot never counts."""
+        p = self.p
+        o = tr.pub
+        if tr.seat_frozen():
+            return False
+        if user_head is not None and tr.footprint(floor_y).contains_xz(
+                np.array([user_head[0]]), np.array([user_head[2]]), p.missing_body_clear)[0]:
+            return False
+        probe = Obb(o.cx, o.cz, o.yaw, o.sx * p.probe_shrink, o.sz * p.probe_shrink,
+                    floor_y + o.surface_h - p.probe_below, floor_y + o.surface_h + p.probe_above)
+        if view.visible_fraction(probe) < p.missing_visible_min:
+            return False
+        if view.free_fraction(probe) < p.missing_free_min:
+            return False
+        if hm is None:
+            return True
+        rel, known = heightmap_cells(hm, probe)
+        if rel.size == 0 or known.mean() < p.missing_visible_min:
+            return False
+        # under an overhang (loft bed) the heightmap top is the overhang, never the floor:
+        # those cells carry no floor evidence and the free slab above decides alone
+        with np.errstate(invalid="ignore"):
+            rel_k = rel[known]
+            ground = rel_k[~(rel_k >= p.overhang_min_h)]
+            if ground.size == 0:
+                return True
+            floor_like = (ground < p.missing_floor_frac * o.surface_h).mean()
+        return floor_like >= p.missing_floor_min
+
     # ------------------------------------------------------------ seats
-    def _update_seats(self, tr: Track, hm, user_head, floor_y):
+    def _update_seats(self, tr: Track, hm, user_head, floor_y, advance=True):
+        """Seat states; Blocked needs ``blocked_confirm`` consecutive blocked frames
+        (counted only when ``advance``), any other reading applies at once."""
         if not tr.sittable or tr.state in (ObjectState.REMOVED, ObjectState.REJECTED):
             tr.seat_states = []
+            tr.blocked_counts = []
             return
         o = tr.pub
         areas = seat_areas(o.cx, o.cz, o.yaw, (o.sx, o.sy, o.sz), self.p)
-        tr.seat_states = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, self.p)
+        p = self.p
+        raw = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, p, tr.seat_baseline)
+        if (advance and tr.seat_baseline is None and tr.state == ObjectState.PRESENT
+                and SeatState.OCCUPIED_BY_USER not in raw):
+            # first frame at this pose with the user off the seat: what the object itself
+            # (or anything already lying there) puts in its seat areas
+            fr = [seat_high_fraction(a, o.surface_h, hm, p) for a in areas]
+            if all(f is not None for f in fr):
+                tr.seat_baseline = [min(f, p.blocked_baseline_max) for f in fr]
+                raw = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, p, tr.seat_baseline)
+        if len(tr.blocked_counts) != len(raw):
+            tr.blocked_counts = [0] * len(raw)
+        states = []
+        for i, s in enumerate(raw):
+            if s != SeatState.BLOCKED:
+                if advance:
+                    tr.blocked_counts[i] = 0
+                states.append(s)
+                continue
+            n = tr.blocked_counts[i] + (1 if advance else 0)
+            if advance:
+                tr.blocked_counts[i] = n
+            states.append(SeatState.BLOCKED if n >= p.blocked_confirm else SeatState.AVAILABLE)
+        tr.seat_states = states
 
     def _seat_states_out(self, tr: Track, n: int) -> List[str]:
         if tr.state in (ObjectState.REMOVED, ObjectState.REJECTED):

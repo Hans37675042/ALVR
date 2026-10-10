@@ -247,3 +247,37 @@ def test_small_surface_at_table_height_is_not_a_table(w, d):
     # real tap: cabinet shelves and ledges at 0.7-0.8 m read as tables
     c = _one(storage(0.0, 0.0, 20.0, w=w, d=d, h=0.75))
     assert c.kind == "Other" and not c.sittable
+
+
+@pytest.mark.parametrize("back_h", [1.38, 1.45])
+def test_seat_with_a_back_far_above_any_chair_is_not_a_chair(back_h):
+    # live 2026-10-10: 1.28-1.40 m tall pieces with a seat-height ledge read as chairs
+    cands = _detect(chair(0.0, 0.0, 0.0, seat_h=0.5, width=0.5, depth=0.6, back_h=back_h))
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands), \
+        [(c.kind, round(c.sy, 2)) for c in cands]
+
+
+@pytest.mark.parametrize("width", [0.25, 0.28])
+def test_seat_narrower_than_any_chair_is_not_a_chair(width):
+    # live 2026-10-10: a strip measured 0.31 m wide (5 cm heightmap adds ~5 cm) read as a chair
+    cands = _detect(chair(0.0, 0.0, 30.0, seat_h=0.45, width=width, depth=0.45, back_h=1.0))
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands), \
+        [(c.kind, round(c.sx, 2), round(c.sz, 2)) for c in cands]
+
+
+def test_office_chair_like_the_pm_chair_is_a_chair():
+    # PM office chair on the room2 tap: ~0.65 x 0.7 m, seat ~0.45 m, backrest read at 1.23-1.27 m
+    c = _one(chair(0.0, 0.0, 30.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.27))
+    assert c.kind == "Chair" and c.sittable
+
+
+@pytest.mark.parametrize("spike_x", [0.0, 0.13])
+@pytest.mark.parametrize("spike", [(0.03, 0.03), (0.06, 0.05)])
+def test_one_high_spot_on_a_low_back_is_still_not_a_chair(spike_x, spike):
+    # room2 replay: false chairs (3.27, 0.34), (3.30, -0.41), (-1.05, 0.76) had a backrest
+    # p75 of 1.0-1.2 m and only 1 cell above 1.32 m; the real chair never had one (max 1.27
+    # over 250 samples). A percentile top check let them through, so the top stays the max.
+    from roomd.semantics import Obb
+    top = Obb(spike_x, -0.25, 0.0, spike[0], spike[1], 1.2, 1.36)
+    cands = _detect(chair(0.0, 0.0, 0.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.2) + [top])
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands),         [(c.kind, round(c.sy, 2)) for c in cands]
