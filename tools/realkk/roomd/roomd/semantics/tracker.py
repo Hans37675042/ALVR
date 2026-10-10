@@ -382,8 +382,14 @@ class RoomSemantics:
         rel, known = heightmap_cells(hm, probe)
         if rel.size == 0 or known.mean() < p.missing_visible_min:
             return False
+        # under an overhang (loft bed) the heightmap top is the overhang, never the floor:
+        # those cells carry no floor evidence and the free slab above decides alone
         with np.errstate(invalid="ignore"):
-            floor_like = (rel[known] < p.missing_floor_frac * o.surface_h).mean()
+            rel_k = rel[known]
+            ground = rel_k[~(rel_k >= p.overhang_min_h)]
+            if ground.size == 0:
+                return True
+            floor_like = (ground < p.missing_floor_frac * o.surface_h).mean()
         return floor_like >= p.missing_floor_min
 
     # ------------------------------------------------------------ seats
