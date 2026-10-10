@@ -260,6 +260,7 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     # backrest: attached cells clearly above the main surface, spanning the seat width
     has_back = False
     front = None
+    back_top = 0.0
     if len(g.upper_xz):
         # a backrest is real geometry (not shelving seen under an overhang) and smaller
         # than the seat (not the side of the next, taller piece of furniture)
@@ -270,6 +271,9 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
         if len(back) > p.back_max_ratio * len(g.base_xz):
             back = back[:0]
         if len(back):
+            # the chair height check reads the backrest's upper percentile, not the single
+            # highest cell: a hand on the backrest adds a cell or two above the real top
+            back_top = float(np.percentile(g.upper_rel[is_back], p.seat_top_pct))
             d = g.base_xz.mean(axis=0) - back.mean(axis=0)
             if abs(d @ u) >= abs(d @ v):
                 f_axis, f_ext, p_axis, p_ext = u, eu, v, ev
@@ -302,7 +306,7 @@ def _classify(g: _Geom, cell: float, p: SemanticsParams) -> Optional[Candidate]:
     if area >= p.bed_min_area and _in(s, p.bed_h) and flat and not couch_like:
         kind, sittable, conf = Kind.BED, p.bed_sittable, p.conf_bed
     elif (has_back and flat and _in(s, p.seat_h) and min(sx, sz) >= p.seat_min_side
-          and sz <= p.seat_max_depth and sy <= p.seat_max_top
+          and sz <= p.seat_max_depth and back_top <= p.seat_max_top
           and g.base_refilled <= p.seat_max_overhung):
         if sx >= p.couch_min_len:
             kind, conf = Kind.COUCH, p.conf_couch

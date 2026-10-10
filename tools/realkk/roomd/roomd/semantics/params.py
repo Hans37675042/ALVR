@@ -37,8 +37,10 @@ class SemanticsParams:
     back_max_ratio: float = 0.8        # backrest cells / seat cells; more = side of other furniture
     seat_min_side: float = 0.35        # m, chair/couch footprint narrower than this is a ledge
                                        # (measured on the 5 cm heightmap: ~5 cm wider than true)
-    seat_max_top: float = 1.32         # m, chair/couch with anything higher is a cabinet side
+    seat_max_top: float = 1.32         # m, chair/couch backrest higher than this is a cabinet side
                                        # (room2 office chair reads 1.23-1.27; false 1.34-1.48)
+    seat_top_pct: float = 75.0         # backrest height percentile checked against seat_max_top
+                                       # (a hand left on it covers ~4 of ~24 cells: 17 %)
     seat_max_depth: float = 1.1        # m, front-to-back depth no chair or couch exceeds
     seat_max_overhung: float = 0.5     # seat seen mostly under an overhang (loft desk zone) is not a seat
     couch_min_len: float = 1.2
