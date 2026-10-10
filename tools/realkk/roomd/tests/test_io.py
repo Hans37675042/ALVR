@@ -355,6 +355,36 @@ def test_service_forwards_reclassify_to_the_sink_and_publishes_the_model():
     assert svc.process(RelayInbox()) is False
 
 
+class CountingReclassifySink(ReclassifySink):
+    def __init__(self):
+        super().__init__()
+        self.snapshots = 0
+
+    def snapshot_outputs(self):
+        self.snapshots += 1
+        return super().snapshot_outputs()
+
+
+def test_service_merges_queued_reclassify_requests_into_one_poll():
+    sink = CountingReclassifySink()
+    plugin = QueuePlugin([["fused:1"], ["fused:2", "fused:1"], ["fused:3"]])
+    svc = RoomService(sink, plugin, log=lambda *a: None)
+    svc.tick()
+    n = sink.snapshots
+    assert svc.process(RelayInbox()) is True
+    assert sink.requests == [["fused:1", "fused:2", "fused:3"]]
+    assert sink.snapshots == n + 1
+
+
+def test_service_merged_reclassify_with_an_all_request_means_all():
+    sink = CountingReclassifySink()
+    plugin = QueuePlugin([["fused:1"], None, ["fused:3"]])
+    svc = RoomService(sink, plugin, log=lambda *a: None)
+    assert svc.process(RelayInbox()) is True
+    assert sink.requests == [None]
+    assert sink.snapshots == 1
+
+
 def test_service_tolerates_a_sink_without_reclassify():
     plugin = QueuePlugin([None])
     svc = RoomService(FusionSink(), plugin, log=lambda *a: None)

@@ -242,3 +242,23 @@ def test_unstable_chair_keeps_its_kind_while_the_user_sits_on_it():
     o = by_id(out)[oid]
     assert o["Kind"] == "Chair"
     assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]
+
+
+def test_back_to_back_polls_on_the_same_map_count_once_for_the_kind():
+    # several forced polls within kind_obs_min_dt (queued plugin requests) see the same map
+    room, sem, oid, t = _locked_chair()
+    sem.reclassify([oid])
+    room.place("c", coffee_table(0.5, 0.5, 0.0, w=1.0, d=0.5, h=0.42))
+    for _ in range(P.kind_lock_obs + 2):
+        out = sem.update(room, t)
+    tr = sem.tracks[oid]
+    assert tr.kind == "Chair" and not tr.kind_locked
+    out, t = run(sem, room, P.kind_switch_confirm, t + 0.5)
+    assert sem.tracks[oid].kind == "Table" and not sem.tracks[oid].kind_locked
+
+
+def test_kind_does_not_lock_from_same_instant_polls():
+    room, sem, oid, out, t = _chair_track(CREATE)
+    for _ in range(P.kind_lock_obs + 2):
+        out = sem.update(room, t)
+    assert not sem.tracks[oid].kind_locked
