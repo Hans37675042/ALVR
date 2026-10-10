@@ -247,3 +247,25 @@ def test_small_surface_at_table_height_is_not_a_table(w, d):
     # real tap: cabinet shelves and ledges at 0.7-0.8 m read as tables
     c = _one(storage(0.0, 0.0, 20.0, w=w, d=d, h=0.75))
     assert c.kind == "Other" and not c.sittable
+
+
+@pytest.mark.parametrize("back_h", [1.32, 1.40])
+def test_seat_with_a_back_far_above_any_chair_is_not_a_chair(back_h):
+    # live 2026-10-10: 1.28-1.40 m tall pieces with a seat-height ledge read as chairs
+    cands = _detect(chair(0.0, 0.0, 0.0, seat_h=0.5, width=0.5, depth=0.6, back_h=back_h))
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands), \
+        [(c.kind, round(c.sy, 2)) for c in cands]
+
+
+@pytest.mark.parametrize("width", [0.25, 0.28])
+def test_seat_narrower_than_any_chair_is_not_a_chair(width):
+    # live 2026-10-10: a strip measured 0.31 m wide (5 cm heightmap adds ~5 cm) read as a chair
+    cands = _detect(chair(0.0, 0.0, 30.0, seat_h=0.45, width=width, depth=0.45, back_h=1.0))
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands), \
+        [(c.kind, round(c.sx, 2), round(c.sz, 2)) for c in cands]
+
+
+def test_office_chair_like_the_pm_chair_is_a_chair():
+    # PM office chair: ~0.69 x 0.54 m footprint, seat ~0.52 m, ~0.84 m tall (live fused:44)
+    c = _one(chair(0.0, 0.0, 30.0, seat_h=0.52, width=0.6, depth=0.5, back_h=0.84))
+    assert c.kind == "Chair" and c.sittable

@@ -64,3 +64,13 @@ def test_user_sitting_ends_moving_state():
     out, t = run(sem, room, 1, t, user_head=(0.5, 1.2, 0.42))
     assert by_id(out)[oid]["State"] == "Present"
     assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]
+
+
+def test_one_noisy_frame_does_not_block_a_seat():
+    room, sem, oid, t = _setup(chair(0.5, 0.5, 0.0))
+    room.place("pile", clothes_pile(0.5, 0.52, base_y=0.45, size=0.35, height=0.2))
+    out, t = run(sem, room, 1, t)
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+    room.remove("pile")
+    out, t = run(sem, room, 1, t)
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]

@@ -207,3 +207,61 @@ def test_rejected_object_is_kept_and_not_redetected():
     out, t = run(sem, room, 6, t)
     assert by_id(out)[oid]["State"] == "Rejected"
     assert live(out) == []
+
+
+def test_removed_object_revives_on_first_observation():
+    # live 2026-10-10: the office chair stayed Removed while back in the room
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")
+    out, t = run(sem, room, 16, t)
+    assert by_id(out)[oid]["State"] == "Removed"
+    room.place("c", chair(0.7, 0.4, 20.0))
+    out, t = run(sem, room, 1, t)
+    o = _single(out)
+    assert o["Id"] == oid and o["State"] == "Present"
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+
+
+def test_seat_height_mismatch_is_not_free_space_evidence():
+    # real chairs read 0.375-0.46 m across views: a probe slab at the published seat height can
+    # be free while the seat (seen as something else, e.g. no backrest) still stands there
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0, seat_h=0.52))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    from roomd.semantics.synthetic import stool
+    room.place("c", stool(0.5, 0.5, 0.0, h=0.44, w=0.45))
+    out, t = run(sem, room, 20, t)
+    assert by_id(out)[oid]["State"] == "Present"
+
+
+def test_chair_the_user_sits_on_never_goes_missing():
+    # the fusion body mask hides a chair the user sits on; its slab can read free
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")  # worst case: the map shows only free space there
+    out, t = run(sem, room, 20, t, user_head=(0.5, 1.2, 0.45))
+    o = by_id(out)[oid]
+    assert o["State"] == "Present"
+    assert [s["State"] for s in seats_of(out, oid)] == ["OccupiedByUser"]
+
+
+def test_user_standing_on_the_spot_gives_no_free_space_evidence():
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sem = new_sem()
+    out, t = run(sem, room, 3, 0.0)
+    oid = _single(out)["Id"]
+    room.remove("c")
+    out, t = run(sem, room, 20, t, user_head=(0.55, 1.65, 0.5))
+    assert by_id(out)[oid]["State"] == "Present"
+    out, t = run(sem, room, 2, t, user_head=(-1.5, 1.65, -1.5))  # walks away: now it is gone
+    assert by_id(out)[oid]["State"] == "Missing"
