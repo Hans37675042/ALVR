@@ -111,6 +111,8 @@ class SemanticsParams:
     kind_lock_s: float = 10.0          # ... or the same kind for this long (>= 2 observations)
     kind_switch_confirm: int = 2       # consecutive other-kind readings before an unlocked
                                        # track changes kind
+    kind_obs_min_dt: float = 0.5       # s; a poll this soon after the last counted one (same
+                                       # map, e.g. forced by a plugin request) does not count
     kind_gate_dist: float = 0.5        # m; a candidate of another kind matches only this close
     cost_kind_mismatch: float = 0.5    # added to the cost of an other-kind match
     kind_size_tol: float = 0.25        # locked: each extent stays within +-25 % of the size at

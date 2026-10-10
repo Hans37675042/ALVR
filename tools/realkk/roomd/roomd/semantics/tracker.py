@@ -71,6 +71,7 @@ class Track:
     confirmed: bool = False         # was stable once: never removed automatically
     kind_streak: int = 1            # consecutive observations reading the track's kind
     kind_since: Optional[float] = None  # time of the first observation of that streak
+    kind_obs_t: Optional[float] = None  # time of the last observation counted for the kind
     alt_kind: Optional[str] = None  # another kind read on an unlocked track ...
     alt_streak: int = 0             # ... this many consecutive times
     lock_size: Optional[Tuple[float, float, float]] = None  # (sx, sy, sz) at lock time
@@ -298,6 +299,15 @@ class RoomSemantics:
         size as usual), "presence" (only keep the object seen) or "done" (the track switched
         kind and took this observation as its new pose)."""
         p = self.p
+        if tr.kind_obs_t is not None and t - tr.kind_obs_t < p.kind_obs_min_dt:
+            # another poll on (nearly) the same map, e.g. forced by a plugin request: it is
+            # no new evidence for the kind, so no counter moves
+            if c.kind == tr.kind:
+                return "pose"
+            if tr.kind_locked:
+                return "pose" if self._size_ok(tr, c) else "presence"
+            return "presence"
+        tr.kind_obs_t = t
         if c.kind == tr.kind:
             tr.alt_kind, tr.alt_streak = None, 0
             if tr.kind_streak <= 0 or tr.kind_since is None:
@@ -482,7 +492,8 @@ class RoomSemantics:
             id=tid, kind=c.kind, source=source, label=c.label, sittable=c.sittable,
             movable=c.kind == Kind.CHAIR, symmetric=c.symmetric, pub=obs, est=_Obs(**vars(obs)),
             hist=np.array(c.hist, dtype=float), confidence=c.confidence, pub_conf=c.confidence,
-            state=ObjectState.PRESENT, created=t, updated=t, last_seen=t, kind_since=t)
+            state=ObjectState.PRESENT, created=t, updated=t, last_seen=t, kind_since=t,
+            kind_obs_t=t)
         self._dirty = True
 
     # ------------------------------------------------------------ disappearance
