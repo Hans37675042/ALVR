@@ -35,6 +35,7 @@ from roomd.semantics import RoomSemantics, SemanticsParams, SceneLabel, Obb, det
 sem = RoomSemantics(SemanticsParams())
 fragment = sem.update(map_view, t_unix, scene_labels=[...], user_head=(x, y, z))
 sem.reject("fused:3")            # user deleted it -> Rejected tombstone
+sem.reclassify(["fused:3"])      # unlock its kind (None / [] = every automatic object)
 ```
 
 - `fragment` = `{Revision, FrameSource:"Stage", FloorY, FloorRms, Walls:[{a:[x,z], b:[x,z]}], Objects, Seats}`;
@@ -91,12 +92,14 @@ Meta anchor already converted to Unity stage space.
    Unmatched labels are dropped if their footprint is observed and empty (stale),
    otherwise published from the box (seats face away from the nearest wall).
 7. Tracking: scene candidates bind to `scene:<uuid>`; the rest go through Hungarian
-   assignment (gates: same kind, < 3 m, surface height < 5 cm) on
+   assignment (gates: < 3 m, surface height < 10 cm; a candidate of another kind only
+   within 0.5 m and with +0.5 cost, see 9.) on
    distance + size + surface + height-histogram cost. Pose republishes only after 3
    consistent observations > 5 cm or > 10° away (`Moving` after 2); smaller changes go
    into an EMA. New objects need 3 consecutive observations (scene objects: 1);
    leftovers overlapping a live or Rejected object are absorbed. An unmatched object
-   becomes `Missing` after 2 frames of "gone" evidence, `Removed` 5 s later. Gone = the
+   becomes `Missing` after 2 frames of "gone" evidence, `Removed` 5 s later unless it is
+   stable (see 9.: a stable object stays `Missing`). Gone = the
    surface slab is visible and free **and** the heightmap shows floor (top below half the
    surface height) over ≥ 60 % of the known probe cells (cells reading ≥ 1.4 m are an
    overhang such as the loft bed and carry no floor evidence; with only such cells the free
@@ -111,6 +114,36 @@ Meta anchor already converted to Unity stage space.
    not occupy the seat (the object's own
    armrests / backrest under a shifted area; baseline capped at 0.6); object
    Moving/Missing/Removed propagate to its seats.
+9. Kind lock (PM 2026-10-10: real furniture is moved, almost never added or removed).
+   - Until stable, the classifier decides: an unlocked track that reads as another kind
+     `kind_switch_confirm` (2) times in a row takes that kind and that observation's pose
+     (seats follow the new kind). A single other reading only keeps it seen, and so does
+     any other reading while a seat is `OccupiedByUser` (the body distorts the geometry).
+   - Stable = `kind_lock_obs` (5) consecutive same-kind observations of the track (the
+     creating one counts; semantics runs about once per second, so ~5 s after the object
+     appears, ~7 s after it is first detected) or the same kind for `kind_lock_s` (10 s,
+     at least 2 observations). Only `lock_kinds` (Chair, Couch, Table, Bed) lock; `Other`
+     is clutter and keeps following the classifier.
+   - Locked: the kind never changes on its own (someone leaning on a chair, a bag on the
+     seat). A reading of another kind within 0.5 m still matches it: if its size fits the
+     locked size (every extent within ±25 %) it updates the pose as usual, otherwise it only
+     keeps the object `Present` (no pose change). Pose, `Moving` and `Missing` keep their
+     usual latency.
+   - Size: each extent (footprint long side, short side, height) stays within
+     `kind_size_tol` (±25 %) of the size at lock time. A real object does not change size;
+     a re-measured box after a move, or a blob merged with a person or a pile, would
+     otherwise stretch it (and move its seats). ±25 % still lets the 5 cm heightmap refine it.
+   - A stable object is never removed automatically: unseen with free-space evidence it is
+     `Missing` (last pose kept, seats `Missing`) forever. A same-kind candidate within 3 m
+     resumes it at once; one farther away (moved while unseen, `missing_gate_dist` 10 m) after
+     `revive_confirm` (2) consecutive matched frames. Tombstones (`Removed`) and their revival
+     remain only for never-stable tracks; `Rejected` is unchanged (user decision).
+   - `reclassify(ids)` (plugin ROOM_RECLASSIFY): unlocks the listed tracks (None / empty =
+     every non-Rejected, non-Removed track; unknown ids ignored). The classifier decides
+     again, the kind re-locks when stable; the object stays stable (never removed) and its
+     size limit is re-taken at the next lock.
+   - The lock is internal: the published `Locked` field stays `false` (it is the user lock of
+     the contract).
 
 All thresholds live in `SemanticsParams` (`params.py`) for on-device tuning.
 
@@ -166,6 +199,18 @@ Replaying room2 with candidate dumps showed the causes:
 
 Geometry-only `Other` objects are not published by the sink.
 
+### Kind lock (replay 2026-10-10, defaults)
+
+| room2 | track ids (Other / Table / Chair) | ids that changed kind | published at the end | locked at the end | chair id across the move | chair polls Present / Moving / Missing |
+|---|---|---|---|---|---|---|
+| before | 39 (36 / 2 / 1) | 0 | 2 Table + 1 Chair | — | `fused:28` kept (Missing 79–81, Present at (1.55, 0.38) from 81, ends (1.33, 0.59)) | 59 / 8 / 2 |
+| after  | 39 (35 / 3 / 1) | 1 (`fused:11` Other → Table at t=101) | 3 Table + 1 Chair | 4 (chair at t=67, tables at 40 / 46 / 104) | same, locked as Chair from t=67 | 59 / 8 / 2 |
+
+The seat states after t=57 s are identical (Available 51, Moving 8, Missing 2, OccupiedByUser 7).
+The extra Table is an `Other` track that jumped to (−0.94, 0.71) at t≈96 s and then read as a
+Table twice: before, the overlapping Table candidates were absorbed by that Other track; now
+the unstable track follows the classifier and locks. It was not checked against the room.
+
 ## Known limits
 
 - Checked end to end on roomd.fusion's TsdfFusion with its SynthScene (72 rendered
@@ -192,6 +237,13 @@ Geometry-only `Other` objects are not published by the sink.
   seat in the middle of the mattress.
 - Revival of a Removed object is by kind + distance (1 m) + seat height only; two identical
   chairs taken out and brought back may swap ids. A chair carried > 1 m while Removed gets
-  a new id after 3 observations.
+  a new id after 3 observations. This only concerns never-stable tracks now; a stable object
+  stays Missing and resumes anywhere in the room (same kind).
+- A really new piece of furniture of the same kind as a Missing stable object (and seen 2
+  frames in a row) takes that object's id and resumes it there: by design, since furniture is
+  moved, not added. Two identical chairs both Missing may swap.
+- A wrongly locked kind stays wrong until the plugin sends ROOM_RECLASSIFY (or the user
+  rejects the object). Locks are not persisted: a roomd restart or a recenter
+  (`on_playspace_changed` restarts tracking) starts over and re-locks after ~5 s.
 - Under an overhang the disappearance check falls back to the free slab alone, which can
   read free above a seat whose height was published a few cm off (see above).
