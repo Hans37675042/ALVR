@@ -10,7 +10,7 @@ import numpy as np
 
 from .classify import Candidate, detect
 from .geometry import footprint_iou, linear_assignment
-from .mapview import MapView, as_heightmap
+from .mapview import MapView, as_heightmap, heightmap_cells
 from .params import SemanticsParams
 from .seats import generate_seats, pose_json, seat_areas, seat_occupancy
 from .basics import (
@@ -158,9 +158,10 @@ class RoomSemantics:
                     continue
             rest.append(c)
 
-        # 2) Hungarian between remaining candidates and live tracks
+        # 2) Hungarian between remaining candidates and live tracks; a Removed tombstone
+        # is revived by one observation within revive_dist (it was a confirmed object)
         live = [tr for tr in self.tracks.values()
-                if tr.state in LIVE_STATES and tr.id not in matched_tracks]
+                if tr.state in LIVE_STATES + (ObjectState.REMOVED,) and tr.id not in matched_tracks]
         if rest and live:
             cost = np.full((len(rest), len(live)), _BIG)
             for i, c in enumerate(rest):
@@ -190,7 +191,7 @@ class RoomSemantics:
         for tr in self.tracks.values():
             if tr.id in matched_tracks or tr.state not in LIVE_STATES:
                 continue
-            self._check_missing(tr, view, t, floor_y)
+            self._check_missing(tr, view, hm, user_head, t, floor_y)
 
         for tr in self.tracks.values():
             self._update_seats(tr, hm, user_head, floor_y)
@@ -204,7 +205,7 @@ class RoomSemantics:
         if c.scene_uuid is not None and tr.source == Source.SCENE_API:
             return _BIG  # another anchor's object
         dist = math.hypot(c.cx - tr.pub.cx, c.cz - tr.pub.cz)
-        if dist >= p.gate_dist:
+        if dist >= (p.revive_dist if tr.state == ObjectState.REMOVED else p.gate_dist):
             return _BIG
         dsurf = abs(c.surface_h - tr.est.surface_h)
         if dsurf >= p.gate_surface_dh:
@@ -316,16 +317,11 @@ class RoomSemantics:
         self._dirty = True
 
     # ------------------------------------------------------------ disappearance
-    def _check_missing(self, tr: Track, view: MapView, t: float, floor_y: float):
+    def _check_missing(self, tr: Track, view: MapView, hm, user_head, t: float, floor_y: float):
         p = self.p
-        o = tr.pub
-        probe = Obb(o.cx, o.cz, o.yaw, o.sx * p.probe_shrink, o.sz * p.probe_shrink,
-                    floor_y + o.surface_h - p.probe_below, floor_y + o.surface_h + p.probe_above)
-        vis = view.visible_fraction(probe)
-        free = view.free_fraction(probe) if vis >= p.missing_visible_min else 0.0
-        if vis < p.missing_visible_min or free < p.missing_free_min:
+        if not self._gone_evidence(tr, view, hm, user_head, floor_y):
             tr.free_count = 0
-            return  # occluded or still occupied: no evidence of disappearance
+            return  # occluded, still occupied or under the user: no evidence of disappearance
         tr.free_count += 1
         if tr.state != ObjectState.MISSING:
             if tr.free_count >= p.missing_confirm:
@@ -334,6 +330,34 @@ class RoomSemantics:
                 self._bump(tr, ObjectState.MISSING, t)
         elif t - tr.missing_since >= p.remove_after_s:
             self._bump(tr, ObjectState.REMOVED, t)
+
+    def _gone_evidence(self, tr: Track, view: MapView, hm, user_head, floor_y) -> bool:
+        """True when the map shows the object's place empty: the surface slab is free
+        space AND the heightmap shows floor there. The slab alone fails on real chairs
+        (seat height reads 0.375-0.46 m across views, so a slab at the published height
+        can be free above the real seat); a seated or nearby user hides the object from
+        the fusion (body mask), so the user's own spot never counts."""
+        p = self.p
+        o = tr.pub
+        if tr.seat_frozen():
+            return False
+        if user_head is not None and tr.footprint(floor_y).contains_xz(
+                np.array([user_head[0]]), np.array([user_head[2]]), p.missing_body_clear)[0]:
+            return False
+        probe = Obb(o.cx, o.cz, o.yaw, o.sx * p.probe_shrink, o.sz * p.probe_shrink,
+                    floor_y + o.surface_h - p.probe_below, floor_y + o.surface_h + p.probe_above)
+        if view.visible_fraction(probe) < p.missing_visible_min:
+            return False
+        if view.free_fraction(probe) < p.missing_free_min:
+            return False
+        if hm is None:
+            return True
+        rel, known = heightmap_cells(hm, probe)
+        if rel.size == 0 or known.mean() < p.missing_visible_min:
+            return False
+        with np.errstate(invalid="ignore"):
+            floor_like = (rel[known] < p.missing_floor_frac * o.surface_h).mean()
+        return floor_like >= p.missing_floor_min
 
     # ------------------------------------------------------------ seats
     def _update_seats(self, tr: Track, hm, user_head, floor_y):

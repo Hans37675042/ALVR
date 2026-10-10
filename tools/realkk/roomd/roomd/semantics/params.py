@@ -95,6 +95,9 @@ class SemanticsParams:
     missing_visible_min: float = 0.5
     missing_free_min: float = 0.6
     missing_confirm: int = 2           # consecutive free-space observations -> Missing
+    missing_floor_frac: float = 0.5    # heightmap top below this share of the surface = floor
+    missing_floor_min: float = 0.6     # ... over this share of the known probe cells
+    missing_body_clear: float = 0.45   # m; user's head this close to the footprint: no evidence
     remove_after_s: float = 5.0
     probe_below: float = 0.04          # probe slab around the surface for free-space evidence
     probe_above: float = 0.01
