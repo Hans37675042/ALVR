@@ -488,9 +488,44 @@ class RoomSemantics:
                 tr.missing_since = t
                 tr.pending.clear()
                 self._bump(tr, ObjectState.MISSING, t)
+                if tr.confirmed:
+                    self._take_over_successor(tr, t)
         elif not tr.confirmed and t - tr.missing_since >= p.remove_after_s:
             # a stable object stays Missing at its last pose: furniture is moved, not removed
             self._bump(tr, ObjectState.REMOVED, t)
+
+    def _take_over_successor(self, tr: Track, t: float):
+        """A stable object just went Missing. A live fused track of its kind that was created
+        after the object was last seen is the same piece of furniture carried farther than
+        gate_dist while its old spot was unseen (furniture is moved, not added): the stable
+        object takes that track's pose and the young track becomes Removed. The nearest
+        one wins when there are several."""
+        if tr.source != Source.FUSED:
+            return
+        young = [y for y in self.tracks.values()
+                 if y is not tr and y.source == Source.FUSED and y.kind == tr.kind
+                 and y.state in (ObjectState.PRESENT, ObjectState.MOVING)
+                 and y.created > tr.last_seen]
+        if not young:
+            return
+        y = min(young, key=lambda y: math.hypot(y.pub.cx - tr.pub.cx, y.pub.cz - tr.pub.cz))
+        obs = _Obs(**vars(y.pub))
+        self._clamp_size(tr, obs)
+        tr.pub = obs
+        tr.est = _Obs(**vars(obs))
+        tr.hist = np.array(y.hist, dtype=float)
+        tr.confidence = y.confidence
+        tr.last_seen = y.last_seen
+        tr.free_count = 0
+        tr.missing_since = None
+        tr.revive_count = 0
+        tr.pending.clear()
+        tr.seat_baseline = None
+        tr.seat_states, tr.blocked_counts = list(y.seat_states), list(y.blocked_counts)
+        self._bump(tr, ObjectState.PRESENT, t)
+        y.pending.clear()
+        y.seat_states, y.blocked_counts = [], []
+        self._bump(y, ObjectState.REMOVED, t)
 
     def _gone_evidence(self, tr: Track, view: MapView, hm, user_head, floor_y) -> bool:
         """True when the map shows the object's place empty: the surface slab is free
