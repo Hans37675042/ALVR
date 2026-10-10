@@ -64,6 +64,7 @@ class Track:
     seat_states: List[str] = field(default_factory=list)
     blocked_counts: List[int] = field(default_factory=list)
     seat_baseline: Optional[List[float]] = None  # high share per seat at the published pose
+    revive_count: int = 0           # consecutive frames a Removed tombstone was seen again
 
     def footprint(self, floor_y) -> Obb:
         o = self.pub
@@ -160,24 +161,19 @@ class RoomSemantics:
                     continue
             rest.append(c)
 
-        # 2) Hungarian between remaining candidates and live tracks; a Removed tombstone
-        # is revived by one observation within revive_dist (it was a confirmed object)
+        # 2) Hungarian between remaining candidates and live tracks
         live = [tr for tr in self.tracks.values()
-                if tr.state in LIVE_STATES + (ObjectState.REMOVED,) and tr.id not in matched_tracks]
-        if rest and live:
-            cost = np.full((len(rest), len(live)), _BIG)
-            for i, c in enumerate(rest):
-                for j, tr in enumerate(live):
-                    cost[i, j] = self._cost(c, tr)
-            rows, cols = linear_assignment(cost)
-            taken = set()
-            for i, j in zip(rows, cols):
-                if cost[i, j] >= _BIG:
-                    continue
-                self._observe(live[j], rest[i], t)
-                matched_tracks.add(live[j].id)
-                taken.add(i)
-            rest = [c for i, c in enumerate(rest) if i not in taken]
+                if tr.state in LIVE_STATES and tr.id not in matched_tracks]
+        rest = self._assign(rest, live, matched_tracks, t)
+
+        # 2b) only candidates no live track wants may revive a Removed tombstone within
+        # revive_dist; it was a confirmed object, so revive_confirm frames are enough
+        tombs = [tr for tr in self.tracks.values() if tr.state == ObjectState.REMOVED]
+        seen = set()
+        rest = self._assign(rest, tombs, seen, t, revive=True)
+        for tr in tombs:
+            if tr.id not in seen:
+                tr.revive_count = 0
 
         # 3) leftovers: absorbed by an existing object, or new-object candidates
         for c in rest:
@@ -200,6 +196,32 @@ class RoomSemantics:
         return self._output(floor_y, t)
 
     # ------------------------------------------------------------ matching
+    def _assign(self, cands: List[Candidate], tracks: List[Track], matched: set, t: float,
+                revive: bool = False) -> List[Candidate]:
+        """Hungarian between ``cands`` and ``tracks``; returns the unassigned candidates.
+        With ``revive`` an assignment counts towards reviving the tombstone instead of
+        observing it at once."""
+        if not cands or not tracks:
+            return cands
+        cost = np.full((len(cands), len(tracks)), _BIG)
+        for i, c in enumerate(cands):
+            for j, tr in enumerate(tracks):
+                cost[i, j] = self._cost(c, tr)
+        rows, cols = linear_assignment(cost)
+        taken = set()
+        for i, j in zip(rows, cols):
+            if cost[i, j] >= _BIG:
+                continue
+            tr = tracks[j]
+            matched.add(tr.id)
+            taken.add(i)
+            if revive:
+                tr.revive_count += 1
+                if tr.revive_count < self.p.revive_confirm:
+                    continue
+            self._observe(tr, cands[i], t)
+        return [c for i, c in enumerate(cands) if i not in taken]
+
     def _cost(self, c: Candidate, tr: Track) -> float:
         p = self.p
         if c.kind != tr.kind:
@@ -227,6 +249,7 @@ class RoomSemantics:
         obs = _Obs.of(c)
         obs.yaw = _align_yaw(obs.yaw, tr.pub.yaw, tr.symmetric)
         if tr.state in (ObjectState.MISSING, ObjectState.REMOVED):
+            tr.revive_count = 0
             tr.pub = obs
             tr.seat_baseline = None
             tr.est = _Obs(**vars(obs))

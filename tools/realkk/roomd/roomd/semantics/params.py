@@ -94,6 +94,7 @@ class SemanticsParams:
     new_match_dist: float = 0.3
     absorb_iou: float = 0.3            # unmatched candidate over a live track = same thing
     revive_dist: float = 1.0           # Removed tombstone revived within this distance
+    revive_confirm: int = 2            # consecutive observations that revive a tombstone
     missing_visible_min: float = 0.5
     missing_free_min: float = 0.6
     missing_confirm: int = 2           # consecutive free-space observations -> Missing
