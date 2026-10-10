@@ -97,7 +97,8 @@ Meta anchor already converted to Unity stage space.
    distance + size + surface + height-histogram cost. Pose republishes only after 3
    consistent observations > 5 cm or > 10° away (`Moving` after 2); smaller changes go
    into an EMA. New objects need 3 consecutive observations (scene objects: 1);
-   leftovers overlapping a live or Rejected object are absorbed. An unmatched object
+   leftovers overlapping a live or Rejected object are absorbed (except by a stable `Missing`
+   object, see 9.). An unmatched object
    becomes `Missing` after 2 frames of "gone" evidence, `Removed` 5 s later unless it is
    stable (see 9.: a stable object stays `Missing`). Gone = the
    surface slab is visible and free **and** the heightmap shows floor (top below half the
@@ -122,13 +123,17 @@ Meta anchor already converted to Unity stage space.
    - Stable = `kind_lock_obs` (5) consecutive same-kind observations of the track (the
      creating one counts; semantics runs about once per second, so ~5 s after the object
      appears, ~7 s after it is first detected) or the same kind for `kind_lock_s` (10 s,
-     at least 2 observations). Only `lock_kinds` (Chair, Couch, Table, Bed) lock; `Other`
+     at least 2 observations). An observation counts at most once per `kind_obs_min_dt`
+     (0.5 s): back-to-back polls on the same map (forced by plugin requests) are no new
+     evidence and move no kind counter. Only `lock_kinds` (Chair, Couch, Table, Bed) lock; `Other`
      is clutter and keeps following the classifier.
    - Locked: the kind never changes on its own (someone leaning on a chair, a bag on the
      seat). A reading of another kind within 0.5 m still matches it: if its size fits the
-     locked size (every extent within ±25 %) it updates the pose as usual, otherwise it only
-     keeps the object `Present` (no pose change). Pose, `Moving` and `Missing` keep their
-     usual latency.
+     locked size (every extent within ±25 %) it updates the pose as usual. One that does not
+     fit only keeps the object seen (no pose change) when it covers the object (footprint
+     IoU ≥ `absorb_iou`) and the object is not `Missing`; otherwise it is other furniture (a
+     couch pushed where the chair stood) and gets its own track. Pose, `Moving` and
+     `Missing` keep their usual latency.
    - Size: each extent (footprint long side, short side, height) stays within
      `kind_size_tol` (±25 %) of the size at lock time. A real object does not change size;
      a re-measured box after a move, or a blob merged with a person or a pile, would
@@ -136,7 +141,12 @@ Meta anchor already converted to Unity stage space.
    - A stable object is never removed automatically: unseen with free-space evidence it is
      `Missing` (last pose kept, seats `Missing`) forever. A same-kind candidate within 3 m
      resumes it at once; one farther away (moved while unseen, `missing_gate_dist` 10 m) after
-     `revive_confirm` (2) consecutive matched frames. Tombstones (`Removed`) and their revival
+     `revive_confirm` (2) consecutive matched frames. Carried farther than 3 m while its old
+     spot was unseen, it first gets a young track at the new place (3 observations); when the
+     old spot is then seen empty and the object turns `Missing`, it takes over the nearest
+     live fused track of its kind created after it was last seen (pose, seats; the young id
+     becomes `Removed`), so one piece of furniture keeps one id. A stable `Missing` object
+     absorbs no leftover candidate (its spot was seen empty). Tombstones (`Removed`) and their revival
      remain only for never-stable tracks; `Rejected` is unchanged (user decision).
    - `reclassify(ids)` (plugin ROOM_RECLASSIFY): unlocks the listed tracks (None / empty =
      every non-Rejected, non-Removed track; unknown ids ignored). The classifier decides
@@ -210,6 +220,9 @@ The seat states after t=57 s are identical (Available 51, Moving 8, Missing 2, O
 The extra Table is an `Other` track that jumped to (−0.94, 0.71) at t≈96 s and then read as a
 Table twice: before, the overlapping Table candidates were absorbed by that Other track; now
 the unstable track follows the classifier and locks. It was not checked against the room.
+Rerun after the review fixes (take-over of a far-moved young track, other-kind gate on stable
+objects, `kind_obs_min_dt`, merged ROOM_RECLASSIFY): the summary is identical (no young track
+was taken over, no kind counter was held back).
 
 ## Known limits
 
@@ -241,7 +254,12 @@ the unstable track follows the classifier and locks. It was not checked against 
   stays Missing and resumes anywhere in the room (same kind).
 - A really new piece of furniture of the same kind as a Missing stable object (and seen 2
   frames in a row) takes that object's id and resumes it there: by design, since furniture is
-  moved, not added. Two identical chairs both Missing may swap.
+  moved, not added. Two identical chairs both Missing may swap. Likewise a second chair
+  brought in while the first one's spot is out of view, then the first one taken away, ends
+  as one id (the first one's) at the second chair's place.
+- Other furniture put over a stable object's spot while the spot stays occupied (a couch
+  replacing a chair) gets its own track, but the old object has no free-space evidence and
+  stays `Present` under it.
 - A wrongly locked kind stays wrong until the plugin sends ROOM_RECLASSIFY (or the user
   rejects the object). Locks are not persisted: a roomd restart or a recenter
   (`on_playspace_changed` restarts tracking) starts over and re-locks after ~5 s.

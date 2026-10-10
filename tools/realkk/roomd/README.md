@@ -95,10 +95,11 @@ asks for a new decision with type 102, JSON `{"ids": ["fused:3", "scene:<uuid>"]
 
 - The 9945 reader thread decodes it (`protocol.decode_room_reclassify`; a bad payload is logged
   and ignored) and queues it; it never touches the writer queues, so publishing is not blocked.
-- The main loop drains the queue (`RoomService.process_plugin`), calls
-  `FusionSink.reclassify(ids)` (unknown ids ignored; the no-op sink unlocks nothing), logs
-  `roomd: reclassify <ids|all> -> N object(s) unlocked`, then polls the outputs and publishes
-  STATUS and the ROOM_MODEL at once. The kinds then follow the classifier again and re-lock
+- The main loop drains the queue (`RoomService.process_plugin`), merges every queued request
+  into one (the union of the ids; any "all" request makes it all), calls
+  `FusionSink.reclassify(ids)` once (unknown ids ignored; the no-op sink unlocks nothing), logs
+  `roomd: reclassify <ids|all> -> N object(s) unlocked`, then polls the outputs once and
+  publishes STATUS and the ROOM_MODEL at once. The kinds then follow the classifier again and re-lock
   when stable; a changed kind reaches the plugin in the next ROOM_MODEL (content change).
 
 Persistence: roomd keeps no state across restarts (tracks, ids, locked kinds); `--dump-model`
