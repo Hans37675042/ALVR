@@ -106,6 +106,9 @@ class SemanticsParams:
     # --- seat states
     blocked_rise: float = 0.08
     blocked_fraction: float = 0.4
+    blocked_confirm: int = 2           # consecutive blocked observations before Blocked
+    blocked_over_baseline: float = 0.25  # more high share than when the pose was published
+    blocked_baseline_max: float = 0.6  # baseline cap (a pile there at publish time still counts)
     seat_area_len_frac: float = 0.8
     seat_area_depth_frac: float = 0.5
     head_h: Tuple[float, float] = (1.1, 1.3)

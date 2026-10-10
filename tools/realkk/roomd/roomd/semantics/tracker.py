@@ -12,7 +12,7 @@ from .classify import Candidate, detect
 from .geometry import footprint_iou, linear_assignment
 from .mapview import MapView, as_heightmap, heightmap_cells
 from .params import SemanticsParams
-from .seats import generate_seats, pose_json, seat_areas, seat_occupancy
+from .seats import generate_seats, pose_json, seat_areas, seat_high_fraction, seat_occupancy
 from .basics import (
     Kind, Obb, ObjectState, SceneLabel, SeatState, Source, wrap_deg, yaw_diff)
 
@@ -62,6 +62,8 @@ class Track:
     free_count: int = 0
     missing_since: Optional[float] = None
     seat_states: List[str] = field(default_factory=list)
+    blocked_counts: List[int] = field(default_factory=list)
+    seat_baseline: Optional[List[float]] = None  # high share per seat at the published pose
 
     def footprint(self, floor_y) -> Obb:
         o = self.pub
@@ -135,7 +137,7 @@ class RoomSemantics:
         # seat states first: a seat occupied by the user freezes its object's pose, and an
         # object someone sits on is not moving (the body only distorts its geometry)
         for tr in self.tracks.values():
-            self._update_seats(tr, hm, user_head, floor_y)
+            self._update_seats(tr, hm, user_head, floor_y, advance=False)
             if tr.seat_frozen() and tr.state == ObjectState.MOVING:
                 tr.pending.clear()
                 self._bump(tr, ObjectState.PRESENT, t)
@@ -226,6 +228,7 @@ class RoomSemantics:
         obs.yaw = _align_yaw(obs.yaw, tr.pub.yaw, tr.symmetric)
         if tr.state in (ObjectState.MISSING, ObjectState.REMOVED):
             tr.pub = obs
+            tr.seat_baseline = None
             tr.est = _Obs(**vars(obs))
             tr.pending.clear()
             self._bump(tr, ObjectState.PRESENT, t)
@@ -253,6 +256,7 @@ class RoomSemantics:
             m = _mean_obs(last)
             if not any(_deviates(m, o, tr.symmetric, p) for o in last):
                 tr.pub = m
+                tr.seat_baseline = None
                 tr.est = _Obs(**vars(m))
                 tr.pending.clear()
                 self._bump(tr, ObjectState.PRESENT, t)
@@ -360,13 +364,38 @@ class RoomSemantics:
         return floor_like >= p.missing_floor_min
 
     # ------------------------------------------------------------ seats
-    def _update_seats(self, tr: Track, hm, user_head, floor_y):
+    def _update_seats(self, tr: Track, hm, user_head, floor_y, advance=True):
+        """Seat states; Blocked needs ``blocked_confirm`` consecutive blocked frames
+        (counted only when ``advance``), any other reading applies at once."""
         if not tr.sittable or tr.state in (ObjectState.REMOVED, ObjectState.REJECTED):
             tr.seat_states = []
+            tr.blocked_counts = []
             return
         o = tr.pub
         areas = seat_areas(o.cx, o.cz, o.yaw, (o.sx, o.sy, o.sz), self.p)
-        tr.seat_states = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, self.p)
+        p = self.p
+        raw = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, p, tr.seat_baseline)
+        if (advance and tr.seat_baseline is None and tr.state == ObjectState.PRESENT
+                and SeatState.OCCUPIED_BY_USER not in raw):
+            # first clear look at this pose: what the object itself puts in its seat areas
+            fr = [seat_high_fraction(a, o.surface_h, hm, p) for a in areas]
+            if all(f is not None for f in fr):
+                tr.seat_baseline = [min(f, p.blocked_baseline_max) for f in fr]
+                raw = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, p, tr.seat_baseline)
+        if len(tr.blocked_counts) != len(raw):
+            tr.blocked_counts = [0] * len(raw)
+        states = []
+        for i, s in enumerate(raw):
+            if s != SeatState.BLOCKED:
+                if advance:
+                    tr.blocked_counts[i] = 0
+                states.append(s)
+                continue
+            n = tr.blocked_counts[i] + (1 if advance else 0)
+            if advance:
+                tr.blocked_counts[i] = n
+            states.append(SeatState.BLOCKED if n >= p.blocked_confirm else SeatState.AVAILABLE)
+        tr.seat_states = states
 
     def _seat_states_out(self, tr: Track, n: int) -> List[str]:
         if tr.state in (ObjectState.REMOVED, ObjectState.REJECTED):
