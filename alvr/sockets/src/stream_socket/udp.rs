@@ -68,26 +68,45 @@ impl MultiplexedSocketWriter for MultiplexedUdpWriter {
     }
 
     fn send(&mut self, stream_id: u16, packet_index: u32, buffer: &mut Vec<u8>) -> Result<()> {
+        for shard_idx in 0..self.piece_count(buffer.len()) {
+            self.send_piece(stream_id, packet_index, buffer, shard_idx)?;
+        }
+
+        Ok(())
+    }
+
+    // One piece is one shard (datagram)
+    fn piece_count(&self, buffer_len: usize) -> usize {
+        let max_shard_size = self.max_packet_size - SHARD_PREFIX_SIZE;
+        let payload_size = buffer_len - SHARD_PREFIX_SIZE;
+        // rounding up:
+        payload_size.div_ceil(max_shard_size)
+    }
+
+    fn send_piece(
+        &mut self,
+        stream_id: u16,
+        packet_index: u32,
+        buffer: &mut Vec<u8>,
+        shard_idx: usize,
+    ) -> Result<()> {
         let max_shard_size = self.max_packet_size - SHARD_PREFIX_SIZE;
         let payload_size = buffer.len() - SHARD_PREFIX_SIZE;
-        // rounding up:
-        let shards_count = payload_size.div_ceil(max_shard_size);
+        let shards_count = self.piece_count(buffer.len());
 
-        for shard_idx in 0..shards_count {
-            // this overlaps with the previous shard, this is intended behavior and allows to
-            // reduce allocations
-            let shard_start_position = shard_idx * max_shard_size;
-            let shard_size = usize::min(max_shard_size, payload_size - shard_start_position);
+        // this overlaps with the previous shard, this is intended behavior and allows to
+        // reduce allocations
+        let shard_start_position = shard_idx * max_shard_size;
+        let shard_size = usize::min(max_shard_size, payload_size - shard_start_position);
 
-            let shard_view = &mut buffer[shard_start_position..][..SHARD_PREFIX_SIZE + shard_size];
+        let shard_view = &mut buffer[shard_start_position..][..SHARD_PREFIX_SIZE + shard_size];
 
-            shard_view[0..2].copy_from_slice(&stream_id.to_le_bytes());
-            shard_view[2..6].copy_from_slice(&packet_index.to_le_bytes());
-            shard_view[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
-            shard_view[10..14].copy_from_slice(&(shard_idx as u32).to_le_bytes());
+        shard_view[0..2].copy_from_slice(&stream_id.to_le_bytes());
+        shard_view[2..6].copy_from_slice(&packet_index.to_le_bytes());
+        shard_view[6..10].copy_from_slice(&(shards_count as u32).to_le_bytes());
+        shard_view[10..14].copy_from_slice(&(shard_idx as u32).to_le_bytes());
 
-            self.inner.send(shard_view)?;
-        }
+        self.inner.send(shard_view)?;
 
         Ok(())
     }
@@ -265,4 +284,56 @@ pub fn split_multiplexed(
     };
 
     Ok((Box::new(writer), Box::new(reader)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loopback_pair() -> (UdpSocket, UdpSocket) {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        (tx, rx)
+    }
+
+    fn datagrams(rx: &UdpSocket, count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|_| {
+                let mut buf = [0u8; 256];
+                let len = rx.recv(&mut buf).unwrap();
+                buf[..len].to_vec()
+            })
+            .collect()
+    }
+
+    fn packet(payload_len: usize) -> Vec<u8> {
+        let mut buffer = vec![0u8; SHARD_PREFIX_SIZE];
+        buffer.extend((0..payload_len).map(|i| (i * 7 % 251) as u8));
+        buffer
+    }
+
+    #[test]
+    fn udp_pieces_are_the_shards_of_a_whole_send() {
+        let (tx, rx) = loopback_pair();
+        let mut writer = MultiplexedUdpWriter {
+            inner: tx,
+            max_packet_size: 64,
+        };
+        // 130 payload bytes in 50-byte shards: 3 pieces, the last one partial
+        let payload_len = 130;
+        assert_eq!(writer.piece_count(SHARD_PREFIX_SIZE + payload_len), 3);
+
+        let mut whole = packet(payload_len);
+        writer.send(9, 4, &mut whole).unwrap();
+        let expected = datagrams(&rx, 3);
+
+        let mut pieces = packet(payload_len);
+        for piece in 0..3 {
+            writer.send_piece(9, 4, &mut pieces, piece).unwrap();
+        }
+        assert_eq!(datagrams(&rx, 3), expected);
+        assert_eq!(expected[2].len(), SHARD_PREFIX_SIZE + 30);
+    }
 }

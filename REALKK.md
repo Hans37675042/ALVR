@@ -115,14 +115,52 @@ D16 換成線性距離（標準 GL 投影，d ∈ [0,1]）：
 
 ### 假幀與 hand removal（S8，feat/scene-import）
 
-- 讀回不可用時（深度 swapchain 的 GL texture 還是 0，或 readback pipeline 沒建立）client 直接**跳過這一幀**，不再送整張 0x8080 的假幀。blit／copy／ReadPixels 任一步 GL 報錯或 framebuffer 不完整時也一樣跳過。頭盔 log 會出現 `[XR_DATA] depth readback unavailable, frame skipped (N so far)`，GL 失敗時附上是哪一步（前 3 次和每 100 次印一行）。舊的 tap 錄檔仍可能有假幀，`tap_inspect.py` 照樣統計。
+- 讀回不可用時（深度 swapchain 的 GL texture 還是 0，或 readback pipeline 沒建立）client 直接**跳過這一幀**，不再送整張 0x8080 的假幀。blit／copy／ReadPixels 任一步 GL 報錯或 framebuffer 不完整時也一樣跳過。頭盔 log 會出現 `[XR_DATA] depth readback unavailable, frame skipped (N so far)`，GL 失敗時附上原因（前 3 次和每 100 次印一行）。逐步檢查（每步 glGetError＋framebuffer status）只在前 20 次和每第 100 次擷取做，其餘擷取只在整串指令後讀一次 GL 錯誤旗標：錯誤旗標會一直保留到被讀走，所以任一步失敗照樣會跳過，只是 log 寫 `step unknown`。舊的 tap 錄檔仍可能有假幀，`tap_inspect.py` 照樣統計。
 - 系統回報 `supports_hand_removal=1` 時，建立 provider 後呼叫 `xrSetEnvironmentDepthHandRemovalMETA(enabled)`，深度圖裡的手會被移除。log：`[XR_DIAG] Depth hand removal enabled: SUCCESS`。
+- 要 A/B 測 hand removal 的成本：把 `environment_depth_meta.rs` 的 `DEPTH_HAND_REMOVAL` 改成 `false` 重 build，log 會改成 `Depth hand removal disabled at build time`。不放進 session 設定，因為改設定 schema 要 client 和 streamer 一起換版。
 
 **以下尚未實機驗證，PM 實測時確認：**
 - row 方向：patch 有做上下翻轉，是否真的翻成 y 向下。
 - 深度編碼：是否就是上面這個標準投影。
 
 驗法見 PLAN-v2 的 R9-P3：深度點雲裡的平面高度對照手把高度。
+
+### Client 深度讀回管線（perf/client-depth-readback）
+
+量測背景：開 XR Data Streaming 時 Dashboard 的「Client System」是 47.6 ms，關掉是 18.8 ms。原因是整條深度路徑都在 render thread 上同步跑（在 swapchain release 和 xrEndFrame 之間）：ReadPixels 直接讀進 client 記憶體等於 glFinish，LZ4 壓縮和約 300 個 UDP shard 的送出也在同一條 thread。改法：
+
+| 步驟 | 在哪條 thread | 做什麼 |
+|---|---|---|
+| 擷取幀 | render | acquire 深度影像，排入 blit → CopyImageSubData → ReadPixels 進 pixel pack buffer（PBO），插 fence 後 `glFlush`。不等 GPU |
+| 之後每幀 | render | 用 `glGetSynciv(SYNC_STATUS)` 查最舊的 slot，fence 已 signal 才 map PBO，複製時順便上下翻轉，unmap |
+| 送出 | `depth send` worker | 取 `client_send_time`、壓 LZ4、`send_depth_frame` |
+
+- PBO 有 3 個 slot。三個都還在等 GPU 時這一幀不擷取，下一幀再試，絕不等待；超過 30 幀沒 signal 的 slot 直接放棄（算一次 skip）。
+- 每個 slot 帶著 acquire 當下的 display time、兩個 view 的 pose／FOV、near／far、寬高，所以晚 1–3 幀才送出的深度 header 仍是擷取那一刻的值。線格式沒有變。
+- render thread 交給 worker 的佇列只有 1 格，滿了就丟這一幀（計數）。buffer 由 worker 還回來重複使用，穩定狀態不配置記憶體。
+- 擷取時機改成固定排程（`next_due += 1/depth_fps`），不再是「距上次擷取滿一個間隔」：72 Hz 下舊作法會變成每 8 幀一次（9 fps），量到的 7.6 fps 也有這個因素。還沒有新深度影像（acquire 回 None）時下一幀重試；停頓超過一個間隔後從當下重新起算，不會連續補發。
+- acquire 新影像會把上一張還給 runtime，runtime 之後可能覆寫它，而 app 的 GL fence 擋不住 runtime 端的寫入。所以 blit 讀完 runtime image 之後另插一個 guard fence（`ReleaseGuard`），要等它 signal 才 acquire 下一張；沒 signal 就下一幀再試，不等待，計數在 `runtime-busy frames`。不這樣做的話，送出的深度可能比 header 的 pose 新，或是讀到寫到一半的影像。
+- viewer 關掉 depth feed 時，render thread 先丟掉還在 PBO 裡的幀（不再送出），等 guard fence signal 後才呼叫 `xrStopEnvironmentDepthProviderMETA`。重新開啟時走原本的 start 路徑（會重新列舉 swapchain image）。
+- 深度幀和 tracking、statistics 共用同一條 stream socket 的 mutex。原本一幀幾百 KB 要整包寫完才放鎖，render thread 上的 `report_submit`（在 xrEndFrame 前）會被卡住，而且它卡住時還握著 statistics lock，連帶擋住 video receive thread。現在深度幀改用 `send_interleaved`，UDP 每個 shard 鎖一次，其他封包可以插在 shard 之間，線格式不變；TCP 仍整包寫。`report_submit` 先取 summary、放掉 statistics lock，再用 `try_send` 送，socket 正忙就跳過這一幀的 statistics。
+
+**`[XR_PERF]` log**（`adb logcat | Select-String "XR_PERF"`）：
+
+- render thread，每讀回 50 幀一行：`[XR_PERF] depth N frames read back, S skipped, R ring-full frames, G runtime-busy frames, D dropped at the worker, B buffers: ...`，後面接各段的 p50／p95／max：
+  - `enqueue_ms`：排入 GPU 指令的時間，應遠低於 1 ms。
+  - `map_ms`：map＋翻轉複製＋unmap。
+  - `fence_frames`／`fence_ms`：從排入到讀出隔了幾幀／幾 ms，預期 1–3 幀。
+  - `acquire_ms`：`xrAcquireEnvironmentDepthImageMETA`。
+  - `render_thread_ms`：有做深度工作的那幾幀，深度路徑佔 render thread 的總時間。
+- worker，每送 50 幀一行：`[XR_PERF] depth worker N frames: lz4_ms ..., send_ms ...`。
+- render thread，每 720 個送出的幀（72 Hz 約 10 秒）一行：`[XR_PERF] render N frames: report_submit_ms ...`。開關 depth 對照，p95 應維持在 1 ms 以下；偏高代表 render thread 又在等 socket（例如走 TCP 時）。
+
+**Adreno PBO 的坑（未實機驗證，看 log 判斷）**：
+
+- `map_ms` 偏高（p95 > 1 ms）可能是 map 出來的記憶體沒有 cache，或 driver 在 map 時才真正搬資料。
+- `enqueue_ms` 偏高（數 ms）代表 ReadPixels 進 PBO 退回同步路徑。可能原因：一列 640 B 不是 256 B 的倍數，或 `RED_INTEGER/UNSIGNED_SHORT` 讀 R16UI 不在 driver 的快速路徑上。退路依序是把讀回寬度 pad 到 384 px（768 B）或設 `PACK_ROW_LENGTH`；`copy_flipped_rows` 已支援來源 row stride。再不行就用 shader 把兩個 u16 打包成 RGBA8 再讀。
+- `fence_frames` 常常到 30（`skipped` 一直增加）代表 fence 沒有被送進 GPU，或 GPU 落後很多。
+
+LZ4 留在 worker 上：用 2026-10-09 的 room 錄檔（2691 幀）量，LZ4 後大小是原始的中位數 86%、平均 83%，改送 RawD16 會多約 20% 頻寬，所以沒有改。
 
 ## 場景匯入（Quest Space Setup → MSG_ROOM_SNAPSHOT）
 
@@ -328,7 +366,7 @@ APK 簽章：
 - Camera 上行（`CameraFrameHeader`）維持 patch 原樣，只帶單一 pose。realkk 目前用不到。
 - 深度 row 方向、D16 編碼、pose 和 SteamVR 座標的對齊，都要用 R9-P3 實機驗證。
 - server 會把每張深度幀複製一份成 `ServerCoreEvent::DepthFrame`，丟給 OpenVR event loop，但那邊會直接忽略。這是 patch 原有的行為，有額外記憶體成本，但不影響功能。
-- 沒有自動化 build 測試 Android 執行期。目前只驗證過：單元測試（`cargo test -p alvr_packets -p alvr_server_core`）、兩個平台都 build 成功。
+- 沒有自動化 build 測試 Android 執行期。目前只驗證過：單元測試（`cargo test -p alvr_packets -p alvr_server_core -p alvr_client_core`；client 的深度管線純邏輯放在 `alvr_client_core::depth_pipeline`，因為 `alvr_client_openxr` 在 Windows host 上連結不到 `camera2ndk`）、兩個平台都 build 成功。
 - 場景匯入（feat/scene-import）尚未實機驗證：
   - 不會觸發 Space Setup（`MSG_ROOM_REQUEST recapture=1` 視同 0，只會重查）；lobby 也沒有觸發 UI，請在頭盔設定裡先做。
   - 快照只在上述時機產生，不追蹤 Space Setup 以外的場景變化（家具移動靠 roomd 的深度融合）。
