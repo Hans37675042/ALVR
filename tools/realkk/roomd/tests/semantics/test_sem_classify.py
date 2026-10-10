@@ -271,12 +271,13 @@ def test_office_chair_like_the_pm_chair_is_a_chair():
     assert c.kind == "Chair" and c.sittable
 
 
-@pytest.mark.parametrize("hand_x", [0.0, 0.13])
-@pytest.mark.parametrize("hand", [(0.03, 0.03), (0.06, 0.05)])
-def test_hand_on_the_backrest_does_not_unmake_a_chair(hand_x, hand):
-    # the chair top check must not hang on one cell: a hand left on the backrest (not fully
-    # removed by the body mask) adds a 1.33-1.39 m cell to a 1.27 m office chair
+@pytest.mark.parametrize("spike_x", [0.0, 0.13])
+@pytest.mark.parametrize("spike", [(0.03, 0.03), (0.06, 0.05)])
+def test_one_high_spot_on_a_low_back_is_still_not_a_chair(spike_x, spike):
+    # room2 replay: false chairs (3.27, 0.34), (3.30, -0.41), (-1.05, 0.76) had a backrest
+    # p75 of 1.0-1.2 m and only 1 cell above 1.32 m; the real chair never had one (max 1.27
+    # over 250 samples). A percentile top check let them through, so the top stays the max.
     from roomd.semantics import Obb
-    palm = Obb(hand_x, -0.25, 0.0, hand[0], hand[1], 1.27, 1.37)
-    c = _one(chair(0.0, 0.0, 0.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.27) + [palm])
-    assert c.kind == "Chair" and c.sittable
+    top = Obb(spike_x, -0.25, 0.0, spike[0], spike[1], 1.2, 1.36)
+    cands = _detect(chair(0.0, 0.0, 0.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.2) + [top])
+    assert cands and not any(c.kind == "Chair" or c.sittable for c in cands),         [(c.kind, round(c.sy, 2)) for c in cands]
