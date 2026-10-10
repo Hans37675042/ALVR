@@ -74,3 +74,33 @@ def test_one_noisy_frame_does_not_block_a_seat():
     room.remove("pile")
     out, t = run(sem, room, 1, t)
     assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+
+
+
+def _armchair_setup():
+    # room2 t>=105: a re-measured box put the seat area over the chair's own armrests and
+    # backrest (50 % of its cells > 8 cm above the seat). Stand-in: armrests at the seat
+    # edges and a seat area covering the whole footprint.
+    from roomd.semantics import Obb
+    arms = [Obb(0.5 + s * 0.2, 0.52, 0.0, 0.1, 0.45, 0.41, 0.68) for s in (-1, 1)]
+    room = make_room()
+    room.place("c", chair(0.5, 0.5, 0.0, width=0.5, depth=0.5) + arms)
+    sem = new_sem(seat_area_len_frac=1.0, seat_area_depth_frac=1.0)
+    out, t = run(sem, room, 3, 0.0)
+    objs = live(out)
+    assert len(objs) == 1 and objs[0]["Kind"] == "Chair", [(o["Kind"], o["Size"]) for o in objs]
+    return room, sem, objs[0]["Id"], t
+
+
+def test_own_armrests_inside_the_seat_area_do_not_block_it():
+    room, sem, oid, t = _armchair_setup()
+    out, t = run(sem, room, 4, t)
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+
+
+def test_pile_between_own_armrests_still_blocks():
+    room, sem, oid, t = _armchair_setup()
+    out, t = run(sem, room, 2, t)
+    room.place("pile", clothes_pile(0.5, 0.55, base_y=0.45, size=0.28, height=0.2))
+    out, t = run(sem, room, 3, t)
+    assert [s["State"] for s in seats_of(out, oid)] == ["Blocked"]

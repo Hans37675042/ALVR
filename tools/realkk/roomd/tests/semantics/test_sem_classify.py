@@ -249,7 +249,7 @@ def test_small_surface_at_table_height_is_not_a_table(w, d):
     assert c.kind == "Other" and not c.sittable
 
 
-@pytest.mark.parametrize("back_h", [1.32, 1.40])
+@pytest.mark.parametrize("back_h", [1.38, 1.45])
 def test_seat_with_a_back_far_above_any_chair_is_not_a_chair(back_h):
     # live 2026-10-10: 1.28-1.40 m tall pieces with a seat-height ledge read as chairs
     cands = _detect(chair(0.0, 0.0, 0.0, seat_h=0.5, width=0.5, depth=0.6, back_h=back_h))
@@ -266,6 +266,6 @@ def test_seat_narrower_than_any_chair_is_not_a_chair(width):
 
 
 def test_office_chair_like_the_pm_chair_is_a_chair():
-    # PM office chair: ~0.69 x 0.54 m footprint, seat ~0.52 m, ~0.84 m tall (live fused:44)
-    c = _one(chair(0.0, 0.0, 30.0, seat_h=0.52, width=0.6, depth=0.5, back_h=0.84))
+    # PM office chair on the room2 tap: ~0.65 x 0.7 m, seat ~0.45 m, backrest read at 1.23-1.27 m
+    c = _one(chair(0.0, 0.0, 30.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.27))
     assert c.kind == "Chair" and c.sittable
