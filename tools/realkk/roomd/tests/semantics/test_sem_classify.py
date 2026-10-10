@@ -269,3 +269,14 @@ def test_office_chair_like_the_pm_chair_is_a_chair():
     # PM office chair on the room2 tap: ~0.65 x 0.7 m, seat ~0.45 m, backrest read at 1.23-1.27 m
     c = _one(chair(0.0, 0.0, 30.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.27))
     assert c.kind == "Chair" and c.sittable
+
+
+@pytest.mark.parametrize("hand_x", [0.0, 0.13])
+@pytest.mark.parametrize("hand", [(0.03, 0.03), (0.06, 0.05)])
+def test_hand_on_the_backrest_does_not_unmake_a_chair(hand_x, hand):
+    # the chair top check must not hang on one cell: a hand left on the backrest (not fully
+    # removed by the body mask) adds a 1.33-1.39 m cell to a 1.27 m office chair
+    from roomd.semantics import Obb
+    palm = Obb(hand_x, -0.25, 0.0, hand[0], hand[1], 1.27, 1.37)
+    c = _one(chair(0.0, 0.0, 0.0, seat_h=0.45, width=0.6, depth=0.55, back_h=1.27) + [palm])
+    assert c.kind == "Chair" and c.sittable
