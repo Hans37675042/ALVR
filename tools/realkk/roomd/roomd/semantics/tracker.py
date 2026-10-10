@@ -210,7 +210,9 @@ class RoomSemantics:
         # 3) leftovers: absorbed by an existing object, or new-object candidates
         for c in rest:
             fp = c.footprint(floor_y)
+            # a stable Missing object stays forever: its spot was seen empty, it absorbs nothing
             if any(tr.state in LIVE_STATES + (ObjectState.REJECTED,)
+                   and not (tr.state == ObjectState.MISSING and tr.confirmed)
                    and footprint_iou(fp, tr.footprint(floor_y)) >= p.absorb_iou
                    for tr in self.tracks.values()):
                 continue
@@ -276,6 +278,13 @@ class RoomSemantics:
             return _BIG
         dsurf = abs(c.surface_h - tr.est.surface_h)
         if dsurf >= p.gate_surface_dh:
+            return _BIG
+        if not same and tr.kind_locked and not self._size_ok(tr, c) and (
+                tr.state == ObjectState.MISSING
+                or footprint_iou(c.footprint(0.0), tr.footprint(0.0)) < p.absorb_iou):
+            # another kind that does not fit the locked size is other furniture, unless it
+            # covers the object (someone leaning on it, a bag on its seat: only kept seen);
+            # a Missing object's spot was seen empty, so whatever stands there now is new
             return _BIG
         dsize = (abs(max(c.sx, c.sz) - max(tr.est.sx, tr.est.sz))
                  + abs(min(c.sx, c.sz) - min(tr.est.sx, tr.est.sz)))
