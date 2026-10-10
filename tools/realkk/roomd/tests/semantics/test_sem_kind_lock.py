@@ -1,7 +1,7 @@
 """Kind lock (PM 2026-10-10): real furniture is moved, not added or removed. A track's kind
 follows the classifier until it is stable, then stays fixed; pose and state keep updating.
 A stable (confirmed) object is never removed automatically; re-classification is on request."""
-from roomd.semantics import SemanticsParams
+from roomd.semantics import Obb, SemanticsParams
 from roomd.semantics.synthetic import chair, coffee_table, stool
 from roomd.semantics.tracker import iso_utc
 from sem_helpers import by_id, live, make_room, near, new_sem, pos, run, seats_of
@@ -123,6 +123,40 @@ def test_locked_missing_chair_resumes_where_it_is_seen_again_far_away():
     o = by_id(out)[oid]
     assert o["State"] == "Present" and near(pos(o), (1.8, 1.8), 0.06)
     assert [x["Id"] for x in live(out)] == [oid]
+
+
+def test_chair_carried_far_while_its_spot_is_unseen_keeps_one_id():
+    # old spot out of view during the move: the new place gets a young track first; when the
+    # old spot is then seen empty the stable object takes the young track over
+    room, sem, oid, t = _locked_chair(-1.8, -1.8)
+    room.set_hidden([Obb(-1.8, -1.8, 0.0, 1.0, 1.0, -1, 3)])
+    room.place("c", chair(1.8, 1.8, 90.0))                  # 5 m, beyond gate_dist
+    out, t = run(sem, room, 6, t)
+    young = [x["Id"] for x in live(out, "Chair") if x["Id"] != oid]
+    assert len(young) == 1                                  # created while oid was unseen
+    room.set_hidden([])
+    out, t = run(sem, room, 20, t)
+    assert [x["Id"] for x in live(out, "Chair")] == [oid]
+    o = by_id(out)[oid]
+    assert o["State"] == "Present" and near(pos(o), (1.8, 1.8), 0.06)
+    assert sem.tracks[oid].kind_locked
+    assert by_id(out)[young[0]]["State"] == "Removed"
+    assert [s["State"] for s in seats_of(out, oid)] == ["Available"]
+    assert [s["State"] for s in seats_of(out, young[0])] == ["Removed"]
+
+
+def test_second_chair_seen_together_with_the_first_is_not_merged():
+    # both seen at the same time = two chairs; the first one leaving keeps them apart
+    room, sem, a, t = _locked_chair(-1.8, -1.8)
+    room.place("b", chair(1.8, 1.8, 90.0))
+    out, t = run(sem, room, 4, t)
+    b = [x["Id"] for x in live(out, "Chair") if x["Id"] != a]
+    assert len(b) == 1
+    room.remove("c")
+    out, t = run(sem, room, 20, t)
+    assert by_id(out)[a]["State"] == "Missing"
+    assert by_id(out)[b[0]]["State"] == "Present"
+    assert near(pos(by_id(out)[b[0]]), (1.8, 1.8), 0.06)
 
 
 def test_never_stable_track_still_expires():
