@@ -136,6 +136,26 @@ class RoomSemantics:
             tr.revision += 1
             self._dirty = True
 
+    def reclassify(self, ids: Optional[Iterable[str]] = None) -> List[str]:
+        """Unlock the kind of the listed tracks (None / empty = every automatic object) so the
+        classifier decides it again on the next observations; it re-locks when stable.
+        Rejected and Removed tracks and unknown ids are ignored. Objects stay confirmed (never
+        removed automatically). Returns the ids that were unlocked."""
+        want = set(ids) if ids else None
+        out = []
+        for tr in self.tracks.values():
+            if tr.state in (ObjectState.REJECTED, ObjectState.REMOVED):
+                continue
+            if want is not None and tr.id not in want:
+                continue
+            tr.kind_locked = False
+            tr.kind_streak = 0
+            tr.kind_since = None
+            tr.alt_kind, tr.alt_streak = None, 0
+            tr.lock_size = None
+            out.append(tr.id)
+        return out
+
     def update(self, view: MapView, t: float, scene_labels: Sequence[SceneLabel] = (),
                user_head: Optional[Sequence[float]] = None) -> dict:
         p = self.p
