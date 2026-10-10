@@ -406,7 +406,8 @@ class RoomSemantics:
         raw = seat_occupancy(areas, o.surface_h, hm, user_head, floor_y, p, tr.seat_baseline)
         if (advance and tr.seat_baseline is None and tr.state == ObjectState.PRESENT
                 and SeatState.OCCUPIED_BY_USER not in raw):
-            # first clear look at this pose: what the object itself puts in its seat areas
+            # first frame at this pose with the user off the seat: what the object itself
+            # (or anything already lying there) puts in its seat areas
             fr = [seat_high_fraction(a, o.surface_h, hm, p) for a in areas]
             if all(f is not None for f in fr):
                 tr.seat_baseline = [min(f, p.blocked_baseline_max) for f in fr]
