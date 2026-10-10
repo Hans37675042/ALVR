@@ -38,6 +38,7 @@ MESH_CHUNK = 3
 STATUS = 4
 SCENE_MESH = 5  # Quest GLOBAL_MESH, in parts
 PLUGIN_HELLO = 101  # plugin -> roomd
+ROOM_RECLASSIFY = 102  # plugin -> roomd: {"ids": [...]} re-decide object kinds
 
 NAV_FLAG_KNOWN = 1
 NAV_FLAG_OBSTACLE = 2
@@ -296,6 +297,30 @@ def encode_json(obj):
 
 def decode_json(payload):
     return json.loads(payload.decode("utf-8"))
+
+
+def encode_room_reclassify(ids=None):
+    """ROOM_RECLASSIFY payload; no ids = every automatic object."""
+    return encode_json({"ids": list(ids)} if ids else {})
+
+
+def decode_room_reclassify(payload):
+    """ROOM_RECLASSIFY payload -> list of object ids, or None for every automatic object
+    (empty payload, missing / null / empty ids). Raises ValueError on anything else."""
+    if not payload or not payload.strip():
+        return None
+    try:
+        d = decode_json(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError("ROOM_RECLASSIFY: bad JSON: %s" % e) from None
+    if not isinstance(d, dict):
+        raise ValueError("ROOM_RECLASSIFY: payload is not a JSON object")
+    ids = d.get("ids")
+    if ids is None:
+        return None
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        raise ValueError("ROOM_RECLASSIFY: ids must be a list of strings")
+    return list(ids) or None
 
 
 @dataclass

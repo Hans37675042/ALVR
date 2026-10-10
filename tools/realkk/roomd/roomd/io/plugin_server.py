@@ -5,6 +5,9 @@ client whose queue exceeds MAX_PENDING_BYTES (a stalled plugin) is dropped and w
 reconnect. Messages published with `remember` are replayed to clients that connect later
 (the latest ROOM_MODEL, NAV_HEIGHTMAP and every live MESH_CHUNK), so a new plugin instance
 gets the full state before any later update.
+
+Each client's reader thread handles plugin -> roomd messages: PLUGIN_HELLO is logged,
+ROOM_RECLASSIFY is queued for the main loop (take_reclassify()); other types are skipped.
 """
 
 import socket
@@ -71,6 +74,13 @@ class _Client:
                     except ValueError:
                         self.hello = {"raw": payload.decode("utf-8", "replace")}
                     self.server._on_hello(self, self.hello)
+                elif msg_type == P.ROOM_RECLASSIFY:
+                    try:
+                        ids = P.decode_room_reclassify(payload)
+                    except ValueError as e:
+                        self.server.log("plugin: bad reclassify from %s:%d ignored: %s" % (self.addr + (e,)))
+                        continue
+                    self.server._on_reclassify(self, ids)
         except (ConnectionError, OSError):
             pass
         finally:
@@ -106,6 +116,7 @@ class PluginServer:
         self._stop = threading.Event()
         self._accept_thread = None
         self.hellos = []
+        self._reclassify = deque()
 
     @property
     def port(self):
@@ -164,6 +175,19 @@ class PluginServer:
     def _on_hello(self, client, hello):
         self.hellos.append(hello)
         self.log("plugin: hello from %s:%d %s" % (client.addr + (hello,)))
+
+    def take_reclassify(self):
+        """Drain ROOM_RECLASSIFY requests (each a list of ids, or None = all), oldest first."""
+        out = []
+        while True:
+            try:
+                out.append(self._reclassify.popleft())
+            except IndexError:
+                return out
+
+    def _on_reclassify(self, client, ids):
+        self._reclassify.append(ids)
+        self.log("plugin: reclassify from %s:%d: %s" % (client.addr + ("all" if ids is None else ids,)))
 
     def _on_closed(self, client):
         with self._lock:

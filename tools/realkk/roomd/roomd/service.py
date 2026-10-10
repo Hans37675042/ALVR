@@ -8,6 +8,8 @@ and publishes on the 9945 server:
 - STATUS at 1 Hz;
 - NAV_HEIGHTMAP / MESH_CHUNK whenever the sink's outputs (polled at 1 Hz) carry new ones;
 - SCENE_MESH (the snapshot's GLOBAL_MESH in parts) when a snapshot brings a different mesh.
+Plugin ROOM_RECLASSIFY requests (queued by the 9945 reader threads) are handed to the sink
+here too, followed by an immediate output poll and ROOM_MODEL.
 """
 
 import hashlib
@@ -243,9 +245,27 @@ class RoomService:
             self._last_heartbeat = now
             self.heartbeat()
 
+    def reclassify(self, ids):
+        """Plugin ROOM_RECLASSIFY: the sink re-decides these objects' kinds (None = all
+        automatic objects); then outputs are polled and the ROOM_MODEL is published."""
+        fn = getattr(self.sink, "reclassify", None)
+        done = list(fn(ids) or []) if fn is not None else []
+        self.log("roomd: reclassify %s -> %d object(s) unlocked%s"
+                 % ("all" if ids is None else ids, len(done), (": %s" % done) if done else ""))
+        self.tick(force=True)
+
+    def process_plugin(self):
+        """Handle the plugin's queued requests; True if there were any."""
+        take = getattr(self.plugin, "take_reclassify", None)
+        requests = take() if take is not None else []
+        for ids in requests:
+            self.reclassify(ids)
+        return bool(requests)
+
     def process(self, inbox):
-        """Handle everything waiting in the inbox; True if anything was handled."""
-        did = False
+        """Handle everything waiting in the inbox and the plugin's requests; True if anything
+        was handled."""
+        did = self.process_plugin()
         for recv_ns, msg_type, payload in inbox.take_messages():
             self.handle_message(recv_ns, msg_type, payload)
             did = True
