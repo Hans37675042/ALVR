@@ -257,3 +257,17 @@ def test_map_view_lowers_fusion_normal_filter_only_during_its_query():
     assert fusion.config.upward_min_normal_y == 0.85
     sink = SemanticsSink(FakeInner(room), obb_cls=FakeFusionObb)
     assert sink.view.up_normal_min == sink.semantics.p.up_normal_min
+
+
+def test_sink_forwards_reclassify_to_the_tracker():
+    from roomd.sink import FusionSink
+    room = _room()
+    room.place("c", chair(0.5, 0.5, 0.0))
+    sink = _sink(room)
+    for _ in range(10):
+        out = sink.snapshot_outputs()
+    assert [o.Id for o in out.objects] == ["fused:1"]
+    assert sink.semantics.tracks["fused:1"].kind_locked
+    assert sink.reclassify(["fused:1", "fused:42"]) == ["fused:1"]
+    assert not sink.semantics.tracks["fused:1"].kind_locked
+    assert FusionSink().reclassify(None) == []

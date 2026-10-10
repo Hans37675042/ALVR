@@ -10,6 +10,7 @@ import pytest
 
 import rktap
 import tap_replay
+from roomd import model as M
 from roomd import protocol as P
 from roomd.io.plugin_server import PluginServer
 from roomd.io.relay import RelayInbox, RelayViewer
@@ -276,3 +277,115 @@ def test_record_option_writes_inbound_relay_messages(tmp_path):
     recs = list(rktap.TapReader(out))
     assert [r.msg_type for r in recs] == [P.MSG_DEPTH_FRAME_V2, P.MSG_PLAYSPACE_CHANGED]
     assert rktap.TapReader(out).metadata["listener_version"].startswith("roomd")
+
+
+def test_plugin_server_reads_reclassify_requests_without_blocking_publish():
+    logs = []
+    server = PluginServer(0, log=logs.append)
+    server.start()
+    try:
+        c = PluginClient(server.port)
+        assert c.wait_for(lambda _: server.hellos)
+        c.sock.sendall(P.pack_frame(P.ROOM_RECLASSIFY, P.encode_room_reclassify(["fused:1"]))
+                       + P.pack_frame(P.ROOM_RECLASSIFY, b'{"ids":"bad"}')
+                       + P.pack_frame(77, b"unknown type is skipped")
+                       + P.pack_frame(P.ROOM_RECLASSIFY, b""))
+        got = []
+        assert c.wait_for(lambda _: got.extend(server.take_reclassify()) or len(got) >= 2)
+        assert got == [["fused:1"], None]
+        assert server.take_reclassify() == []
+        assert any("reclassify" in str(m) for m in logs)
+        server.publish(P.STATUS, b'{"y":2}')                 # the client is still served
+        assert c.wait_for(lambda c: (P.STATUS, b'{"y":2}') in c.frames)
+        assert server.client_count == 1
+        c.close()
+    finally:
+        server.close()
+
+
+class ReclassifySink(RecordingSink):
+    def __init__(self):
+        super().__init__()
+        self.requests = []
+        self.objects = [M.RoomObject(Id="fused:1", Kind=M.Kind.Chair, Source=M.SOURCE_FUSED, Locked=False)]
+
+    def reclassify(self, ids):
+        self.requests.append(ids)
+        self.objects[0].Kind = M.Kind.Table
+        return ["fused:1"]
+
+    def snapshot_outputs(self):
+        out = super().snapshot_outputs()
+        out.floor_y, out.floor_rms, out.objects, out.seats = 0.0, 0.0, list(self.objects), []
+        return out
+
+
+class QueuePlugin:
+    client_count = 0
+
+    def __init__(self, requests):
+        self.requests = list(requests)
+        self.published = []
+
+    def take_reclassify(self):
+        out, self.requests = self.requests, []
+        return out
+
+    def publish(self, msg_type, payload, remember=None):
+        self.published.append((msg_type, payload))
+
+    def forget(self, key):
+        pass
+
+
+def test_service_forwards_reclassify_to_the_sink_and_publishes_the_model():
+    logs = []
+    sink = ReclassifySink()
+    plugin = QueuePlugin([["fused:1", "fused:9"]])
+    svc = RoomService(sink, plugin, log=logs.append)
+    svc.tick()
+    first = [p for t, p in plugin.published if t == P.ROOM_MODEL][-1]
+    assert json.loads(first)["Objects"][0]["Kind"] == "Chair"
+    n = len(plugin.published)
+    assert svc.process(RelayInbox()) is True
+    assert sink.requests == [["fused:1", "fused:9"]]
+    models = [p for t, p in plugin.published[n:] if t == P.ROOM_MODEL]
+    assert models and json.loads(models[-1])["Objects"][0]["Kind"] == "Table"
+    assert any("reclassify" in str(m) for m in logs)
+    assert svc.process(RelayInbox()) is False
+
+
+class CountingReclassifySink(ReclassifySink):
+    def __init__(self):
+        super().__init__()
+        self.snapshots = 0
+
+    def snapshot_outputs(self):
+        self.snapshots += 1
+        return super().snapshot_outputs()
+
+
+def test_service_merges_queued_reclassify_requests_into_one_poll():
+    sink = CountingReclassifySink()
+    plugin = QueuePlugin([["fused:1"], ["fused:2", "fused:1"], ["fused:3"]])
+    svc = RoomService(sink, plugin, log=lambda *a: None)
+    svc.tick()
+    n = sink.snapshots
+    assert svc.process(RelayInbox()) is True
+    assert sink.requests == [["fused:1", "fused:2", "fused:3"]]
+    assert sink.snapshots == n + 1
+
+
+def test_service_merged_reclassify_with_an_all_request_means_all():
+    sink = CountingReclassifySink()
+    plugin = QueuePlugin([["fused:1"], None, ["fused:3"]])
+    svc = RoomService(sink, plugin, log=lambda *a: None)
+    assert svc.process(RelayInbox()) is True
+    assert sink.requests == [None]
+    assert sink.snapshots == 1
+
+
+def test_service_tolerates_a_sink_without_reclassify():
+    plugin = QueuePlugin([None])
+    svc = RoomService(FusionSink(), plugin, log=lambda *a: None)
+    assert svc.process(RelayInbox()) is True

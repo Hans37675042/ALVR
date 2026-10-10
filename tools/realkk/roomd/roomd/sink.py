@@ -60,6 +60,11 @@ class FusionSink:
     def on_playspace_changed(self, recenter_pose):
         """ALVR recentered; recenter_pose is (px,py,pz,qx,qy,qz,qw), OpenXR."""
 
+    def reclassify(self, ids):
+        """Plugin ROOM_RECLASSIFY: let the classifier decide the kind of these object ids
+        again (None = every automatic object). Returns the ids actually unlocked."""
+        return []
+
     def close(self):
         pass
 

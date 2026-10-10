@@ -50,9 +50,9 @@ uv run python ..\tap_inspect.py room.rktap
 | `scene.py` | MSG_ROOM_SNAPSHOT → RoomModel v2 + `ScenePrior` (GLOBAL_MESH in Unity space) |
 | `sink.py` | `FusionSink` interface and no-op implementation, `FusionOutputs`, `ScenePrior` |
 | `io/relay.py` | 9944 viewer: accept ALVR, send STREAM_CONTROL (depth on, camera off) + ROOM_REQUEST(0), reader thread → `RelayInbox` (newest depth only, camera dropped, others queued), optional `.rktap` recording |
-| `io/plugin_server.py` | 9945 server: many clients, per-client writer thread and queue (a stalled client is dropped at 64 MB), latest state replayed to new clients, PLUGIN_HELLO logged |
+| `io/plugin_server.py` | 9945 server: many clients, per-client writer thread and queue (a stalled client is dropped at 64 MB), latest state replayed to new clients; per-client reader thread: PLUGIN_HELLO logged, ROOM_RECLASSIFY queued for the main loop (`take_reclassify`) |
 | `io/tapsource.py` | `--tap-in`: plays a tap into the same `RelayInbox` |
-| `service.py` | main loop: fake-frame drop, `integrate`, snapshot conversion, SCENE_MESH publishing, model revisioning, 1 Hz output poll / heartbeat |
+| `service.py` | main loop: fake-frame drop, `integrate`, snapshot conversion, SCENE_MESH publishing, model revisioning, 1 Hz output poll / heartbeat, plugin ROOM_RECLASSIFY → `sink.reclassify` |
 | `synth/` | synthetic room (Unity frame), Scene snapshot builder, Open3D renderer, noise, scripted session → tap + ground truth |
 | `fusion/`, `semantics/` | owned by the fusion and semantics slices |
 
@@ -71,6 +71,7 @@ uv run python ..\tap_inspect.py room.rktap
 | 9945 4 STATUS | `RoomService.status()`, exactly the CONTRACT keys, 1 Hz |
 | 9945 5 SCENE_MESH | `SceneMeshPart`, `encode/decode_scene_mesh_part`, `split_scene_mesh`; `RoomService.publish_scene_mesh` on each snapshot (see below) |
 | 9945 101 PLUGIN_HELLO | `PluginServer.hellos` |
+| 9945 102 ROOM_RECLASSIFY | see below |
 | RoomModel v2 | `model.py`; reading v1 gives `Source=Manual, Confidence=1, Locked=true, State=Present`, seats `Available` |
 
 ## Scene conversion rules (`scene.py`)
@@ -85,6 +86,25 @@ uv run python ..\tap_inspect.py room.rktap
 - TABLE → Table; STORAGE / SCREEN / LAMP / PLANT / OTHER / unknown labels with a volume → Other;
   CEILING, DOOR_FRAME, WINDOW_FRAME, WALL_ART, GLOBAL_MESH → no object.
 - Ids `scene:<anchor uuid>`, `Source=SceneApi`, `Locked=false`, `Confidence=1`.
+
+## Re-classification on request (ROOM_RECLASSIFY, plugin → roomd)
+
+Automatic objects keep their kind once it is stable (semantics README, "Kind lock"); the plugin
+asks for a new decision with type 102, JSON `{"ids": ["fused:3", "scene:<uuid>"]}`. A missing,
+`null` or empty `ids` (or an empty payload) means every automatic object.
+
+- The 9945 reader thread decodes it (`protocol.decode_room_reclassify`; a bad payload is logged
+  and ignored) and queues it; it never touches the writer queues, so publishing is not blocked.
+- The main loop drains the queue (`RoomService.process_plugin`), merges every queued request
+  into one (the union of the ids; any "all" request makes it all), calls
+  `FusionSink.reclassify(ids)` once (unknown ids ignored; the no-op sink unlocks nothing), logs
+  `roomd: reclassify <ids|all> -> N object(s) unlocked`, then polls the outputs once and
+  publishes STATUS and the ROOM_MODEL at once. The kinds then follow the classifier again and re-lock
+  when stable; a changed kind reaches the plugin in the next ROOM_MODEL (content change).
+
+Persistence: roomd keeps no state across restarts (tracks, ids, locked kinds); `--dump-model`
+only writes the last model on exit. After a restart or a recenter the kinds re-lock after
+~5 observations (~5 s).
 
 ## Quest scene mesh to the plugin (SCENE_MESH)
 
@@ -108,6 +128,7 @@ class FusionSink:                         # roomd.sink
     def snapshot_outputs(self): ...       # -> FusionOutputs, polled about once per second
     def set_scene_prior(self, prior): ... # ScenePrior(snapshot_id, floor_y, objects, walls, mesh_vertices, mesh_triangles)
     def on_playspace_changed(self, recenter_pose): ...
+    def reclassify(self, ids): ...        # ROOM_RECLASSIFY, ids list or None = all -> ids unlocked
     def close(self): ...
 
 @dataclass

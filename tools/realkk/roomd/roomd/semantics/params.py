@@ -104,6 +104,23 @@ class SemanticsParams:
     probe_above: float = 0.01
     probe_shrink: float = 0.7
 
+    # --- kind lock (PM 2026-10-10: furniture is moved, not added or removed)
+    lock_kinds: Tuple[str, ...] = ("Chair", "Couch", "Table", "Bed")  # Other never locks
+    kind_lock_obs: int = 5             # consecutive same-kind observations of the track (the
+                                       # creating one counts; semantics runs ~1 Hz) -> locked
+    kind_lock_s: float = 10.0          # ... or the same kind for this long (>= 2 observations)
+    kind_switch_confirm: int = 2       # consecutive other-kind readings before an unlocked
+                                       # track changes kind
+    kind_obs_min_dt: float = 0.5       # s; a poll this soon after the last counted one (same
+                                       # map, e.g. forced by a plugin request) does not count
+    kind_gate_dist: float = 0.5        # m; a candidate of another kind matches only this close
+    cost_kind_mismatch: float = 0.5    # added to the cost of an other-kind match
+    kind_size_tol: float = 0.25        # locked: each extent stays within +-25 % of the size at
+                                       # lock time; other-kind readings outside it only keep
+                                       # the object Present (no pose update)
+    missing_gate_dist: float = 10.0    # m; a Missing stable object matches same-kind candidates
+                                       # this far (moved while unseen), after revive_confirm
+
     # --- seat states
     blocked_rise: float = 0.08
     blocked_fraction: float = 0.4

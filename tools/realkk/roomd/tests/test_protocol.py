@@ -122,3 +122,16 @@ def test_message_names_cover_contract():
             P.MSG_STREAM_CONTROL, P.MSG_ROOM_REQUEST) == (3, 4, 5, 100, 101)
     assert (P.ROOM_MODEL, P.NAV_HEIGHTMAP, P.MESH_CHUNK, P.STATUS, P.PLUGIN_HELLO) == (1, 2, 3, 4, 101)
     assert P.MSG_MARKER == 0xFFFF0001
+
+
+def test_room_reclassify_ids_and_all():
+    assert P.ROOM_RECLASSIFY == 102 and P.PLUGIN_HELLO == 101
+    payload = P.encode_room_reclassify(["fused:1", "scene:abc"])
+    assert json.loads(payload) == {"ids": ["fused:1", "scene:abc"]}
+    assert P.decode_room_reclassify(payload) == ["fused:1", "scene:abc"]
+    # empty or missing ids = every automatic object
+    for all_payload in (b"", b"{}", b'{"ids":[]}', b'{"ids":null}', P.encode_room_reclassify()):
+        assert P.decode_room_reclassify(all_payload) is None
+    for bad in (b"[1]", b'{"ids":"fused:1"}', b'{"ids":[1]}', b"\xff"):
+        with pytest.raises(ValueError):
+            P.decode_room_reclassify(bad)

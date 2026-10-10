@@ -101,6 +101,10 @@ class SemanticsSink(FusionSink):
         self.semantics = RoomSemantics(self.params)
         self._head = None
 
+    def reclassify(self, ids):
+        """Unlock the kind of these objects (None = all); see RoomSemantics.reclassify."""
+        return self.semantics.reclassify(ids)
+
     def close(self):
         self.inner.close()
 
