@@ -301,6 +301,8 @@ class RoomSemantics:
             # e.g. someone leaning on a chair or a bag on its seat: the kind stays; a reading
             # whose size does not fit the object only keeps it Present
             return "pose" if self._size_ok(tr, c) else "presence"
+        if tr.seat_frozen():
+            return "presence"  # the seated user's body is what reads differently
         if c.kind == tr.alt_kind:
             tr.alt_streak += 1
         else:
